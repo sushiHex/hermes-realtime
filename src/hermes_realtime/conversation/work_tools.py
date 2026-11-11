@@ -49,6 +49,9 @@ _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 _MAX_IDENTIFIER_CHARS = 128
+# The browser projection's turn identity rule; checked before dispatch so a malformed
+# presentation anchor can never reach projection after the task was accepted.
+_ANCHOR_TURN_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}\Z")
 _MAX_REASON_CHARS = 1024
 _UNAVAILABLE_REASON = "work control unavailable; restart required"
 _NO_ACTIVE_REASON = "no active work"
@@ -315,8 +318,16 @@ class ConversationWorkControlSurface:
         *,
         objective: str,
         invocation_id: str,
+        anchor_turn_id: str | None = None,
     ) -> WorkStartResult:
-        admission = await self._admit_start_work(objective=objective, invocation_id=invocation_id)
+        if anchor_turn_id is not None:
+            if type(anchor_turn_id) is not str:
+                raise TypeError("anchor_turn_id must be an exact built-in string or None")
+            if _ANCHOR_TURN_ID.fullmatch(anchor_turn_id) is None:
+                raise ValueError("anchor_turn_id must be a bounded turn identity")
+        admission = await self._admit_start_work(
+            objective=objective, invocation_id=invocation_id, anchor_turn_id=anchor_turn_id,
+        )
         if isinstance(admission, _InvocationBinding):
             return self._copy_start(await asyncio.shield(admission.operation))
         return self._copy_start(admission)
@@ -328,7 +339,7 @@ class ConversationWorkControlSurface:
         return self._submit_command_admission(admission, kind="start")
 
     async def _admit_start_work(
-        self, *, objective: str, invocation_id: str
+        self, *, objective: str, invocation_id: str, anchor_turn_id: str | None = None
     ) -> _InvocationBinding | WorkStartResult:
         self._validate_objective(objective)
         _validate_identifier(invocation_id, "invocation_id")
@@ -403,6 +414,7 @@ class ConversationWorkControlSurface:
                             objective=objective,
                             utterance_id=utterance_id,
                             pending=pending,
+                            anchor_turn_id=anchor_turn_id,
                         ),
                         name=f"conversation-work-start:{invocation_id}",
                     )
@@ -652,6 +664,7 @@ class ConversationWorkControlSurface:
         objective: str,
         utterance_id: str,
         pending: _PendingStart,
+        anchor_turn_id: str | None,
     ) -> WorkStartResult:
         try:
             dispatch = await self._controller.dispatch(
@@ -747,12 +760,16 @@ class ConversationWorkControlSurface:
                             task_id=dispatch.task_id,
                         )
                     )
-                start_result = await self._project_accepted_start(dispatch.task_id)
+                start_result = await self._project_accepted_start(
+                    dispatch.task_id, anchor_turn_id=anchor_turn_id,
+                )
                 # Establish the live card before attaching cancellation feedback.
                 # A later active projection would clear that feedback in the UI.
                 await self._project_cancel(cancel_result)
                 return start_result
-            return await self._project_accepted_start(dispatch.task_id)
+            return await self._project_accepted_start(
+                dispatch.task_id, anchor_turn_id=anchor_turn_id,
+            )
         except _ProjectionRolledBack as rolled_back:
             raise rolled_back.error from None
         except asyncio.CancelledError:
@@ -775,14 +792,16 @@ class ConversationWorkControlSurface:
             async with self._lock:
                 self._remove_pending_start_locked(pending)
 
-    async def _project_accepted_start(self, task_id: str) -> WorkStartResult:
+    async def _project_accepted_start(
+        self, task_id: str, *, anchor_turn_id: str | None
+    ) -> WorkStartResult:
         result = WorkStartResult(
             accepted=True,
             state="active",
             task_id=task_id,
         )
         try:
-            return await self._project_start(result)
+            return await self._project_start(result, anchor_turn_id=anchor_turn_id)
         except BaseException as projection_error:
             try:
                 rollback = await self._request_cancel(
@@ -841,7 +860,9 @@ class ConversationWorkControlSurface:
     ) -> WorkCancelResult:
         return await asyncio.shield(pending.cancel_result)
 
-    async def _project_start(self, result: WorkStartResult) -> WorkStartResult:
+    async def _project_start(
+        self, result: WorkStartResult, *, anchor_turn_id: str | None = None
+    ) -> WorkStartResult:
         copied = self._copy_start(result)
         gate = self._start_projection_gate
         if gate is not None:
@@ -866,6 +887,8 @@ class ConversationWorkControlSurface:
         }
         if copied.reason is not None:
             data["reason"] = copied.reason
+        if anchor_turn_id is not None and copied.accepted and copied.state == "active":
+            data["anchorTurnId"] = anchor_turn_id
         self._observer("task_state", data)
         return self._copy_start(copied)
 

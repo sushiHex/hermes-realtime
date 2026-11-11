@@ -506,6 +506,7 @@ const EVENT_KINDS = new Set([
   "voice_activity_started",
   "voice_input_ready",
 ]);
+const TURN_ID = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/;
 const PRIVATE_HANDLE = /(?:deleg_[A-Za-z0-9_-]*|run_[A-Za-z0-9_-]{8,})/;
 
 export interface PublicEvent {
@@ -624,6 +625,16 @@ function parseEvent(value: unknown, batchVersion: 1 | 2): PublicEvent {
       ttsModel: value.data.ttsModel,
       ttsProvider: value.data.ttsProvider,
     });
+  }
+  if (value.kind === "task_state" && "anchorTurnId" in value.data) {
+    // Presentation only: the foreground turn whose acknowledgement announces the task.
+    const anchor = value.data.anchorTurnId;
+    if (
+      value.data.status !== "active" ||
+      (anchor !== null && (typeof anchor !== "string" || !TURN_ID.test(anchor)))
+    ) {
+      throw new TypeError("Public task anchor is invalid");
+    }
   }
   if (value.kind === "capture_status") parseCaptureStatus(value.data);
   if (value.kind === "task_proposal") parseTaskProposal(value.data);

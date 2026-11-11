@@ -148,7 +148,7 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
   // The host ended the session out of band: the next ordinary rebind is refused (409) and a
   // fresh bootstrap starts a new session whose counters and projection restart at one.
   const endServerSession = () => { sessionActive = false; sequence = 0; };
-  return { requests, approvals, approval, task, taskResult, taskBatch, card, cancel, submit, toggle, poisonProjection, endServerSession, refresh: () => refreshCredential!() };
+  return { event, requests, approvals, approval, task, taskResult, taskBatch, card, cancel, submit, toggle, poisonProjection, endServerSession, refresh: () => refreshCredential!() };
 }
 
 afterEach(() => {
@@ -646,5 +646,91 @@ describe("mounted task controls", () => {
     await task("task_fixture", "rejected", "task is not active");
     expect(card().dataset.status).toBe(status);
     expect(card().querySelector(".task-card-controls")?.hasAttribute("hidden")).toBe(true);
+  });
+});
+
+describe("task card anchoring", () => {
+  type Mounted = Awaited<ReturnType<typeof mount>>;
+  // A live card may be docked in the active stack; its history slot keeps its transcript
+  // position, and settlement restores the card into that exact slot.
+  const order = () => [...dom.window.document.querySelectorAll<HTMLLIElement>("#transcript > li")]
+    .map((item) => item.dataset.taskId !== undefined || item.classList.contains("task-history-slot")
+      ? "card" : item.dataset.turnId ?? item.dataset.role);
+  const user = (mounted: Mounted) => mounted.event("transcript_final", { role: "user", text: "Synthetic request" });
+  const said = (mounted: Mounted, turnId: string, segmentId = "segment_1") =>
+    mounted.event("assistant_text_generated", {
+      role: "assistant", text: `Synthetic ${turnId} ${segmentId}`, turnId, turnGeneration: 1, segmentId,
+    });
+  const heard = (mounted: Mounted, turnId: string, segmentId = "segment_1") =>
+    mounted.event("transcript_final", {
+      role: "assistant", text: `Synthetic ${turnId} ${segmentId}`, turnId, turnGeneration: 1, segmentId,
+    });
+  const accepted = (mounted: Mounted, anchorTurnId: string | null) =>
+    mounted.event("task_state", { status: "active", taskId: "task_fixture", anchorTurnId });
+
+  it("places the card after the acknowledgement that announces it", async () => {
+    const mounted = await mount();
+    await user(mounted);
+    await accepted(mounted, "turn_ack");
+    await said(mounted, "turn_ack");
+    await mounted.task("task_fixture", "completed");
+    await mounted.taskResult("task_fixture", "Synthetic result");
+    await said(mounted, "turn_answer");
+    expect(order()).toEqual(["user", "turn_ack", "card", "turn_answer"]);
+  });
+
+  it("keeps the card in place when the acknowledgement is confirmed after the result", async () => {
+    const mounted = await mount();
+    await user(mounted);
+    await accepted(mounted, "turn_ack");
+    await said(mounted, "turn_ack");
+    const card = mounted.card();
+    await mounted.task("task_fixture", "completed");
+    await mounted.taskResult("task_fixture", "Synthetic result");
+    await heard(mounted, "turn_ack");
+    expect(order()).toEqual(["user", "turn_ack", "card"]);
+    expect(mounted.card()).toBe(card);
+  });
+
+  it("leaves the card after a turn that spoke before the tool call", async () => {
+    const mounted = await mount();
+    await user(mounted);
+    await said(mounted, "turn_ack");
+    await accepted(mounted, "turn_ack");
+    await said(mounted, "turn_ack", "segment_2");
+    expect(order()).toEqual(["user", "turn_ack", "card"]);
+  });
+
+  it("keeps an unanchored explicit-command card in arrival order", async () => {
+    const mounted = await mount();
+    await user(mounted);
+    await accepted(mounted, null);
+    await said(mounted, "turn_next");
+    expect(order()).toEqual(["user", "card", "turn_next"]);
+  });
+
+  it("never reaches back across an unrelated turn when the acknowledgement never comes", async () => {
+    const mounted = await mount();
+    await user(mounted);
+    await accepted(mounted, "turn_ack");
+    await said(mounted, "turn_other");
+    await said(mounted, "turn_ack");
+    expect(order()).toEqual(["user", "card", "turn_other", "turn_ack"]);
+  });
+
+  it("stops waiting for the acknowledgement once the task is terminal", async () => {
+    const mounted = await mount();
+    await user(mounted);
+    await accepted(mounted, "turn_ack");
+    await mounted.task("task_fixture", "completed");
+    await said(mounted, "turn_ack");
+    expect(order()).toEqual(["user", "card", "turn_ack"]);
+  });
+
+  it("keeps a waiting card visible at the end when no acknowledgement arrives", async () => {
+    const mounted = await mount();
+    await user(mounted);
+    await accepted(mounted, "turn_ack");
+    expect(order()).toEqual(["user", "card"]);
   });
 });

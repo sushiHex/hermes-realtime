@@ -67,7 +67,9 @@ class _Surface(Protocol):
         invocation_id: str,
     ) -> WorkCommandAdmission: ...
 
-    async def start_work(self, *, objective: str, invocation_id: str) -> WorkStartResult: ...
+    async def start_work(
+        self, *, objective: str, invocation_id: str, anchor_turn_id: str | None = None,
+    ) -> WorkStartResult: ...
 
 
 class ConversationTaskProposals:
@@ -268,12 +270,16 @@ class ConversationTaskProposals:
                 self._evidence("automatic_unavailable")
         return None
 
-    async def submit_for_ack(self, request: HostTaskProposalRequest) -> WorkStartResult | None:
+    async def submit_for_ack(
+        self, request: HostTaskProposalRequest, *, anchor_turn_id: str | None = None,
+    ) -> WorkStartResult | None:
         """Wait for the independently owned dispatch, not merely command intake."""
         if not self.automatic_start:
             raise RuntimeError("automatic start policy required")
         proposal = self._offer(request, visible=False)
-        result = await self._consume(proposal, decision=None, wait_for_ack=True)
+        result = await self._consume(
+            proposal, decision=None, wait_for_ack=True, anchor_turn_id=anchor_turn_id,
+        )
         if isinstance(result, WorkCommandAdmission):
             return None
         if not result.accepted and result.task_id is None and result.reason == _UNAVAILABLE_REASON:
@@ -355,6 +361,7 @@ class ConversationTaskProposals:
 
     async def _consume(
         self, proposal: TaskProposal, *, decision: str | None, wait_for_ack: bool = False,
+        anchor_turn_id: str | None = None,
     ) -> WorkCommandAdmission | WorkStartResult:
         category = "expired"
         try:
@@ -380,6 +387,7 @@ class ConversationTaskProposals:
                     raise ValueError("acknowledgment applies only to automatic starts")
                 result = await self._surface.start_work(
                     objective=proposal.objective, invocation_id="automatic_" + proposal.proposal_id,
+                    anchor_turn_id=anchor_turn_id,
                 )
                 if type(result) is not WorkStartResult:
                     raise TypeError("work start result must be exact")
