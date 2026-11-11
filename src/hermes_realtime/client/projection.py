@@ -400,6 +400,16 @@ class BrowserEventProjection:
                 raise ValueError("voice readiness generation is outside the browser-safe range")
             if not 1 <= media_incarnation <= (1 << 53) - 1:
                 raise ValueError("voice readiness incarnation is outside the browser-safe range")
+        if kind == "task_state" and "anchorTurnId" in data:
+            # Browser presentation only: the foreground turn whose lease admitted the task.
+            anchor = data["anchorTurnId"]
+            if data.get("status") != "active":
+                raise ValueError("task anchor is valid only on an active task state")
+            if anchor is not None:
+                if type(anchor) is not str:
+                    raise TypeError("task anchor must be an exact string or null")
+                if _TURN_ID.fullmatch(anchor) is None:
+                    raise ValueError("task anchor turn identity is invalid")
         if kind == "task_result":
             if set(data) != {"status", "taskId", "text"}:
                 raise ValueError("task result data has an invalid shape")

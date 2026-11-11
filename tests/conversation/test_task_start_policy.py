@@ -106,7 +106,9 @@ async def test_automatic_stream_reports_only_real_ack_after_one_silent_submissio
         await response
         await surface.close()
     expected = {"status": "active" if accepted else "rejected", "taskId": "task_release_check"}
-    if not accepted:
+    if accepted:
+        expected["anchorTurnId"] = "turn_auto"
+    else:
         expected["reason"] = "Hermes declined the request"
     assert events == [("task_state", expected)]
     assert controller.cancellations == [] and len(controller.dispatches) == 1

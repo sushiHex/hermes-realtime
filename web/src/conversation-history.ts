@@ -31,6 +31,11 @@ export class ConversationHistory {
     return this.active.has(item);
   }
 
+  /** The element holding an item's history position: its slot while docked. */
+  position(item: HTMLLIElement): HTMLLIElement {
+    return this.active.get(item) ?? item;
+  }
+
   /** Voice deletion preserves durable work and its exact positions in history. */
   clearTranscript(
     transcript: HTMLOListElement,

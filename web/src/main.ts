@@ -508,7 +508,10 @@ function addTranscript(
   interrupted = false,
 ): void {
   const dataRole = role === "You" ? "user" : "assistant";
-  if (dataRole === "assistant") closeActiveUserTurn();
+  if (dataRole === "assistant") {
+    closeActiveUserTurn();
+    pendingTaskAnchors.clear();
+  }
   if (partialTranscriptRole === dataRole) {
     clearPartialTranscript();
   }
@@ -571,6 +574,17 @@ interface ApprovalCardView {
 }
 
 const taskCardViews = new Map<string, TaskCardView>();
+// A new task card waiting for the assistant turn whose acknowledgement announces it
+// (#500). The server accepts the task before that turn speaks, so the turn is placed
+// above the card when it first appears. Any other assistant turn ends every wait, so
+// a card never moves across unrelated history; each live card holds at most one entry.
+const pendingTaskAnchors = new Map<string, HTMLLIElement>();
+
+function forgetTaskAnchor(item: HTMLLIElement): void {
+  for (const [turnId, card] of pendingTaskAnchors) {
+    if (card === item) pendingTaskAnchors.delete(turnId);
+  }
+}
 // Concurrent background runs can each hold a pending approval, and the server
 // retains and resolves them by exact id in any order. Every actionable request
 // therefore needs its own card; a single active reference stranded the older run
@@ -600,6 +614,7 @@ function actionableOperationCard(item: HTMLLIElement): boolean {
 }
 
 function forgetEvictedOperationCard(item: HTMLLIElement): void {
+  forgetTaskAnchor(item);
   taskProposalControls.forget(item);
   const approvalId = item.dataset.approvalId;
   if (approvalId !== undefined && approvalCardViews.get(approvalId)?.item === item) {
@@ -633,8 +648,9 @@ function disposeTranscriptEvictions(obsoleteItems: readonly HTMLLIElement[]): vo
   }
 }
 
-function appendTranscriptBounded(item: HTMLLIElement): void {
-  transcript.append(item);
+function appendTranscriptBounded(item: HTMLLIElement, before: HTMLLIElement | null = null): void {
+  if (before !== null && before.parentElement === transcript) transcript.insertBefore(item, before);
+  else transcript.append(item);
   if (conversationHistory.isActive(item)) return;
   disposeTranscriptEvictions(transcriptRetention.admit(item, retainedDomCost(item)));
 }
@@ -770,7 +786,16 @@ function projectTaskStateCard(event: PublicEvent): void {
     taskCardViews.set(taskId, view);
     conversationHistory.setActive(item, live);
     admitOperationCard(item);
+    const anchor = data.anchorTurnId;
+    if (
+      typeof anchor === "string" &&
+      assistantTurns.get(anchor)?.item.isConnected !== true &&
+      !pendingTaskAnchors.has(anchor)
+    ) {
+      pendingTaskAnchors.set(anchor, item);
+    }
   }
+  if (!live) forgetTaskAnchor(view.item);
   const wasLive = conversationHistory.isActive(view.item);
   conversationHistory.setActive(view.item, live);
   if (live) transcriptRetention.remove(view.item);
@@ -1061,6 +1086,7 @@ const voiceDeleteControls = new VoiceDeleteControls(deleteVoiceButton, voiceDele
       forgetEvictedOperationCard(item);
     }
     assistantTurns.clear();
+    pendingTaskAnchors.clear();
     syncTranscriptEmptyState();
   },
 });
@@ -1140,7 +1166,12 @@ function createAssistantTurn(turnId: string, turnGeneration: number): AssistantT
   const content = document.createElement("span");
   content.className = "assistant-copy";
   item.append(label, content);
-  appendTranscriptBounded(item);
+  const anchoredCard = pendingTaskAnchors.get(turnId);
+  pendingTaskAnchors.clear();
+  appendTranscriptBounded(
+    item,
+    anchoredCard === undefined ? null : conversationHistory.position(anchoredCard),
+  );
   for (const [retainedTurnId, retained] of assistantTurns) {
     if (!retained.item.isConnected) assistantTurns.delete(retainedTurnId);
   }
