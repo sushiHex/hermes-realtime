@@ -54,7 +54,10 @@ python scripts/release_gate.py --candidate . --declared-tool-path
 Each stage's `PATH` is rebuilt from the directories of its exact declared tools,
 plus the Windows system directories. Both stages also ignore the developer's
 global Git config (`GIT_CONFIG_GLOBAL` set to the null device), because hosted
-runners have none. System Git config is kept.
+runners have none. System Git config is kept. Launch the check from PowerShell
+or cmd. From Git Bash, `git` resolves to Git for Windows' shell-internal
+`mingw64\bin` binary instead of the `cmd\git.exe` launcher that hosted runners
+use, and the gate refuses it.
 
 | Stage | Declared tools |
 | --- | --- |

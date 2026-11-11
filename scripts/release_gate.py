@@ -200,6 +200,7 @@ DECLARED_TOOL_REFUSALS = frozenset(
         "python_reselection",
         "system_directory",
         "unsupported_platform",
+        "shell_internal_git",
     }
 )
 
@@ -343,6 +344,24 @@ def uv_selected_python(uv: Path, environment: dict[str, str], cwd: Path) -> Path
     return Path(os.path.normcase(os.path.abspath(completed.stdout.strip())))
 
 
+def is_shell_internal_git(git: Path) -> bool:
+    """Whether ``git`` is Git for Windows' ``mingw64``/``usr`` binary beside its ``cmd`` launcher.
+
+    Hosted runners launch the ``cmd\\git.exe`` launcher, which supplies Git's own
+    runtime directories to its children. The shell-internal binary alone does not:
+    a local clone crashes under a declared PATH.
+    """
+    if type(git) is not type(Path()):
+        raise TypeError("git must be an exact path")
+    directory = git.parent
+    return (
+        git.name.lower() == "git.exe"
+        and directory.name.lower() == "bin"
+        and directory.parent.name.lower() in {"mingw64", "usr"}
+        and (directory.parent.parent / "cmd" / "git.exe").is_file()
+    )
+
+
 def declared_stage_environments(
     environment: dict[str, str], root: Path
 ) -> tuple[dict[str, str], dict[str, str]]:
@@ -367,6 +386,13 @@ def declared_stage_environments(
         system = trusted_system_directories()
         stage.name = "uv"
         python_tools = resolve(PYTHON_STAGE_TOOLS)
+        if is_shell_internal_git(python_tools["git"]):
+            raise DeclaredToolRefusal(
+                "shell_internal_git",
+                "git",
+                "declared git is Git for Windows' shell-internal binary; launch the gate from "
+                "PowerShell or cmd so Git\\cmd\\git.exe resolves",
+            )
         stage.name = "web"
         web_tools = resolve(WEB_STAGE_TOOLS)
         stage.name = "uv"

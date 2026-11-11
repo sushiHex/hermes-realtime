@@ -496,3 +496,53 @@ def test_refusal_categories_are_a_closed_set() -> None:
 
     with pytest.raises(ValueError, match="unknown declared-tool refusal category"):
         gate["DeclaredToolRefusal"](SENTINEL, None, "message")
+
+
+def _git_for_windows(root: Path, *, launcher: bool) -> Path:
+    if launcher:
+        _tool(root / "cmd", "git.exe")
+    return root
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Git for Windows layout")
+@pytest.mark.parametrize("internal", ["mingw64", "usr"])
+def test_shell_internal_git_beside_its_launcher_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    internal: str,
+) -> None:
+    gate = _release_gate()
+    _, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    git_root = _git_for_windows(tmp_path / SENTINEL / "Git", launcher=True)
+    _tool(git_root / internal / "bin", "git.exe")
+    ambient = os.pathsep.join((str(git_root / internal / "bin"), ambient))
+
+    with pytest.raises(RuntimeError, match="launch the gate from PowerShell or cmd"):
+        gate["declared_stage_environments"]({"PATH": ambient}, tmp_path)
+    assert _evidence(capsys) == [{"stage": "uv", "refusal": "shell_internal_git", "tool": "git"}]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Git for Windows layout")
+@pytest.mark.parametrize(
+    ("directory", "launcher"),
+    [("cmd", True), ("mingw64/bin", False), ("usr/bin", False)],
+    ids=["launcher", "mingw64-without-launcher", "usr-without-launcher"],
+)
+def test_launcher_git_or_lone_bin_git_is_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    directory: str,
+    launcher: bool,
+) -> None:
+    gate = _release_gate()
+    _, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    git_root = _git_for_windows(tmp_path / SENTINEL / "Git", launcher=launcher)
+    git = _tool(git_root / directory, "git.exe")
+    ambient = os.pathsep.join((str(git.parent), ambient))
+
+    python_environment, _ = gate["declared_stage_environments"]({"PATH": ambient}, tmp_path)
+
+    assert gate["resolve_on_path"]("git", python_environment["PATH"]) == git
+    assert _evidence(capsys) == []
