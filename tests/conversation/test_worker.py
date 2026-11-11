@@ -3052,6 +3052,188 @@ async def test_held_task_acknowledgment_does_not_hold_pcm_consumption(command_ki
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("input_path", ("microphone", "typed"))
+@pytest.mark.parametrize("command_kind", ("start", "cancel"))
+async def test_held_command_acknowledgment_does_not_stall_source_pcm_ingress(
+    command_kind: str,
+    input_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held Hermes acknowledgment must not age the PCM queued behind its command.
+
+    Drives the real ``run_source`` pump and its ``BoundedPcmIngress``, so a command
+    acknowledgment awaited under ``_audio_lock`` (on either input path) would leave the
+    following frames queued until the 2 s age bound faults the binding.
+    """
+
+    from hermes_realtime.conversation import (
+        ConversationContextStore,
+        ConversationTaskCommandRouter,
+        ConversationWorkControlSurface,
+        TaskCancelOutcome,
+        TaskDispatchOutcome,
+    )
+
+    context = ConversationContextStore()
+    if command_kind == "cancel":
+        context.record_task_accepted(
+            task_id="task_fixture", run_id="deleg_fixture", objective="Synthetic work"
+        )
+    command_text = "start task Synthetic work" if command_kind == "start" else "cancel task"
+    acknowledgment_started, release_acknowledgment = asyncio.Event(), asyncio.Event()
+    projected: list[tuple[str, Any]] = []
+
+    class Controller:
+        async def dispatch(self, *, objective: str, utterance_id: str) -> TaskDispatchOutcome:
+            del utterance_id
+            acknowledgment_started.set()
+            await release_acknowledgment.wait()
+            context.record_task_accepted(
+                task_id="task_fixture", run_id="deleg_fixture", objective=objective
+            )
+            return TaskDispatchOutcome(task_id="task_fixture", accepted=True)
+
+        async def request_cancel(
+            self, task_id: str, *, reason: str | None = None
+        ) -> TaskCancelOutcome:
+            del reason
+            acknowledgment_started.set()
+            await release_acknowledgment.wait()
+            return TaskCancelOutcome(task_id=task_id, accepted=True)
+
+    class Transcriber:
+        def __init__(self) -> None:
+            self.pushed: asyncio.Queue[None] = asyncio.Queue()
+
+        async def push(self, frame: AudioFrame) -> tuple[Transcript, ...]:
+            del frame
+            self.pushed.put_nowait(None)
+            return ()
+
+        async def finish_utterance(self) -> Transcript:
+            return Transcript(text=command_text, final=True)
+
+        async def cancel(self) -> None:
+            return None
+
+    class PacketSource:
+        def __init__(self) -> None:
+            self.packets: asyncio.Queue[ParticipantAudioFrame] = asyncio.Queue()
+
+        async def receive_participant_audio(
+            self,
+            *,
+            timeout_seconds: float,
+        ) -> ParticipantAudioFrame:
+            del timeout_seconds
+            return await self.packets.get()
+
+    ingresses: list[BoundedPcmIngress] = []
+
+    class CapturedIngress(BoundedPcmIngress):
+        def __init__(self) -> None:
+            super().__init__()
+            ingresses.append(self)
+
+    monkeypatch.setattr(
+        "hermes_realtime.conversation.worker.BoundedPcmIngress", CapturedIngress
+    )
+    surface = ConversationWorkControlSurface(
+        controller=Controller(),
+        context=context,
+        observer=lambda kind, data: projected.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+    )
+    router = ConversationTaskCommandRouter(
+        surface=surface,
+        observer=lambda kind, data: projected.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+    )
+    command_activities = (
+        (VoiceActivity.SPEECH_STARTED, VoiceActivity.SPEECH_ENDED)
+        if input_path == "microphone"
+        else ()
+    )
+    following_activities = (
+        VoiceActivity.SPEECH_STARTED,
+        VoiceActivity.SPEECH_CONTINUED,
+        VoiceActivity.SPEECH_CONTINUED,
+    )
+    transcriber = Transcriber()
+
+    def binding_factory(
+        participant_identity: str,
+        generation: int,
+        actions: ConversationUpdateExecutor,
+    ) -> ConversationSessionWorker:
+        return ConversationSessionWorker(
+            participant_identity=participant_identity,
+            session_generation=generation,
+            vad=ScriptedVad(*command_activities, *following_activities),
+            stt=transcriber,
+            actions=actions,
+            command_router=router,
+        )
+
+    executor, _, responses = action_executor_probe()
+    worker = ReconnectSafeConversationWorker(actions=executor, binding_factory=binding_factory)
+    generation = await worker.bind("browser_user")
+    frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+    source = PacketSource()
+    pump = asyncio.create_task(worker.run_source(source, generation))
+    typed: asyncio.Task[None] | None = None
+    # Failure bound only: well above the 15.6 ms Windows tick, below the 2 s age bound.
+    bound = 1.0
+    try:
+        if input_path == "microphone":
+            for _ in command_activities:
+                source.packets.put_nowait(ParticipantAudioFrame("browser_user", frame))
+                await asyncio.wait_for(transcriber.pushed.get(), bound)
+        else:
+            typed = asyncio.create_task(
+                worker.submit_final_transcript(
+                    participant_identity="browser_user",
+                    session_generation=generation,
+                    typed_sequence=1,
+                    text=command_text,
+                )
+            )
+        await asyncio.wait_for(acknowledgment_started.wait(), bound)
+
+        for _ in following_activities:
+            source.packets.put_nowait(ParticipantAudioFrame("browser_user", frame))
+        for _ in following_activities:
+            await asyncio.wait_for(transcriber.pushed.get(), bound)
+
+        assert not release_acknowledgment.is_set()
+        assert typed is None or typed.done()
+        (ingress,) = ingresses
+        assert ingress.outstanding_frames == 0
+        ingress.check_health()
+        assert not pump.done()
+        assert projected == []
+        assert responses == []
+    finally:
+        release_acknowledgment.set()
+        if typed is not None:
+            await typed
+        await surface.close()
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+        await worker.close()
+    assert projected == [
+        (
+            "task_state",
+            {
+                "status": "active" if command_kind == "start" else "cancelling",
+                "taskId": "task_fixture",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_supervisor_rejects_stale_typed_transcript_before_admission() -> None:
     executor, _, responses = action_executor_probe()
 
