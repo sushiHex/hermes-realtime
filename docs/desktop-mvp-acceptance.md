@@ -11,7 +11,9 @@ physical audibility, microphone behavior or the operator's experience.
 
 Start with the [native work voice preview](native-work-preview.md) for current
 source/wheel-bound preparation and owned cutover, rather than the frozen local-model
-setup below. Cloud inference and speech choices such as Moonshine `medium` and
+setup below. The operator steps and evidence for that profile are in the
+[native preview acceptance procedure](native-preview-acceptance.md); the session steps
+on this page are the historical explicit-command ones. Cloud inference and speech choices such as Moonshine `medium` and
 MCP-managed GPU Kokoro are explicit operator-profile settings, not new repository
 defaults or a transfer of the historical profile's qualification.
 

@@ -62,7 +62,10 @@ async def test_automatic_ack_follows_real_dispatch_ack(accepted):
         if accepted:
             assert type(calls[1]) is AcceptedStartInferenceRequest
             assert calls[1].task_id == "task_release_check"
-        assert synth.texts == (["I have started the work."] if accepted else [])
+        assert synth.texts == (
+            ["I have started the work."] if accepted
+            else ["No new background task is running for that request."]
+        )
         assert controller.cancellations == []
     finally:
         gate.set()
@@ -306,7 +309,9 @@ async def test_rejected_dispatch_cannot_borrow_an_existing_active_task():
     )
     try:
         await loop.respond("turn_auto", Transcript(text="Inspect release", final=True))
-        assert len(controller.dispatches) == 1 and len(calls) == 1 and synth.texts == []
+        # The rejection gets only the fixed host sentence, never an acknowledgment turn.
+        assert len(controller.dispatches) == 1 and len(calls) == 1
+        assert synth.texts == ["No new background task is running for that request."]
     finally:
         await surface.close()
 
