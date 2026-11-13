@@ -1727,6 +1727,61 @@ def test_first_launch_needs_no_predecessor(tmp_path, monkeypatch, capsys):
     preview_cutover._require_state_root_available(plan)
 
 
+@pytest.mark.asyncio
+async def test_a_run_that_ended_abnormally_does_not_block_the_next_run_on_its_state_root(
+    tmp_path, monkeypatch, capsys
+):
+    output = _prepared(tmp_path / "new", monkeypatch)
+    plan = preview_cutover.load_plan(output / "plan.private.json")
+    store = preview_cutover._conversation_store(plan)
+    # The earlier run's host heard something, then exited on a fault: a refused receipt,
+    # work still recorded in its own run record, and no clean stop.
+    await _say(store, _SAID)
+    ended = _abandoned_previous(
+        tmp_path, tmp_path / "new" / "plan.json",
+        journal={"version": 1, "pending": [{"run_id": "synthetic"}],
+                 "admitted": ["run_synthetic"]},
+    )
+    (ended / "result-receipt.private.json").write_text(json.dumps({
+        "version": 1, "category": "refused", "cleanup_settled": False,
+        "cleanup_failed": True, "owned_survivor_count": 0, "remaining_owned_listeners": 0,
+        "protected_listeners_unchanged": True, "run_journal_empty": False,
+        "failure_category": "owned_child_exited", "ports": [59886, 59887, 7890, 28775],
+    }), encoding="utf-8")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    before = _tree_snapshot(ended)
+    # As evidence that run is still refused, and the refusal binds nothing.
+    with pytest.raises(preview_cutover.PreviewRefusal, match="previous_normal_stop"):
+        preview_cutover.finalize(output / "prepared.private.json", ended)
+    assert not (output / "handoff.private.json").exists()
+
+    # Without it, nothing reads that run: its receipt and its journal decide nothing.
+    assert preview_cutover.main(
+        ["finalize", "--prepared", str(output / "prepared.private.json")]
+    ) == 0
+    assert json.loads((output / "handoff.private.json").read_text())["category"] == (
+        "no_previous_handoff"
+    )
+    monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
+    helper = SimpleNamespace(
+        PreviewOwnerLaunchRefusal=_OwnerLaunchRefusal, launch_preview_owner=lambda **_: None,
+    )
+    monkeypatch.setitem(sys.modules, "scripts.preview_owner_launch", helper)
+    assert preview_cutover.main(
+        ["launch", "--active", str(output / "active.private.json")]
+    ) == 0
+    statuses = [
+        json.loads(line.removeprefix("[voice-preview] "))["category"]
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    assert statuses == ["ready_to_launch", "launch_requested"]
+    # What serve checks before it owns anything, then what the new host restores.
+    preview_cutover._require_state_root_available(plan)
+    assert await _restored(store) == [_SAID]
+    assert _tree_snapshot(ended) == before
+
+
 @pytest.mark.parametrize("store", ["empty", "adopted"])
 def test_finalize_does_not_leave_an_earlier_runs_conversation_behind(
     tmp_path, monkeypatch, store
