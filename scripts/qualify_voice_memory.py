@@ -631,11 +631,11 @@ async def _turn_witness(
         and memory.memory not in baseline_prefix
         and (not memory.user or memory.user not in baseline_prefix)
     )
-    from hermes_realtime.conversation.turn import foreground_turn
+    from hermes_realtime.conversation.turn import ForegroundTurn
     from hermes_realtime.providers.ollama import OllamaStreamingInference
 
-    ollama_baseline = OllamaStreamingInference._messages(foreground_turn(baseline))
-    ollama_memory = OllamaStreamingInference._messages(foreground_turn(recalled))
+    ollama_baseline = OllamaStreamingInference._messages(ForegroundTurn(baseline))
+    ollama_memory = OllamaStreamingInference._messages(ForegroundTurn(recalled))
     ollama_data_only = int(_ollama_memory_data_only(
         ollama_baseline, ollama_memory, memory_field,
     ))

@@ -23,7 +23,7 @@ from hermes_realtime.conversation.task_proposals import (
     HostTaskProposalRequest,
 )
 from hermes_realtime.conversation.task_status import HostSpeechRequest
-from hermes_realtime.conversation.turn import ForegroundTurn, foreground_turn, turn_routes
+from hermes_realtime.conversation.turn import ForegroundTurn, turn_routes
 from hermes_realtime.conversation.work_tools import (
     WORK_OBJECTIVE_CONTEXT_POLICY,
     WORK_ROUTING_POLICY,
@@ -382,7 +382,7 @@ class OllamaStreamingInference:
         turn_id: str,
     ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]:
         style = require_output_style(self._output_style())
-        turn = foreground_turn(snapshot)
+        turn = ForegroundTurn(snapshot)
         accepted_ack = turn.accepted_objective is not None
         self._validate_turn_id(turn_id)
         if turn_id != "turn_preflight":
@@ -928,7 +928,7 @@ class OllamaStreamingInference:
         turn: ForegroundTurn, *, output_style: str = "default",
         task_status_available: bool = False,
     ) -> list[dict[str, str]]:
-        snapshot = turn.context
+        snapshot = turn.request
         accepted_objective = turn.accepted_objective
         sections: dict[str, object] = {}
         if accepted_objective is not None:

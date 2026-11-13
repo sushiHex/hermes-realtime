@@ -31,7 +31,7 @@ from hermes_realtime.conversation import (
     ForegroundTurnCoordinator,
     StreamingSpeechLoop,
 )
-from hermes_realtime.conversation.turn import foreground_turn
+from hermes_realtime.conversation.turn import ForegroundTurn
 from hermes_realtime.conversation.work_tools import ConversationWorkControlSurface
 from hermes_realtime.conversation.worker import ConversationSessionWorker
 from hermes_realtime.host_launcher import ProactiveCompletionUpdatePolicy
@@ -168,7 +168,7 @@ async def _stack() -> AsyncIterator[_Stack]:
 def _prompt(stack: _Stack, index: int) -> list[dict[str, str]]:
     from hermes_realtime.providers import OllamaStreamingInference
 
-    return OllamaStreamingInference._messages(foreground_turn(stack.inference.requests[index]))
+    return OllamaStreamingInference._messages(ForegroundTurn(stack.inference.requests[index]))
 
 
 def _references(prompt: list[dict[str, str]]) -> dict[str, Any]:

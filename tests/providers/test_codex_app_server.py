@@ -38,7 +38,7 @@ from hermes_realtime.conversation.streaming import (
 )
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
-from hermes_realtime.conversation.turn import foreground_turn
+from hermes_realtime.conversation.turn import ForegroundTurn
 from hermes_realtime.conversation.work_tools import WorkCancelResult, WorkStartResult
 from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.providers import codex_app_server as codex_app_server_module
@@ -582,7 +582,7 @@ def test_codex_prompt_keeps_memory_separate_and_untrusted() -> None:
         model="gpt-5.6-terra", effort="low", transport_factory=FakeCodexTransport
     )
 
-    prompt = inference._prompt(foreground_turn(snapshot))
+    prompt = inference._prompt(ForegroundTurn(snapshot))
     payload = json.loads(prompt.splitlines()[-1])
 
     assert payload["memory"] == {
@@ -2473,7 +2473,7 @@ def test_codex_prompt_preserves_authoritative_user_transcript() -> None:
         effort="low",
         transport_factory=FakeCodexTransport,
     )
-    prompt = inference._prompt(foreground_turn(snapshot))
+    prompt = inference._prompt(ForegroundTurn(snapshot))
     payload = json.loads(prompt.splitlines()[-1])
 
     assert payload["messages"][0]["text"] == (
@@ -2498,7 +2498,7 @@ def test_codex_prompt_does_not_rewrite_acronyms_from_conversation_context() -> N
         transport_factory=FakeCodexTransport,
     )
 
-    payload = json.loads(inference._prompt(foreground_turn(snapshot)).splitlines()[-1])
+    payload = json.loads(inference._prompt(ForegroundTurn(snapshot)).splitlines()[-1])
 
     assert payload["messages"][-1]["text"] == "And the W, N, B, A tonight?"
 
@@ -2520,7 +2520,7 @@ def test_codex_prompt_preserves_literal_and_assistant_text() -> None:
         transport_factory=FakeCodexTransport,
     )
 
-    payload = json.loads(inference._prompt(foreground_turn(snapshot)).splitlines()[-1])
+    payload = json.loads(inference._prompt(ForegroundTurn(snapshot)).splitlines()[-1])
 
     assert [message["text"] for message in payload["messages"]] == [
         "Let's discuss tonight's game odds.",
@@ -2536,7 +2536,7 @@ def test_codex_prompt_requests_a_short_natural_opening_without_filler() -> None:
         transport_factory=FakeCodexTransport,
     )
 
-    prompt = inference._prompt(foreground_turn(_snapshot()))
+    prompt = inference._prompt(ForegroundTurn(_snapshot()))
 
     assert "first sentence under 12 words" in prompt
     assert "Do not add filler or a preamble" in prompt
@@ -2549,7 +2549,7 @@ def test_codex_prompt_explains_the_heard_only_context_and_interrupted_field() ->
         transport_factory=FakeCodexTransport,
     )
 
-    prompt = inference._prompt(foreground_turn(_snapshot()))
+    prompt = inference._prompt(ForegroundTurn(_snapshot()))
 
     assert "Earlier assistant messages represent only speech confirmed delivered." in prompt
     assert 'An assistant message with "interrupted": true was cut off' in prompt
@@ -2575,7 +2575,7 @@ def test_codex_snapshot_adds_interrupted_field_only_to_interrupted_rows() -> Non
         transport_factory=FakeCodexTransport,
     )
 
-    payload = json.loads(inference._prompt(foreground_turn(snapshot)).splitlines()[-1])
+    payload = json.loads(inference._prompt(ForegroundTurn(snapshot)).splitlines()[-1])
 
     assert payload["messages"] == [
         {"role": "assistant", "text": "Cut off here.", "interrupted": True},

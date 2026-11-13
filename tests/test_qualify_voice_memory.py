@@ -552,7 +552,7 @@ async def test_memory_in_ollama_user_role_fails_data_only_witness(
 
     def user_role(turn: ForegroundTurn) -> list[dict[str, str]]:
         messages = render(turn)
-        if turn.context.memory is not None:
+        if turn.request.memory is not None:
             messages[0]["role"] = "user"
         return messages
 
@@ -576,7 +576,7 @@ async def test_removed_ollama_memory_fails_only_data_only_witness(monkeypatch) -
 
     def dropped_memory(turn):
         messages = render(turn)
-        if turn.context.memory is not None:
+        if turn.request.memory is not None:
             prefix, raw = messages[0]["content"].split("\n\nReference data:\n", 1)
             sections = json.loads(raw)
             del sections["memory"]

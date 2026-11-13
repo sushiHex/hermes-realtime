@@ -36,7 +36,7 @@ from hermes_realtime.conversation.task_proposals import (
 )
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.telemetry import KnowledgeLookupTiming, RollingRouteMetrics
-from hermes_realtime.conversation.turn import ForegroundTurn, foreground_turn, turn_routes
+from hermes_realtime.conversation.turn import ForegroundTurn, turn_routes
 from hermes_realtime.conversation.work_tools import (
     WORK_OBJECTIVE_CONTEXT_POLICY,
     WORK_ROUTING_POLICY,
@@ -1001,9 +1001,9 @@ class CodexAppServerStreamingInference:
         turn_id: str,
     ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]:
         style = require_output_style(self._output_style())
-        turn = foreground_turn(snapshot)
+        turn = ForegroundTurn(snapshot)
         accepted_ack = turn.accepted_objective is not None
-        snapshot = turn.context
+        snapshot = turn.request
         self._validate_turn_id(turn_id)
         async with self._turn_lock:
             await self._ensure_started()
@@ -3173,7 +3173,7 @@ class CodexAppServerStreamingInference:
         *,
         local_now: datetime | None = None,
     ) -> str:
-        snapshot = turn.context
+        snapshot = turn.request
         accepted_objective = turn.accepted_objective
         if accepted_objective is not None:
             return "Accepted task reference data:\n" + json.dumps(

@@ -42,7 +42,7 @@ async def test_validated_terminal_is_in_snapshot_before_completion_consumption()
 async def test_followup_and_both_provider_prompts_receive_reference():
     from hermes_realtime.conversation import ForegroundTurnCoordinator, StreamingSpeechLoop
     from hermes_realtime.conversation.context import RecentTaskResult
-    from hermes_realtime.conversation.turn import foreground_turn
+    from hermes_realtime.conversation.turn import ForegroundTurn
     from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
     from hermes_realtime.providers.ollama import OllamaStreamingInference
     from hermes_realtime.speech import DeliveredSpeechLedger, Transcript
@@ -77,10 +77,10 @@ async def test_followup_and_both_provider_prompts_receive_reference():
     assert request.recent_task_results == (result,)
     assert request.context.recent_task_results == (result,)
     assert "Sunny, source: example.com" in CodexAppServerStreamingInference._prompt(
-        foreground_turn(request)
+        ForegroundTurn(request)
     )
     assert "Sunny, source: example.com" in OllamaStreamingInference._messages(
-        foreground_turn(request)
+        ForegroundTurn(request)
     )[0]["content"]
 
 

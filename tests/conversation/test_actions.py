@@ -21,7 +21,7 @@ from hermes_realtime.conversation import (
     UpdatePolicyInput,
 )
 from hermes_realtime.conversation.streaming import ModelOutputRefused
-from hermes_realtime.conversation.turn import foreground_turn
+from hermes_realtime.conversation.turn import ForegroundTurn
 from hermes_realtime.host_launcher import ProactiveCompletionUpdatePolicy
 from hermes_realtime.speech import (
     AudioFrame,
@@ -455,7 +455,7 @@ async def test_cancel_without_speech_preserves_host_tasks_and_completed_result_n
     await executor.respond(
         "turn_after_idle_cancel", Transcript(text="Synthetic follow-up", final=True)
     )
-    rendered = OllamaStreamingInference._messages(foreground_turn(inference.requests[0]))
+    rendered = OllamaStreamingInference._messages(ForegroundTurn(inference.requests[0]))
     systems = [message for message in rendered if message["role"] == "system"]
     assert len(systems) == 1
     _, separator, references = systems[0]["content"].partition("\n\nReference data:\n")
