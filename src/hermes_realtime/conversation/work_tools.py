@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import secrets
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Literal, Protocol, TypeVar, cast
+
+from hermes_realtime.protocol.identifiers import IDENTIFIER as _IDENTIFIER
+from hermes_realtime.protocol.identifiers import MAX_IDENTIFIER_CHARS as _MAX_IDENTIFIER_CHARS
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN as _PRIVATE_AUTHORITY
+from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID
+from hermes_realtime.protocol.identifiers import TURN_ID as _ANCHOR_TURN_ID
 
 from .context import (
     ActiveTaskIdentityError,
@@ -45,13 +50,6 @@ WORK_ROUTING_POLICY = (
     "to propose work. Never claim you lack research or current-information access."
 )
 
-_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
-_MAX_IDENTIFIER_CHARS = 128
-# The browser projection's turn identity rule; checked before dispatch so a malformed
-# presentation anchor can never reach projection after the task was accepted.
-_ANCHOR_TURN_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}\Z")
 _MAX_REASON_CHARS = 1024
 _UNAVAILABLE_REASON = "work control unavailable; restart required"
 _NO_ACTIVE_REASON = "no active work"
@@ -323,6 +321,8 @@ class ConversationWorkControlSurface:
         if anchor_turn_id is not None:
             if type(anchor_turn_id) is not str:
                 raise TypeError("anchor_turn_id must be an exact built-in string or None")
+            # The browser projection's turn identity rule, checked before dispatch so a
+            # malformed anchor can never reach projection after the task was accepted.
             if _ANCHOR_TURN_ID.fullmatch(anchor_turn_id) is None:
                 raise ValueError("anchor_turn_id must be a bounded turn identity")
         admission = await self._admit_start_work(

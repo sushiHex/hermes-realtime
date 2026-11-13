@@ -26,8 +26,25 @@ _JWT = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 
 
+_CATEGORIES = frozenset({
+    "credential_invalid", "credential_unavailable", "account_mismatch", "credential_expired",
+})
+# Any other value is a programming error; it fails closed to this one fixed token.
+_UNLISTED = "unlisted"
+
+
 class AccessCredentialError(RuntimeError):
-    """Fixed category only; never retain a credential, path or native exception."""
+    """Fixed category only; never retain a credential, path or native exception.
+
+    The category is checked against the closed set when the error is made, so free text
+    passed here can never reach the refusal line.
+    """
+
+    def __init__(self, category: object) -> None:
+        self.category = _UNLISTED
+        if type(category) is str and category in _CATEGORIES:
+            self.category = category
+        super().__init__(self.category)
 
 
 def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -182,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         credential = read_access_credential(args.auth_file, args.account_sha256)
     except AccessCredentialError as error:
-        print('[codex-access-credential] ' + json.dumps({"version": 1, "category": str(error)}),
+        print('[codex-access-credential] ' + json.dumps({"version": 1, "category": error.category}),
               file=sys.stderr, flush=True)
         return 1
     print(json.dumps(credential, separators=(",", ":")), flush=True)

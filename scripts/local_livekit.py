@@ -15,6 +15,7 @@ candidates only on non-loopback adapters, and Windows refuses to send from such 
     uv run python -m scripts.local_livekit install   # download, verify and place it once
     uv run python -m scripts.local_livekit path      # print the verified executable
     uv run python -m scripts.local_livekit serve     # run it in development mode until Ctrl-C
+    uv run python -m scripts.local_livekit verify-upstream  # fetch the release again, compare
 
 Resolving and verifying the server needs only the standard library, so a script run out of
 ``scripts/`` can import this as ``local_livekit``. Installing reuses the qualification's
@@ -25,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
+import json
 import os
 import subprocess
 import sys
@@ -129,6 +132,24 @@ def install(
     return verified_server(environ)
 
 
+def verify_upstream(*, fetch: Callable[[str], bytes] = _download) -> str:
+    """Fetch the pinned release again, from upstream only, and classify it against the pins.
+
+    CI normally restores the archive from a cache, so a deleted or replaced upstream asset
+    would otherwise go unnoticed until the cache entry expired.
+    """
+
+    try:
+        archive = fetch(ARCHIVE_URL)
+    except (OSError, http.client.HTTPException):
+        return "download_unavailable"
+    try:
+        _pinned_executable(archive)
+    except LiveKitUnavailable:
+        return "pin_mismatch"
+    return "verified"
+
+
 def server_command(executable: Path) -> list[str]:
     """The command every local launcher starts: development mode, signaling on loopback."""
 
@@ -158,7 +179,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands.add_parser("install", help="download, verify and place the shared server")
     commands.add_parser("path", help="print the verified shared server")
     commands.add_parser("serve", help="run the shared server until Ctrl-C")
+    commands.add_parser("verify-upstream", help="fetch the pinned release and compare its pins")
     arguments = parser.parse_args(argv)
+    if arguments.command == "verify-upstream":
+        category = verify_upstream(fetch=_download)
+        # Categories only: no URL, path, digest or response text.
+        marker = {"version": 1, "input": "livekit-archive", "category": category}
+        print("[pinned-input] " + json.dumps(marker))
+        return 0 if category == "verified" else 1
     try:
         if arguments.command == "install":
             print(install())

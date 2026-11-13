@@ -60,17 +60,35 @@ jobs:
           Remove-Item -LiteralPath $probe -Recurse -Force -ErrorAction Stop
           "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # v6.1.0. Transport only: cache contents are not verified by GitHub, so the install
+      # step holds restored bytes to the same pinned SHA-256 as downloaded bytes.
+      - name: Cache pinned local LiveKit archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/livekit_1.13.4_windows_amd64.zip
+          key: livekit-windows-amd64-1.13.4-sha256-a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe
       - name: Install pinned local LiveKit server
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Bounded retry (about 4 min) for transient release-download 5xx outages; the checksum stays the authority.
-          $PSDefaultParameterValues = @{ 'Invoke-WebRequest:MaximumRetryCount' = 8; 'Invoke-WebRequest:RetryIntervalSec' = 30 }
           $archive = Join-Path $env:RUNNER_TEMP 'livekit_1.13.4_windows_amd64.zip'
-          Invoke-WebRequest 'https://github.com/livekit/livekit/releases/download/v1.13.4/livekit_1.13.4_windows_amd64.zip' -OutFile $archive
-          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          $expected = 'a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe'
-          if ($actual -ne $expected) { throw "LiveKit checksum mismatch: $actual" }
+          if (Test-Path -LiteralPath $archive -PathType Leaf) {
+            $source = 'restored'
+            $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            $expected = 'a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe'
+          } else {
+            $source = 'downloaded'
+            # Bounded retry (about 4 min) for transient release-download 5xx outages; the checksum stays the authority.
+            $PSDefaultParameterValues = @{ 'Invoke-WebRequest:MaximumRetryCount' = 8; 'Invoke-WebRequest:RetryIntervalSec' = 30 }
+            # scripts/qualification_livekit_files.py reads the pin from the next four statements as written.
+            $archive = Join-Path $env:RUNNER_TEMP 'livekit_1.13.4_windows_amd64.zip'
+            Invoke-WebRequest 'https://github.com/livekit/livekit/releases/download/v1.13.4/livekit_1.13.4_windows_amd64.zip' -OutFile $archive
+            $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            $expected = 'a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe'
+          }
+          # One comparison admits the archive from either source; a mismatch never downloads a replacement.
+          if ($actual -ne $expected) { throw "LiveKit checksum mismatch ($source): $actual" }
           $target = Join-Path $env:RUNNER_TEMP 'livekit'
           Expand-Archive -Path $archive -DestinationPath $target -Force
           $server = Join-Path $target 'livekit-server.exe'
@@ -383,17 +401,35 @@ jobs:
           Remove-Item -LiteralPath $probe -Recurse -Force -ErrorAction Stop
           "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # v6.1.0. Transport only: cache contents are not verified by GitHub, so the install
+      # step holds restored bytes to the same pinned SHA-256 as downloaded bytes.
+      - name: Cache pinned local LiveKit archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/livekit_1.13.4_windows_amd64.zip
+          key: livekit-windows-amd64-1.13.4-sha256-a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe
       - name: Install pinned local LiveKit server
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Bounded retry (about 4 min) for transient release-download 5xx outages; the checksum stays the authority.
-          $PSDefaultParameterValues = @{ 'Invoke-WebRequest:MaximumRetryCount' = 8; 'Invoke-WebRequest:RetryIntervalSec' = 30 }
           $archive = Join-Path $env:RUNNER_TEMP 'livekit_1.13.4_windows_amd64.zip'
-          Invoke-WebRequest 'https://github.com/livekit/livekit/releases/download/v1.13.4/livekit_1.13.4_windows_amd64.zip' -OutFile $archive
-          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          $expected = 'a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe'
-          if ($actual -ne $expected) { throw "LiveKit checksum mismatch: $actual" }
+          if (Test-Path -LiteralPath $archive -PathType Leaf) {
+            $source = 'restored'
+            $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            $expected = 'a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe'
+          } else {
+            $source = 'downloaded'
+            # Bounded retry (about 4 min) for transient release-download 5xx outages; the checksum stays the authority.
+            $PSDefaultParameterValues = @{ 'Invoke-WebRequest:MaximumRetryCount' = 8; 'Invoke-WebRequest:RetryIntervalSec' = 30 }
+            # scripts/qualification_livekit_files.py reads the pin from the next four statements as written.
+            $archive = Join-Path $env:RUNNER_TEMP 'livekit_1.13.4_windows_amd64.zip'
+            Invoke-WebRequest 'https://github.com/livekit/livekit/releases/download/v1.13.4/livekit_1.13.4_windows_amd64.zip' -OutFile $archive
+            $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            $expected = 'a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe'
+          }
+          # One comparison admits the archive from either source; a mismatch never downloads a replacement.
+          if ($actual -ne $expected) { throw "LiveKit checksum mismatch ($source): $actual" }
           $target = Join-Path $env:RUNNER_TEMP 'livekit'
           Expand-Archive -Path $archive -DestinationPath $target -Force
           $server = Join-Path $target 'livekit-server.exe'

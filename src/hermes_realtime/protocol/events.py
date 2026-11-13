@@ -17,6 +17,13 @@ from pydantic import (
     model_validator,
 )
 
+from .identifiers import (
+    IDENTIFIER_GRAMMAR,
+    MAX_IDENTIFIER_CHARS,
+    MAX_VOICE_CONVERSATION_ID_CHARS,
+    VOICE_CONVERSATION_ID_GRAMMAR,
+)
+
 NonEmptyString = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=8192),
@@ -28,8 +35,8 @@ IdentifierString = Annotated[
     str,
     StringConstraints(
         min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        max_length=MAX_IDENTIFIER_CHARS,
+        pattern=f"^{IDENTIFIER_GRAMMAR}$",
     ),
 ]
 
@@ -355,6 +362,20 @@ VOICE_REFUSAL_CATEGORIES = frozenset(
         "window",
     }
 )
+# What an evidence marker prints for a wire category outside the set above.
+VOICE_UNLISTED_REFUSAL = "unlisted"
+
+
+def voice_refusal_label(category: object) -> str:
+    """The marker label for a refusal category: a listed category, else one fixed label.
+
+    The wire type stays open so a newer companion's category still parses; a marker line
+    still prints only the closed vocabulary, never the received string.
+    """
+    if type(category) is str and category in VOICE_REFUSAL_CATEGORIES:
+        return category
+    return VOICE_UNLISTED_REFUSAL
+
 
 # The categories split into two closed sets whose union is exactly the set above. A
 # transient refusal says the companion cannot take the batch now (not ready, a lease, the
@@ -406,7 +427,12 @@ VOICE_INTEGRITY_REFUSALS = frozenset(
 )
 
 VoiceConversationId = Annotated[
-    str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=MAX_VOICE_CONVERSATION_ID_CHARS,
+        pattern=f"^{VOICE_CONVERSATION_ID_GRAMMAR}$",
+    ),
 ]
 VoiceIdentity = Annotated[int, Field(ge=0, le=_VOICE_MAX_IDENTITY)]
 VoiceRefusalCategory = Annotated[

@@ -22,6 +22,7 @@ from hermes_realtime.protocol import (
     VoiceArchiveRefusedEvent,
     VoiceForgetAckEvent,
     VoiceForgetEvent,
+    VoiceForgetRefusedEvent,
 )
 from hermes_realtime.speech import Transcript
 
@@ -153,6 +154,55 @@ async def test_a_stuck_delete_never_holds_up_a_later_one(tmp_path: Path) -> None
     assert sender.negotiated
     await sender.close()
     await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_forget_refusal_never_reaches_the_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=iter(("a", "b")).__next__)
+    context = ConversationContextStore(on_change=writer.update)
+    await writer.open(context)
+    await _offer(writer, context)
+    pending = await writer.request_forget(context)
+    replies = 0
+
+    class Link:
+        capabilities = frozenset({VOICE_FORGET_CAPABILITY})
+
+        async def forget(self, event: VoiceForgetEvent) -> VoiceForgetRefusedEvent:
+            nonlocal replies
+            replies += 1
+            return VoiceForgetRefusedEvent(
+                protocol_version="0.3", type="voice_forget_refused",
+                conversation_id=event.conversation_id, generation=event.generation,
+                category="sentinel_private",
+            )
+
+        async def close(self) -> None:
+            pass
+
+    async def connect() -> Link:
+        return Link()
+
+    sender = VoiceForgetSender(
+        writer, connect, initial_backoff_seconds=0.01, max_backoff_seconds=0.01
+    )
+    sender.start()
+    try:
+        async with asyncio.timeout(2):
+            while replies < 3:
+                await asyncio.sleep(0.01)
+        # Handling is unchanged: the delete stays pending and is resent.
+        assert writer.pending_deletes == (pending,)
+    finally:
+        await sender.close()
+        await writer.close()
+    output = capsys.readouterr().out
+    assert "sentinel_private" not in output
+    markers = [line for line in output.splitlines() if line.startswith("[voice-forget-send] ")]
+    # One marker per episode, the dedup still keyed by the received category.
+    assert markers == ['[voice-forget-send] {"outcome":"unlisted","version":1}']
 
 
 @pytest.mark.asyncio

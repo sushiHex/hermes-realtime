@@ -7,8 +7,10 @@ import json
 import re
 from urllib.parse import urlsplit
 
+from hermes_realtime.protocol.identifiers import PRIVATE_HANDLE as _PRIVATE_RESULT_HANDLE
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
+    MAX_LEGACY_RESULT_CHARS,
     UNUSABLE_RESULT_NOTICE,
     has_valid_result_unicode,
 )
@@ -17,9 +19,6 @@ _COMPLETION_REFERENCE = re.compile(
     r"(?:\[([^\]]+)\]\()?(https?://[^\s<>]+)", re.IGNORECASE,
 )
 _COMPLETION_MACHINE_TOKEN = re.compile(r"\b(?:task_|run_|deleg_)[A-Za-z0-9_.:-]+")
-_PRIVATE_RESULT_HANDLE = re.compile(
-    r"(?:deleg_[A-Za-z0-9_-]*|run_[A-Za-z0-9_-]{8,}|subagent_[A-Za-z0-9_-]+)"
-)
 _TAGGED_COMPLETION = re.compile(
     r"\A<voice>(?P<voice>[\s\S]*?)</voice>\s*"
     r"<detail>(?P<detail>[\s\S]*?)</detail>\Z"
@@ -191,9 +190,9 @@ def _browser_safe_task_result(detail: str, *, completed: bool = False) -> str:
 
 
 def _bounded_result(text: str) -> str:
-    if len(text) <= 1024:
+    if len(text) <= MAX_LEGACY_RESULT_CHARS:
         return text
-    boundary = text.rfind(" ", 0, 1021)
-    if boundary < 512:
-        boundary = 1021
+    boundary = text.rfind(" ", 0, MAX_LEGACY_RESULT_CHARS - 3)
+    if boundary < MAX_LEGACY_RESULT_CHARS // 2:
+        boundary = MAX_LEGACY_RESULT_CHARS - 3
     return text[:boundary].rstrip() + "..."

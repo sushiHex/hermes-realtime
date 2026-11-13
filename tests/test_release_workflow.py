@@ -269,6 +269,11 @@ def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
     expected_uses = (5, 5, 3, 4)
     for pin, expected_count in zip(node24_pins, expected_uses, strict=True):
         assert workflow.count(f"uses: {pin}") == expected_count
+    # v6.1.0, node24. The only uses of actions/cache; see
+    # tests/test_release_workflow_livekit_cache.py for what they may carry.
+    cache = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+    assert workflow.count(f"uses: actions/cache@{cache}") == 2
+    assert workflow.count("actions/cache") == 2
     assert workflow.count("prune-cache: true") == 4
     assert workflow.count('version: "0.11.28"') == 4
 

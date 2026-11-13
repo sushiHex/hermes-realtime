@@ -22,6 +22,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import cast
 
+from hermes_realtime.protocol.identifiers import VOICE_CONVERSATION_ID as _CONVERSATION_ID
+
 VOICE_SOURCE = "hermes-realtime-voice"
 # Provisional per-conversation bound: verification is O(rows), so the bound keeps it cheap.
 MAX_ARCHIVE_ROWS = 4096
@@ -102,7 +104,6 @@ REFUSAL_CATEGORIES = frozenset(
     }
 )
 
-_CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _CHAIN = re.compile(r"[0-9a-f]{64}")
 
 

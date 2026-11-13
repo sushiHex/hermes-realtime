@@ -18,6 +18,7 @@ from hermes_realtime.protocol import (
     VOICE_REFUSAL_CATEGORIES,
     VOICE_REVIEW_CAPABILITY,
     VOICE_TRANSIENT_REFUSALS,
+    VOICE_UNLISTED_REFUSAL,
     RuntimeAttestation,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
@@ -25,6 +26,7 @@ from hermes_realtime.protocol import (
     VoiceArchiveRow,
     parse_event,
     parse_voice_event,
+    voice_refusal_label,
 )
 
 
@@ -228,6 +230,21 @@ def test_a_refusal_category_is_a_bounded_string_on_the_wire_not_a_closed_list() 
     assert type(refused) is VoiceArchiveRefusedEvent
     assert refused.category == "novel"
     assert "novel" not in VOICE_TRANSIENT_REFUSALS | VOICE_INTEGRITY_REFUSALS
+
+
+def test_a_marker_label_is_a_listed_category_or_one_fixed_label() -> None:
+    # The fixed label cannot be mistaken for a category the companion sent.
+    assert VOICE_UNLISTED_REFUSAL not in VOICE_REFUSAL_CATEGORIES
+    for category in VOICE_REFUSAL_CATEGORIES:
+        assert voice_refusal_label(category) == category
+    for received in ("novel", "sentinel_private", "", None, 7, b"invalid"):
+        assert voice_refusal_label(received) == VOICE_UNLISTED_REFUSAL
+
+    class Category(str):
+        pass
+
+    # Only an exact string is looked up; a subclass could carry another rendering.
+    assert voice_refusal_label(Category("invalid")) == VOICE_UNLISTED_REFUSAL
 
 
 def test_a_voice_event_names_its_protocol_version_explicitly() -> None:

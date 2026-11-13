@@ -19,17 +19,16 @@ proof that covers every deleted binding, not only the ones the record still list
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 
 from hermes_realtime.integration.run_record import strict_object
+from hermes_realtime.protocol.identifiers import VOICE_CONVERSATION_ID as _CONVERSATION_ID
 
 _VERSION = 1
 # Deletes a request may leave to verify; a bound, never a lifetime limit, since each settles.
 MAX_PENDING_DELETES = 64
 # The record holds one more: a version-4 tail's single intent moves in even when it is full.
 _MAX_RECORDED = MAX_PENDING_DELETES + 1
-_CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _MAX_IDENTITY = 2**53 - 1
 # A binding is at most 64 id characters and 16 digits, with JSON punctuation.
 _MAX_BINDING_BYTES = 96

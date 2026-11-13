@@ -16,15 +16,15 @@ from hermes_realtime.evidence import (
     FinalInputAuthorityV1,
 )
 from hermes_realtime.evidence.lifecycle import EvidenceConversationAuthorityV1
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN as _PRIVATE_AUTHORITY
+from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID
 
 from .context import ActiveTaskIdentityError, PrivateRunDisclosureError
 from .task_proposals import ConversationTaskProposals
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
 from .work_tools import WorkCommandAdmission
 
-_TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}\Z")
 _COMMAND_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,110}\Z")
-_PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 _MAX_OBJECTIVE_CHARS = 1024
 _SPOKEN_START = re.compile(r"start task(?:\s+(.*)|[.!?])?\Z", re.IGNORECASE | re.DOTALL)
 _SPOKEN_CANCEL = re.compile(r"cancel task[.!?]?\Z", re.IGNORECASE)
