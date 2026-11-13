@@ -321,10 +321,11 @@ Check from terminal D that the API server answers and listens on loopback only:
 
 ```powershell
 curl.exe --fail http://127.0.0.1:8642/health
-Get-NetTCPConnection -State Listen -LocalPort 8642 | Select-Object LocalAddress, LocalPort
+Get-NetTCPConnection -State Listen -LocalPort 8642 | Select-Object LocalAddress, LocalPort, OwningProcess
 ```
 
-Every `LocalAddress` must be `127.0.0.1` or `::1`. Do not continue otherwise; this is the same
+`OwningProcess` is shown because some Windows builds report closed connections as Listen with
+owner 0 (#515); ignore such rows. Every other `LocalAddress` must be `127.0.0.1` or `::1`. Do not continue otherwise; this is the same
 requirement as [`local-livekit.md`](local-livekit.md#one-time-hermes-api-setup).
 
 ### 7. Prepare the LiveKit server

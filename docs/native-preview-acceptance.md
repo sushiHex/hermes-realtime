@@ -248,8 +248,13 @@ category `no_previous_handoff`, and continue the step. Do not edit a receipt.
              [int](Get-Content "<output>\supervisor.pid.private.txt"))
   @(Get-Process -Id $owned -ErrorAction SilentlyContinue).Count
   @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-    Where-Object LocalPort -in <ports.api>, <ports.companion>, <ports.livekit>, <ports.host>).Count
+    Where-Object { $_.OwningProcess -ne 0 -and
+                   $_.LocalPort -in <ports.api>, <ports.companion>, <ports.livekit>, <ports.host> }).Count
   ```
+
+  The listener count keeps only rows with a real owning process (`OwningProcess -ne 0`)
+  because some Windows builds report closed connections as Listen with owner 0
+  (#515).
 
   With managed GPU speech, also read the vram-mcp coordinator's own status and count
   the Kokoro claims this session still holds.
