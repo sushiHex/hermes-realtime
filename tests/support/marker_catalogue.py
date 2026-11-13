@@ -1178,9 +1178,4 @@ KNOWN_FREE_STRINGS: dict[tuple[str, str, str], str] = {
         "hermes-continuity-ready",
         "version: attribute: hermes_cli.__version__",
     ): "a version string from another package",
-    (
-        "scripts/release_gate.py",
-        "declared-tool-path",
-        "refusal: bound: refusal",
-    ): "the class name of any exception that is not the guard's own refusal",
 }

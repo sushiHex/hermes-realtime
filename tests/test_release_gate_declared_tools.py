@@ -451,21 +451,38 @@ def test_python_reselection_refusal(
     ]
 
 
-def test_unexpected_error_reports_only_its_type(
+def test_unexpected_error_reports_a_fixed_label_and_never_its_type(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     gate = _release_gate()
     _, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
 
+    # An exception class is named by whoever raised it. Its name is not a
+    # category this gate chose, so it must not reach the marker.
+    class ThirdPartyNamedFailure9c41(Exception):
+        pass
+
+    failure = ThirdPartyNamedFailure9c41(f"cannot start {SENTINEL}")
+
     def unavailable(*_args: object) -> Path:
-        raise OSError(f"cannot start {SENTINEL}")
+        raise failure
 
     namespace = gate["declared_stage_environments"].__globals__
     monkeypatch.setitem(namespace, "uv_selected_python", unavailable)
 
-    assert _refuse(gate, ambient, tmp_path, capsys) == [
-        {"stage": "uv", "refusal": "OSError", "tool": None}
-    ]
+    with pytest.raises(ThirdPartyNamedFailure9c41) as raised:
+        gate["declared_stage_environments"]({"PATH": ambient}, tmp_path)
+    assert raised.value is failure
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        '[declared-tool-path] {"stage": "uv", "refusal": "unexpected_error", "tool": null}\n'
+    )
+    assert "ThirdPartyNamedFailure9c41" not in captured.err
+    assert "9c41" not in captured.err and SENTINEL not in captured.err
+    assert "unexpected_error" not in gate["DECLARED_TOOL_REFUSALS"]
+    with pytest.raises(ValueError, match="unknown declared-tool refusal category"):
+        gate["DeclaredToolRefusal"]("unexpected_error", None, "not a guard decision")
 
 
 def test_unsupported_platform_refusal(

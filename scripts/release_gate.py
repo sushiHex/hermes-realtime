@@ -250,7 +250,9 @@ def _declared_tool_refusal_evidence() -> Iterator[_DeclaredToolStage]:
         if type(error) is DeclaredToolRefusal:
             refusal, tool = error.refusal, error.tool
         else:
-            refusal, tool = type(error).__name__, None
+            # An exception's class name is chosen by whoever raised it, so it
+            # is not a category. The exception itself propagates unchanged.
+            refusal, tool = "unexpected_error", None
         record = {
             "stage": stage.name if stage.name in DECLARED_TOOL_STAGES else "setup",
             "refusal": refusal,
@@ -504,6 +506,7 @@ def _resolved_commit_oid(source: Path, revision: str, *, label: str) -> str:
         cwd=source,
         env=clean_git_environment(),
         capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
     if resolved.returncode != 0 or re.fullmatch(rb"[0-9a-f]{40}\n", resolved.stdout) is None:
         fail(f"{label} must resolve to a full lowercase Git commit OID")
@@ -548,6 +551,7 @@ def candidate_diff_binding(source: Path, baseline: str | None, *, revision: str)
                 cwd=source,
                 env=clean_git_environment(),
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
             )
             if resolved.returncode != 0 or resolved.stdout != baseline.encode("ascii") + b"\n":
                 raise BaselineRefusal(
@@ -568,6 +572,7 @@ def candidate_diff_binding(source: Path, baseline: str | None, *, revision: str)
                 + json.dumps(
                     {"version": 1, "category": category, "explicit": baseline is not None}
                 ),
+                file=sys.stderr,
                 flush=True,
             )
 
@@ -590,6 +595,7 @@ def canonical_candidate_diff_sha256(
             cwd=source,
             env=clean_git_environment(),
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             check=True,
         ).stdout.strip().split()
@@ -626,6 +632,7 @@ def canonical_candidate_diff_sha256(
                 cwd=source,
                 env=diff_environment,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 check=True,
             ).stdout
             return hashlib.sha256(diff).hexdigest()
@@ -642,6 +649,7 @@ def canonical_candidate_diff_sha256(
         cwd=source,
         env=clean_git_environment(),
         capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
     if ancestry.returncode != 0:
         raise BaselineRefusal(
@@ -676,6 +684,7 @@ def canonical_candidate_diff_sha256(
         cwd=source,
         env=diff_environment,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
         check=True,
     ).stdout
     return hashlib.sha256(diff).hexdigest()
@@ -685,6 +694,7 @@ def _require_no_local_attributes(source: Path) -> None:
     attributes = subprocess.run(
         ("git", "rev-parse", "--git-path", "info/attributes"), cwd=source,
         env=clean_git_environment(), capture_output=True, text=True, check=True,
+        stdin=subprocess.DEVNULL,
     ).stdout.strip()
     attributes_path = source / attributes
     if attributes_path.exists() and attributes_path.stat().st_size:
@@ -1728,11 +1738,12 @@ def self_test() -> None:
             (linear[target], "baseline commit must be an ancestor of candidate HEAD"),
         )
         markers = io.StringIO()
-        with contextlib.redirect_stdout(markers):
+        with contextlib.redirect_stderr(markers):
             for baseline, expected in refused:
                 expect_failure(
                     lambda baseline=baseline: print(
-                        candidate_diff_binding(history, baseline, revision=merge)
+                        candidate_diff_binding(history, baseline, revision=merge),
+                        file=sys.stderr,
                     ),
                     expected,
                 )

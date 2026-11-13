@@ -89,6 +89,14 @@ def later_stages(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return reached
 
 
+def _read(capsys: pytest.CaptureFixture[str]) -> tuple[str, str]:
+    """Return stdout and stderr; refusal evidence belongs to stderr alone."""
+    captured = capsys.readouterr()
+    assert _MARKER not in captured.out
+    assert all(line.startswith(_MARKER) for line in captured.err.splitlines())
+    return captured.out, captured.err
+
+
 def _markers(output: str) -> list[dict[str, object]]:
     return [
         json.loads(line.removeprefix(_MARKER))
@@ -107,10 +115,10 @@ def test_gate_refuses_merge_candidate_without_baseline_before_any_stage(
 ) -> None:
     with pytest.raises(RuntimeError, match="a merge candidate requires an explicit baseline"):
         gate.gate(merged.root, False)
-    output = capsys.readouterr().out
+    output, errors = _read(capsys)
     assert later_stages == []
     assert _DIGEST_LINE not in output
-    assert _markers(output) == [
+    assert _markers(errors) == [
         {"version": 1, "category": "merge_requires_baseline", "explicit": False}
     ]
 
@@ -119,9 +127,9 @@ def test_gate_binds_merge_candidate_to_its_explicit_baseline(
     merged: _MergeFixture, later_stages: list[str], capsys: pytest.CaptureFixture[str]
 ) -> None:
     gate.gate(merged.root, False, baseline=merged.target)
-    output = capsys.readouterr().out
+    output, errors = _read(capsys)
     assert later_stages == ["scan", "archive", "gate"]
-    assert _markers(output) == []
+    assert _markers(errors) == []
     # The binding is exactly the one a single-parent commit with the same tree on
     # the same baseline already receives, and is not the other parent's binding.
     linear = gate.canonical_candidate_diff_sha256(
@@ -138,7 +146,7 @@ def test_gate_binds_each_merge_parent_only_when_named(
     merged: _MergeFixture, later_stages: list[str], capsys: pytest.CaptureFixture[str]
 ) -> None:
     gate.gate(merged.root, False, baseline=merged.topic)
-    assert _printed_digest(capsys.readouterr().out) == gate.canonical_candidate_diff_sha256(
+    assert _printed_digest(_read(capsys)[0]) == gate.canonical_candidate_diff_sha256(
         merged.root, None, revision=merged.squash_onto(merged.topic)
     )
 
@@ -220,11 +228,11 @@ def test_gate_refuses_inexact_or_unrelated_baseline_before_any_stage(
     capsys.readouterr()
     with pytest.raises(RuntimeError, match=message):
         gate.gate(merged.root, False, baseline=supplied)
-    output = capsys.readouterr().out
+    output, errors = _read(capsys)
     assert later_stages == []
     assert _DIGEST_LINE not in output
-    assert _markers(output) == [{"version": 1, "category": category, "explicit": True}]
-    marker_lines = [line for line in output.splitlines() if line.startswith(_MARKER)]
+    assert _markers(errors) == [{"version": 1, "category": category, "explicit": True}]
+    marker_lines = [line for line in errors.splitlines() if line.startswith(_MARKER)]
     assert len(marker_lines) == 1 and len(marker_lines[0]) < 128
     assert str(supplied)[:12] not in marker_lines[0]
 
@@ -234,13 +242,13 @@ def test_single_parent_candidate_keeps_its_implicit_parent_binding(
 ) -> None:
     _git(merged.root, "checkout", "-q", "--detach", merged.topic)
     gate.gate(merged.root, False)
-    output = capsys.readouterr().out
+    output, errors = _read(capsys)
     assert later_stages == ["scan", "archive", "gate"]
-    assert _markers(output) == []
+    assert _markers(errors) == []
     implicit = _printed_digest(output)
     # Naming the only parent states the same binding; it never changes it.
     gate.gate(merged.root, False, baseline=merged.fork)
-    assert _printed_digest(capsys.readouterr().out) == implicit
+    assert _printed_digest(_read(capsys)[0]) == implicit
 
 
 def test_single_parent_candidate_accepts_an_earlier_explicit_baseline(
@@ -249,7 +257,7 @@ def test_single_parent_candidate_accepts_an_earlier_explicit_baseline(
     _git(merged.root, "checkout", "-q", "--detach", merged.topic)
     tip = _commit(merged.root, "more.py", b"more\n", "second topic change")
     gate.gate(merged.root, False, baseline=merged.fork)
-    explicit = _printed_digest(capsys.readouterr().out)
+    explicit = _printed_digest(_read(capsys)[0])
     assert explicit == gate.canonical_candidate_diff_sha256(merged.root, merged.fork)
     assert explicit != gate.canonical_candidate_diff_sha256(merged.root, None, revision=tip)
 
@@ -259,14 +267,14 @@ def test_root_candidate_stays_valid_and_admits_no_baseline(
 ) -> None:
     _git(merged.root, "checkout", "-q", "--detach", merged.fork)
     gate.gate(merged.root, False)
-    output = capsys.readouterr().out
+    output, errors = _read(capsys)
     assert later_stages == ["scan", "archive", "gate"]
     assert _printed_digest(output) == gate.canonical_candidate_diff_sha256(merged.root, None)
     later_stages.clear()
     with pytest.raises(RuntimeError, match="must be an ancestor of candidate HEAD"):
         gate.gate(merged.root, False, baseline=merged.target)
     assert later_stages == []
-    assert _markers(capsys.readouterr().out) == [
+    assert _markers(_read(capsys)[1]) == [
         {"version": 1, "category": "not_ancestor", "explicit": True}
     ]
 
@@ -277,7 +285,41 @@ def test_unrelated_failure_emits_no_baseline_marker(
     (merged.root / ".git" / "info" / "attributes").write_text("*.py -diff\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="local info attributes"):
         gate.gate(merged.root, False, baseline=merged.target)
-    assert _markers(capsys.readouterr().out) == []
+    assert _markers(_read(capsys)[1]) == []
+
+
+@pytest.mark.parametrize("candidate", ["merge_explicit", "merge_refused", "single", "root"])
+def test_binding_never_lends_its_stdin_to_git(
+    merged: _MergeFixture, monkeypatch: pytest.MonkeyPatch, candidate: str
+) -> None:
+    real = subprocess.run
+    calls: list[tuple[str, object]] = []
+
+    def recording(command, *args, **kwargs):
+        calls.append((command[1 + 2 * command.count("-c")], kwargs.get("stdin")))
+        return real(command, *args, **kwargs)
+
+    revision, baseline = {
+        "merge_explicit": (merged.merge, merged.target),
+        "merge_refused": (merged.merge, None),
+        "single": (merged.topic, None),
+        "root": (merged.fork, None),
+    }[candidate]
+    monkeypatch.setattr(gate.subprocess, "run", recording)
+    if candidate == "merge_refused":
+        with pytest.raises(gate.BaselineRefusal):
+            gate.candidate_diff_binding(merged.root, baseline, revision=revision)
+    else:
+        gate.candidate_diff_binding(merged.root, baseline, revision=revision)
+    monkeypatch.undo()
+    expected = {
+        "merge_explicit": [*["rev-parse"] * 4, "merge-base", "diff"],
+        "merge_refused": ["rev-parse", "rev-parse", "rev-list"],
+        "single": ["rev-parse", "rev-parse", "rev-list", "rev-parse", "merge-base", "diff"],
+        "root": ["rev-parse", "rev-parse", "rev-list", "diff-tree"],
+    }[candidate]
+    assert [name for name, _ in calls] == expected
+    assert [name for name, stdin in calls if stdin is not subprocess.DEVNULL] == []
 
 
 def test_baseline_refusal_category_is_closed() -> None:
@@ -351,4 +393,5 @@ def test_self_test_keeps_baseline_refusal_markers_out_of_its_output(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     gate.self_test()
-    assert _MARKER not in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert _MARKER not in captured.out + captured.err

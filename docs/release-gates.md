@@ -71,7 +71,8 @@ must still select the same interpreter, and an undeclared guarded tool must not
 resolve. A shared directory that exposes one fails the gate; it is not dropped.
 Each refusal writes one `[declared-tool-path]` JSON line to stderr, giving the
 stage, a fixed refusal category and the guarded tool name. It contains no paths,
-no `PATH` contents and no versions.
+no `PATH` contents and no versions. An error that is not a guard decision is
+reported as `unexpected_error`, never by its exception class name.
 
 CI does not use this mode. Hosted `PATH` is already the reference, and setup-python
 supplies uv's interpreter there. Explicit injection in tests remains the primary
@@ -610,8 +611,8 @@ uv run --frozen --group dev python scripts/release_gate.py --candidate . --basel
 revision expression, an abbreviation, an annotated tag object, a missing
 object, the candidate itself, and a commit outside the candidate's history are
 all refused before any scan, archive, or test runs. A merge candidate without
-`--baseline` is refused the same way. Each refusal prints one
-`[release-gate-baseline]` JSON line carrying a fixed category and whether a
+`--baseline` is refused the same way. Each refusal writes one
+`[release-gate-baseline]` JSON line to stderr carrying a fixed category and whether a
 baseline was supplied; it contains no OID and no path. Naming the baseline of a
 single-parent candidate is allowed; naming its only parent yields the same
 digest as omitting it.
