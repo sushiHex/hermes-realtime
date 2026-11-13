@@ -112,6 +112,9 @@ async def test_automatic_stream_reports_only_real_ack_after_one_silent_submissio
         expected["reason"] = "Hermes declined the request"
     assert events == [("task_state", expected)]
     assert controller.cancellations == [] and len(controller.dispatches) == 1
+    # Silent submission; afterwards only the real ack, or one fixed host sentence (#353).
+    assert synth.texts == (["The work is underway."] if accepted
+                           else ["No new background task is running for that request."])
 
 
 @pytest.mark.asyncio
