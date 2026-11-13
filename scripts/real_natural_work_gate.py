@@ -43,6 +43,7 @@ from hermes_realtime.conversation import (
     WorkStartResult,
 )
 from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN
 from hermes_realtime.providers.codex_app_server import (
     CodexAppServerStreamingInference,
     SubprocessCodexJsonLineTransport,
@@ -83,7 +84,7 @@ _VERSION_ENVIRONMENT_ALLOWLIST = frozenset(
     }
 )
 _PRIVATE_AUTHORITY = re.compile(
-    r"(?:deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*|"
+    f"(?:{PRIVATE_RUN_TOKEN.pattern}|"
     r"(?<![A-Za-z0-9_-])run_[A-Za-z0-9][A-Za-z0-9_-]{15,127}(?![A-Za-z0-9_-]))"
 )
 _CODEX_PROTOCOL_FIXTURE = (

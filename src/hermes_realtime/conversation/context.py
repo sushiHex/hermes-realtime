@@ -1,13 +1,16 @@
 """Bounded immutable context exposed to latency-critical model adapters."""
 
 import json
-import re
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
 from hermes_realtime.memory import BuiltinMemorySnapshot
+from hermes_realtime.protocol.identifiers import DELEGATION_RUN_ID as _RUN_ID_PATTERN
+from hermes_realtime.protocol.identifiers import IDENTIFIER as _IDENTIFIER_PATTERN
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN as _PRIVATE_RUN_TOKEN_PATTERN
+from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID_PATTERN
 from hermes_realtime.speech import (
     DeliveredSpeechConfirmation,
     DeliveredSpeechLedger,
@@ -29,9 +32,6 @@ _MAX_PENDING_ASSISTANT_ADMISSIONS_LIMIT = 256
 _MAX_REVISION_LIMIT = 2**63 - 1
 _MAX_RECENT_TASK_RESULTS = 8
 _MAX_RECENT_TASK_RESULT_CHARS = 1024
-_TASK_ID_PATTERN = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_RUN_ID_PATTERN = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_PRIVATE_RUN_TOKEN_PATTERN = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 
 
 def _validate_model_visible_value(value: str) -> None:
@@ -127,7 +127,7 @@ class ActiveTaskSummary:
             raise TypeError("objective must be an exact built-in string")
         if not self.task_id.strip() or not self.objective.strip():
             raise ValueError("task summary fields must not be blank")
-        if len(self.task_id) > 128 or _TASK_ID_PATTERN.fullmatch(self.task_id) is None:
+        if _TASK_ID_PATTERN.fullmatch(self.task_id) is None:
             raise ValueError("task_id is not a valid model-visible identifier")
         if len(self.objective) > _MAX_ITEM_CHARS_LIMIT:
             raise ValueError("task objective exceeds supported maximum")
@@ -882,7 +882,7 @@ class ConversationContextStore:
     def _validate_identifier(value: str, name: str) -> None:
         if type(value) is not str:
             raise TypeError(f"{name} must be an exact built-in string")
-        if len(value) > 128 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value) is None:
+        if _IDENTIFIER_PATTERN.fullmatch(value) is None:
             raise ValueError(f"{name} is not a valid identifier")
 
     @staticmethod

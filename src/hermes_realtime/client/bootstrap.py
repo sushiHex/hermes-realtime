@@ -16,9 +16,9 @@ from typing import cast
 from livekit import api
 
 from hermes_realtime.livekit import LiveKitConnection
+from hermes_realtime.protocol.identifiers import BROWSER_IDENTITY as _IDENTITY_PATTERN
 
 _ROOM_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
-_IDENTITY_PATTERN = re.compile(r"browser_[a-f0-9]{16,64}\Z")
 
 
 @dataclass(frozen=True, slots=True)

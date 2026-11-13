@@ -17,6 +17,13 @@ from pydantic import (
     model_validator,
 )
 
+from .identifiers import (
+    IDENTIFIER_GRAMMAR,
+    MAX_IDENTIFIER_CHARS,
+    MAX_VOICE_CONVERSATION_ID_CHARS,
+    VOICE_CONVERSATION_ID_GRAMMAR,
+)
+
 NonEmptyString = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=8192),
@@ -28,8 +35,8 @@ IdentifierString = Annotated[
     str,
     StringConstraints(
         min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        max_length=MAX_IDENTIFIER_CHARS,
+        pattern=f"^{IDENTIFIER_GRAMMAR}$",
     ),
 ]
 
@@ -406,7 +413,12 @@ VOICE_INTEGRITY_REFUSALS = frozenset(
 )
 
 VoiceConversationId = Annotated[
-    str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=MAX_VOICE_CONVERSATION_ID_CHARS,
+        pattern=f"^{VOICE_CONVERSATION_ID_GRAMMAR}$",
+    ),
 ]
 VoiceIdentity = Annotated[int, Field(ge=0, le=_VOICE_MAX_IDENTITY)]
 VoiceRefusalCategory = Annotated[

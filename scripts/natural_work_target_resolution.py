@@ -20,6 +20,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID
+
 TARGET_RESOLUTION_SHA256 = "39bb0bbf823f55df07c5e2e73ca84ceafc3ae6c0dc31701bf03db484d8558351"
 
 _MAX_INPUT_BYTES = 64 * 1024
@@ -29,8 +31,6 @@ _MAX_TEXT_CHARS = 512
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _PUBLIC_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _CASE_ID = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
-# Mirrors the model-visible task id contract in hermes_realtime.conversation.context.
-_TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}\Z")
 _OUTCOMES = ("target", "no_match", "clarify")
 _BUCKETS = {"target": "matched", "no_match": "mismatched", "clarify": "ambiguous"}
 
