@@ -137,45 +137,99 @@ def _statements(node: ast.AST, kind: str) -> Iterator[tuple[ast.AST, str]]:
         yield from _statements(child, kind)
 
 
-def _absolute(anchor: str, level: int, module: str | None) -> str:
-    parts = [PACKAGE, *anchor.split(".")] if anchor else [PACKAGE]
+def _in_package(name: str) -> bool:
+    return name == PACKAGE or name.startswith(PACKAGE + ".")
+
+
+def _relative(package: str, level: int, module: str | None) -> str:
+    """Resolve a relative name as Python does: ``level`` 1 is ``package`` itself."""
+    parts = package.split(".")
     if level > len(parts):
-        raise AssertionError(f"relative import climbs above {PACKAGE}")
+        raise AssertionError(f"relative import climbs above {package}")
     return ".".join([*parts[: len(parts) - (level - 1)], *([module] if module else [])])
 
 
-def _targets(node: ast.AST, anchor: str) -> Iterator[str]:
+def _members(base: str, names: list[str]) -> Iterator[str]:
+    """``from base import name`` imports a submodule when one has that name."""
+    for name in names:
+        child = f"{base}.{name}"
+        yield child if child.removeprefix(PACKAGE + ".") in FILES else base
+
+
+def _is_text(node: ast.AST | None) -> bool:
+    return type(node) is ast.Constant and type(node.value) is str
+
+
+def _argument(call: ast.Call, position: int, keyword: str) -> ast.expr | None:
+    if len(call.args) > position:
+        return call.args[position]
+    return next((item.value for item in call.keywords if item.arg == keyword), None)
+
+
+def _dynamic(call: ast.Call, where: str) -> Iterator[str]:
+    """Yield what an ``import_module`` or ``__import__`` call with a literal name imports.
+
+    A computed name is outside a static measurement. A literal name whose target still
+    depends on a runtime value fails here instead: an import that cannot be resolved
+    must not read as an allowed one.
+    """
+    called = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+    name = _argument(call, 0, "name")
+    if called not in ("import_module", "__import__") or not _is_text(name):
+        return
+    text = name.value
+
+    def unresolved(why: str) -> AssertionError:
+        return AssertionError(
+            f"{where} line {call.lineno}: the target of {called}({text!r}, ...) cannot be "
+            f"established from source: {why}. Use an import statement or literal arguments."
+        )
+
+    if any(type(item) is ast.Starred for item in call.args) or any(
+        item.arg is None for item in call.keywords
+    ):
+        raise unresolved("its arguments are unpacked")
+    if called == "import_module":
+        if not text.startswith("."):
+            yield text
+            return
+        package, module = _argument(call, 1, "package"), text.lstrip(".")
+        if not _is_text(package) or not module:
+            raise unresolved("a relative name needs a literal package to resolve against")
+        yield _relative(package.value, len(text) - len(module), module)
+        return
+    level, fromlist = _argument(call, 4, "level"), _argument(call, 3, "fromlist")
+    absolute = level is None or (type(level) is ast.Constant and level.value == 0)
+    if text.startswith(".") or not absolute:
+        raise unresolved("a relative __import__ resolves against its globals")
+    if fromlist is None:
+        yield text
+    elif type(fromlist) in (ast.Tuple, ast.List) and all(map(_is_text, fromlist.elts)):
+        yield from _members(text, [item.value for item in fromlist.elts] or [""])
+    elif _in_package(text):
+        raise unresolved("its fromlist is not a literal")
+
+
+def _targets(node: ast.AST, anchor: str, where: str) -> Iterator[str]:
     """Yield the absolute dotted names ``node`` imports. ``anchor`` is its package."""
     if type(node) is ast.Import:
         yield from (alias.name for alias in node.names)
     elif type(node) is ast.ImportFrom:
-        base = _absolute(anchor, node.level, node.module) if node.level else node.module or ""
-        for alias in node.names:
-            # ``from package import name`` imports a submodule when one has that name.
-            child = f"{base}.{alias.name}"
-            yield child if child.removeprefix(PACKAGE + ".") in FILES else base
+        base = _relative(anchor, node.level, node.module) if node.level else node.module or ""
+        yield from _members(base, [alias.name for alias in node.names])
     elif type(node) is ast.Call:
-        function = node.func
-        called = getattr(function, "id", None) or getattr(function, "attr", None)
-        literal = node.args[0] if node.args else None
-        if called not in ("import_module", "__import__") or type(literal) is not ast.Constant:
-            return
-        if type(literal.value) is str:
-            name = literal.value.lstrip(".")
-            level = len(literal.value) - len(name)
-            yield _absolute(anchor, level, name or None) if level else name
+        yield from _dynamic(node, where)
 
 
 def _package_imports() -> Iterator[tuple[str, str, str]]:
     """Yield (importing module, imported module, kind) for imports inside the package."""
     for module, path in FILES.items():
-        is_package = path.name == "__init__.py"
-        anchor = module if is_package else module.rpartition(".")[0]
-        anchor = "" if anchor == "__init__" else anchor
+        qualified = PACKAGE if module == "__init__" else f"{PACKAGE}.{module}"
+        anchor = qualified if path.name == "__init__.py" else qualified.rpartition(".")[0]
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node, kind in _statements(tree, RUNTIME):
-            for target in _targets(node, anchor):
-                if target == PACKAGE or target.startswith(PACKAGE + "."):
+            for target in _targets(node, anchor, module):
+                if _in_package(target):
                     yield module, target.removeprefix(PACKAGE).lstrip(".") or "__init__", kind
 
 

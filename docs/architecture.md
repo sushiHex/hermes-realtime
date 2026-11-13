@@ -22,7 +22,12 @@ The same test measures the real import graph from source and compares it with th
   holds it. Placing a unit, or moving one between tiers, is a design decision and is
   reviewed as one.
 
-Limits: the measurement is static. It does not see an `import_module` call whose name is
-computed, and it says nothing about third-party imports. Lazy loading of heavy provider
+A dynamic call with a literal name whose target still depends on a runtime value fails the
+test instead of being guessed: a relative `import_module` name without a literal `package`,
+an `__import__` with a `level`, a non-literal `fromlist` on this package, or unpacked
+arguments.
+
+Limits: the measurement is static. It does not see a dynamic import whose name is computed
+or whose function is aliased, and it says nothing about third-party imports. Lazy loading of heavy provider
 dependencies is a separate property, held by
 [`tests/providers/test_package_import.py`](../tests/providers/test_package_import.py).
