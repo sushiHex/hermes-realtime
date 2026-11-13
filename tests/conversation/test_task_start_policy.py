@@ -135,7 +135,7 @@ async def test_automatic_unavailable_surface_projects_refusal_without_dispatch(h
         await proposals.submit(HostTaskProposalRequest("Inspect exact release"))
         assert controller.dispatches == [] and not proposals.has_pending
         assert events == [("task_state", {"status": "rejected", "taskId": None,
-            "reason": "Task control is unavailable. Restart the session before trying again."})]
+            "reason": "Task control is unavailable until the host restarts."})]
     finally:
         await surface.close()
 
@@ -155,4 +155,4 @@ async def test_automatic_ack_wait_reports_unavailable_without_dispatch():
     assert result is not None and result.accepted is False
     assert controller.dispatches == []
     assert events == [("task_state", {"status": "rejected", "taskId": None,
-        "reason": "Task control is unavailable. Restart the session before trying again."})]
+        "reason": "Task control is unavailable until the host restarts."})]

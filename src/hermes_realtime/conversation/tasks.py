@@ -267,9 +267,14 @@ class ConversationTaskController:
         max_terminal_updates: int = 8,
         close_drain_timeout_ms: int = 1000,
         max_protocol_operations: int = 4096,
+        on_latched: Callable[[], None] | None = None,
     ) -> None:
         if type(context) is not ConversationContextStore:
             raise TypeError("context must be an exact ConversationContextStore")
+        if on_latched is not None and not callable(on_latched):
+            raise TypeError("on_latched must be callable or None")
+        # Told once when a failure latches this controller; closing it is not a failure.
+        self._on_latched = on_latched
         _validate_protocol_identifier(session_id, "session_id")
         if not callable(id_factory) or not callable(clock):
             raise TypeError("id_factory and clock must be callable")
@@ -460,7 +465,9 @@ class ConversationTaskController:
         async with self._lock:
             if self._closed:
                 return
-            self._fail_locked(RuntimeError("conversation task controller is closed"))
+            self._fail_locked(
+                RuntimeError("conversation task controller is closed"), closing=True
+            )
             self._closed = True
             terminal_loop, self._terminal_loop = self._terminal_loop, None
         session_close = asyncio.create_task(
@@ -762,11 +769,15 @@ class ConversationTaskController:
         self._cancel_operations.pop(evidence.task_id, None)
         self._terminal_updates.put_nowait(evidence.outcome)
 
-    def _fail_locked(self, exc: BaseException) -> None:
+    def _fail_locked(self, exc: BaseException, *, closing: bool = False) -> None:
+        latched = False
         if self._terminal_error is None:
             self._terminal_error = exc
+            latched = True
         if self._terminal_updates.empty():
             self._terminal_updates.put_nowait(self._terminal_error)
+        if latched and not closing and self._on_latched is not None:
+            self._on_latched()
 
     def _failure_locked(self, message: str) -> RuntimeError:
         error = RuntimeError(message)

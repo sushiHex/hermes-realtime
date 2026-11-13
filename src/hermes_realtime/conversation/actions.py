@@ -115,9 +115,14 @@ class ConversationUpdateExecutor:
         ]
         | None = None,
         production_observation_recorder: _ProductionObservationRecorderV1 | None = None,
+        on_latched: Callable[[], None] | None = None,
     ) -> None:
         if type(director) is not ConversationUpdateDirector:
             raise TypeError("director must be an exact ConversationUpdateDirector")
+        if on_latched is not None and not callable(on_latched):
+            raise TypeError("on_latched must be callable or None")
+        # Told once when a failure latches this executor; closing it is not a failure.
+        self._on_latched = on_latched
         if type(speech) is not StreamingSpeechLoop:
             raise TypeError("speech must be an exact StreamingSpeechLoop")
         if type(max_action_records) is not int or not 1 <= max_action_records <= 4096:
@@ -775,6 +780,8 @@ class ConversationUpdateExecutor:
         except BaseException as error:
             if not self._closed:
                 self._terminal_error = error
+                if self._on_latched is not None:
+                    self._on_latched()
 
     def _start_idle_mention_drain(self) -> None:
         if (

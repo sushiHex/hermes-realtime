@@ -580,7 +580,7 @@ async def test_closed_surface_command_is_rejected_with_fixed_guidance_and_no_tur
     assert controller.dispatches == []
     assert events == [("task_state", {
         "status": "rejected", "taskId": None,
-        "reason": "Task control is unavailable. Restart the session before trying again.",
+        "reason": "Task control is unavailable until the host restarts.",
     })]
     with pytest.raises(ReservationError, match="consumed"):
         owner.decline_to_user(authority)

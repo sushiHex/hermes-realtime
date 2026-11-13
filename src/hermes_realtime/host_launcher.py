@@ -15,6 +15,7 @@ import signal
 import ssl
 import stat
 import sys
+import threading
 import unicodedata
 import uuid
 from collections.abc import (
@@ -1313,6 +1314,7 @@ def _build_streaming_inference(
     hermes_context: HermesRepresentativeContext | None = None,
     background_tools: Callable[[], tuple[str, ...] | None] | None = None,
     output_style: Callable[[], str] | None = None,
+    on_latched: Callable[[], None] | None = None,
 ) -> OllamaStreamingInference | CodexAppServerStreamingInference:
     if type(inference_provider) is not str:
         raise TypeError("inference_provider must be an exact built-in string")
@@ -1362,6 +1364,8 @@ def _build_streaming_inference(
             codex_options["hermes_context"] = hermes_context
         if background_tools is not None:
             codex_options["background_tools"] = background_tools
+        if on_latched is not None:
+            codex_options["on_latched"] = on_latched
         return CodexAppServerStreamingInference(**codex_options)  # type: ignore[arg-type]
     raise ValueError("inference_provider must be exactly 'ollama' or 'codex'")
 
@@ -1834,6 +1838,156 @@ def _qualification_checkpoint_marker(evidence: dict[str, object]) -> None:
             file=sys.stderr,
             flush=True,
         )
+
+
+# The process status of a host that ended itself after a host-wide fault. It is distinct from
+# every other status this command returns (0, 1, 2, 3, 4 and 130), so that whatever started
+# the host can tell "restart me" from a refused start or an operator stop.
+HOST_FATAL_EXIT_STATUS = 75
+# What latched, never why: one fixed word per holder, bound where the holder is built.
+HOST_FATAL_CAUSES = frozenset(
+    {"task_control", "update_director", "update_executor", "foreground_adapter"}
+)
+_HOST_FATAL_MARKER_PREFIX = "[host-fatal-exit] "
+_HOST_FATAL_INPUT_STOP_SECONDS = 5.0
+_HOST_FATAL_FLUSH_SECONDS = 15.0
+_HOST_FATAL_DEADLINE_SECONDS = 30.0
+
+
+class HostFatalExit:
+    """End the host once, after a failure latched something that lives as long as it does.
+
+    A latched host-lifetime object refuses every later call, and nothing short of a new
+    process rebuilds it. So the host ends itself the way a crash would, with one courtesy:
+    it stops taking input and lets the saved conversation reach the disk first. It does not
+    run the components' close paths. They belong to objects now in an unknown state, and an
+    orderly close stops every background run and writes the run record empty, after which
+    the next start could not tell the user that their task was stopped.
+
+    Holders do not decide any of this. Each is handed ``reporter(cause)`` where it is built
+    and calls it when its own latch trips; no error is inspected to choose an outcome. The
+    first report wins, since every report has the same consequence. Reports before ``arm``
+    (a failed start is reported by the start) and after ``disarm`` (an orderly shutdown is
+    already under way) are ignored. A timer on its own thread ends the process if the
+    event loop cannot.
+    """
+
+    def __init__(
+        self,
+        *,
+        stop_input: Callable[[], Awaitable[None]],
+        flush_conversation: Callable[[], Awaitable[None]] | None,
+        exit_process: Callable[[int], object] = os._exit,
+        input_stop_seconds: float = _HOST_FATAL_INPUT_STOP_SECONDS,
+        flush_seconds: float = _HOST_FATAL_FLUSH_SECONDS,
+        deadline_seconds: float = _HOST_FATAL_DEADLINE_SECONDS,
+    ) -> None:
+        if not callable(stop_input) or not callable(exit_process):
+            raise TypeError("stop_input and exit_process must be callable")
+        if flush_conversation is not None and not callable(flush_conversation):
+            raise TypeError("flush_conversation must be callable or None")
+        for value in (input_stop_seconds, flush_seconds, deadline_seconds):
+            if type(value) not in (int, float):
+                raise TypeError("host-fatal bounds must be exact numbers")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("host-fatal bounds must be finite and positive")
+        self._stop_input = stop_input
+        self._flush_conversation = flush_conversation
+        self._exit_process = exit_process
+        self._input_stop_seconds = float(input_stop_seconds)
+        self._flush_seconds = float(flush_seconds)
+        self._deadline_seconds = float(deadline_seconds)
+        self._state = threading.Lock()
+        self._armed = False
+        self._cause: str | None = None
+        self._finished = False
+        self._operation: asyncio.Task[None] | None = None
+        self._watchdog: threading.Timer | None = None
+
+    @property
+    def cause(self) -> str | None:
+        return self._cause
+
+    def arm(self) -> None:
+        with self._state:
+            self._armed = True
+
+    def disarm(self) -> None:
+        with self._state:
+            self._armed = False
+
+    def reporter(self, cause: str) -> Callable[[], None]:
+        """Return what one holder calls when its latch trips; ``cause`` is fixed here."""
+
+        if type(cause) is not str or cause not in HOST_FATAL_CAUSES:
+            raise ValueError("host-fatal cause must be one of the fixed causes")
+
+        def report() -> None:
+            self._report(cause)
+
+        return report
+
+    def _report(self, cause: str) -> None:
+        with self._state:
+            if not self._armed or self._cause is not None:
+                return
+            self._cause = cause
+        try:
+            watchdog = threading.Timer(
+                self._deadline_seconds, self._finish, ("timeout", "timeout")
+            )
+            watchdog.daemon = True
+            watchdog.start()
+            self._watchdog = watchdog
+            self._operation = asyncio.get_running_loop().create_task(
+                self._run(), name="host-fatal-exit"
+            )
+        except BaseException:
+            # No loop to stop input or flush on: the exit itself must still happen.
+            self._finish("failed", "failed")
+
+    async def _run(self) -> None:
+        stopped, flushed = "failed", "failed"
+        try:
+            stopped = await self._bounded(self._stop_input, self._input_stop_seconds)
+            if self._flush_conversation is None:
+                flushed = "absent"
+            else:
+                flushed = await self._bounded(self._flush_conversation, self._flush_seconds)
+        finally:
+            self._finish(stopped, flushed)
+
+    @staticmethod
+    async def _bounded(step: Callable[[], Awaitable[None]], seconds: float) -> str:
+        try:
+            await asyncio.wait_for(step(), timeout=seconds)
+        except TimeoutError:
+            return "timeout"
+        except Exception:
+            return "failed"
+        return "done"
+
+    def _finish(self, stopped: str, flushed: str) -> None:
+        with self._state:
+            if self._finished:
+                return
+            self._finished = True
+            cause = self._cause
+        watchdog = self._watchdog
+        if watchdog is not None and watchdog is not threading.current_thread():
+            watchdog.cancel()
+        try:
+            print(
+                _HOST_FATAL_MARKER_PREFIX
+                + json.dumps(
+                    {"cause": cause, "flush": flushed, "input": stopped, "version": 1},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        finally:
+            self._exit_process(HOST_FATAL_EXIT_STATUS)
 
 
 def _host_exit_category(error: BaseException | None) -> str:
@@ -2313,6 +2467,22 @@ def build_local_host_launcher(
             run_record_path=hermes_run_record,
         )
     )
+    async def stop_host_input() -> None:
+        # Browser admission first, then the live binding: no new session, no further turn.
+        try:
+            await runtime.close_ingress()
+        finally:
+            await conversation.close_binding()
+
+    async def flush_saved_conversation() -> None:
+        # The writer's own final write: it returns only once the latest view is on disk.
+        await cast(VoiceTailWriter, voice_tail_writer).close()
+
+    # The one owner of a host-wide fault. Each host-lifetime holder below reports to it.
+    host_fatal = HostFatalExit(
+        stop_input=stop_host_input,
+        flush_conversation=flush_saved_conversation if voice_tail_writer is not None else None,
+    )
     task_controller = ConversationTaskController(
         context=context,
         session=(
@@ -2322,6 +2492,7 @@ def build_local_host_launcher(
         ),
         session_id="session_local_host",
         id_factory=lambda: uuid.uuid4().hex,
+        on_latched=host_fatal.reporter("task_control"),
     )
     work_surface = ConversationWorkControlSurface(
         controller=task_controller,
@@ -2425,6 +2596,7 @@ def build_local_host_launcher(
                     lambda: cast(HermesApiTaskSession, task_session).configured_tools
                 ) if hermes_discover_tools and not qualification_no_hermes_tasks else None,
                 output_style=output_style_selection.get,
+                on_latched=host_fatal.reporter("foreground_adapter"),
             )
         )
     synthesizer = (
@@ -2593,11 +2765,13 @@ def build_local_host_launcher(
                 floor_available=completion_floor_available,
             )
         ),
+        on_latched=host_fatal.reporter("update_director"),
     )
     actions = ConversationUpdateExecutor(
         director=director,
         speech=speech,
         cleanup_timeout_seconds=10.0,
+        on_latched=host_fatal.reporter("update_executor"),
         operation_scheduler=(
             evidence_runtime.operation_scheduler if evidence_runtime is not None else None
         ),
@@ -3072,9 +3246,14 @@ def build_local_host_launcher(
         """Close browser ingress before foreground, work, speech, and evidence teardown."""
 
         async def start(self) -> str:
-            return await runtime.start()
+            url = await runtime.start()
+            # A failed start reports itself; only a serving host ends itself on a latch.
+            host_fatal.arm()
+            return url
 
         async def close(self) -> None:
+            # An orderly shutdown owns the exit from here on.
+            host_fatal.disarm()
             errors: list[BaseException] = []
             try:
                 await runtime.close_ingress()
