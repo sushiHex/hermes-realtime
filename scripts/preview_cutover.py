@@ -1726,10 +1726,9 @@ def adopt_state(plan_path: Path, source: Path) -> dict[str, Any]:
     return {
         "category": "state_adopted",
         "already_adopted": adopted,
-        "bytes": len(raw),
-        "sha256": tail_sha256,
-        "deletes_bytes": None if deletes_raw is None else len(deletes_raw),
-        "deletes_sha256": deletes_sha256,
+        # This is printed. A digest or a length is derived from the conversation: it would
+        # tie two outputs to the same one, and a short tail makes its digest guessable.
+        "deletes_carried": deletes_raw is not None,
     }
 
 

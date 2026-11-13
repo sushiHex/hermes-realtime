@@ -1839,14 +1839,24 @@ async def test_adopt_carries_a_saved_conversation_with_its_forget_record(
     assert _tree_snapshot(source) == before
     assert str(tmp_path) not in raw and _SAID not in raw
     store = plan.state_root / _TAIL
-    assert result["category"] == "state_adopted" and result["already_adopted"] is False
-    assert result["sha256"] == _sha256(store) == _sha256(source / "state" / _TAIL)
-    assert result["bytes"] == store.stat().st_size
+    # The printed line holds closed values only. A digest or a length of the conversation
+    # would let two outputs be matched to it, and a short tail makes a digest guessable.
+    assert result == {
+        "category": "state_adopted", "already_adopted": False,
+        "deletes_carried": record != "none",
+    }
+    import re
+
+    assert raw.count("\n") == 1
+    assert re.search(r"[0-9a-f]{64}", raw) is None
+    assert re.search(r"\d", raw) is None
+    for path in (store, plan.state_root / _DELETES, source / "state" / _TAIL):
+        if path.exists():
+            assert _sha256(path) not in raw and str(path.stat().st_size) not in raw
+    assert store.read_bytes() == (source / "state" / _TAIL).read_bytes()
     if record == "none":
-        assert result["deletes_sha256"] is None and result["deletes_bytes"] is None
         assert not (plan.state_root / _DELETES).exists()
     else:
-        assert result["deletes_sha256"] == _sha256(plan.state_root / _DELETES)
         assert (plan.state_root / _DELETES).read_bytes() == (
             source / "state" / _DELETES
         ).read_bytes()
@@ -2186,7 +2196,6 @@ async def test_adopt_refuses_a_source_that_changed_underneath_it(tmp_path, monke
     monkeypatch.setattr(run_record, "write_run_record", write)
     result = preview_cutover.adopt_state(plan_path, source)
     assert result["already_adopted"] is False
-    assert result["sha256"] == _sha256(source / "state" / _TAIL)
     assert (plan.state_root / _TAIL).read_bytes() == (source / "state" / _TAIL).read_bytes()
     assert not (plan.state_root / "adoption.private.json").exists()
 
