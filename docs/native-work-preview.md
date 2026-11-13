@@ -64,10 +64,80 @@ specific to each installation. `native_status.state_dir` must be an existing dir
 `python_user_base` is `null` unless the install is a Python user-base install, in which
 case it must also be an existing directory (`scripts/native_work_profile.py`).
 
-`prepare` requires a speech asset receipt at the plan's `speech_assets.receipt`.
+**Realtime source, wheel and runtime target.** `realtime.source` must be the checkout
+whose `scripts/preview_cutover.py` you run, with `HEAD` at `realtime.revision`
+(`git rev-parse HEAD`) and `realtime.tree` (`git rev-parse "HEAD^{tree}"`). The
+checkout must be completely clean, untracked files included: keep the plan, the
+output directory and every other working file outside it (`dist/` is ignored, so the
+built wheel may stay there). `realtime.wheel_sha256` is the SHA-256 of the wheel built
+from that commit, and `realtime.record_sha256` is the SHA-256 of
+`hermes_realtime-<version>.dist-info\RECORD` inside `realtime.runtime_target` after the
+`--no-deps` install described below. The runtime target may hold only that install:
+run everything that imports from it with `-B`, because a bytecode cache there is an
+unexpected file and refuses preparation.
+
+**Hermes source and profile.** `hermes.source` must be at `hermes.revision` with no
+modified or untracked Python files. `hermes.profile_source` is a directory that may
+contain only `config.yaml`, `.env`, `SOUL.md`, `skills`, `hooks` and `plugins`, without
+links, within 4096 files and 64 MiB. Its `.env` is required and is copied unread into
+the staged profile by `finalize`. It must hold one `API_SERVER_KEY` of at least 32
+random characters, `HERMES_REALTIME_COMPANION_PORT` equal to the plan's
+`ports.companion`, and a `HERMES_REALTIME_COMPANION_TOKEN` of 24 to 512 random
+characters; generate them as the
+[diagnostic guide](desktop-mvp-diagnostic.md#5-configure-hermes_homeenv) describes and
+never reuse personal credentials. The owner passes the API host and port from the plan
+in the gateway's environment; whether a different `API_SERVER_PORT` in `.env` would
+override that has not been checked, so omit it or keep it equal to `ports.api`.
+
+**LiveKit and ports.** `executables.livekit` must be the shared verified server that
+`uv run python -m scripts.local_livekit path` prints
+([pinned development server](local-livekit.md#pinned-development-server)); another copy
+is refused at launch. The owner starts its own LiveKit process on `ports.livekit`. All
+four owned ports must be free at launch, so stop a development LiveKit server on the
+same port or choose another port. `output` must not exist yet and its parent directory
+must.
+
+### Speech caches
+
+`prepare` copies speech assets only from the two existing cache directories the plan
+names. It downloads nothing, so populate them once.
+
+**Moonshine.** Download the model for the plan's `speech.stt_tier` into the directory
+the plan names as `speech_assets.moonshine_cache`, using the host Python:
+
+```powershell
+& $previewPython -I -B -m moonshine_voice.download --stt --language en `
+  --model-arch 5 --root "<moonshine-cache>"
+```
+
+`--model-arch` takes the package's numeric streaming architecture: `2` for `tiny`,
+`4` for `small`, `5` for `medium`. The command needs network access to
+`download.moonshine.ai`. It checks each file against the size and CRC32C in the
+package's own catalog, and also tries to fetch the English spelling model. Files land
+under `<moonshine-cache>\download.moonshine.ai\model\`, the layout the host later reads
+through `MOONSHINE_VOICE_CACHE`. With a complete cache the host start downloads nothing
+for Moonshine; if the spelling files are missing, the package tries to fetch them at
+host start and continues without them. This repository does not pin Moonshine model
+hashes: the receipt pins the bytes you downloaded. Before writing the receipt, check
+that an interrupted download left no `.partial` or `.lock` file in the directory; an
+empty file is refused as `speech_asset_size`. This step follows from the
+`moonshine-voice` 0.1.5 source and has not been exercised on a clean machine here.
+
+**Kokoro.** `speech_assets.kokoro_cache` must be a directory named by the pinned model
+SHA-256, `beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a`, holding
+`kokoro-v1.0.onnx` and `voices-v1.0.bin` from the kokoro-onnx
+[`model-files-v1.1` release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.1).
+A host that has already spoken with Kokoro under this account has them in
+`.cache\hermes-realtime\kokoro\<model-sha256>\` under the user profile. Otherwise
+download the two files into a directory with that name. Their exact sizes and SHA-256
+values are pinned in `src/hermes_realtime/providers/kokoro.py`, and the receipt command
+refuses any other bytes.
+
+**Receipt.** `prepare` requires a speech asset receipt at the plan's
+`speech_assets.receipt`.
 `python scripts/preview_cutover.py make-speech-receipt --plan <plan.json>` writes it
-from the caches that already exist; it never downloads anything, and the Moonshine
-cache warm-up remains a known gap below. Use a dedicated Moonshine cache directory,
+from the caches that already exist; it never downloads anything. Use a dedicated
+Moonshine cache directory,
 not a shared one: every file in it is admitted and staged. The two cache roots must
 not contain each other. The receipt is a version 1
 JSON object with `moonshine_tier`, `moonshine_package_version`, `moonshine_cache_root`
@@ -80,14 +150,69 @@ the pinned model SHA-256. The command refuses links, pin mismatches including fi
 name case, an empty Moonshine cache, the consumer's count, size and path bounds, and
 an existing receipt (it never overwrites).
 
-### Known gaps (#295)
+### Web tools backend and credential
 
-These steps are not yet published as maintained procedures:
+The native profile gives Hermes background work the `web` toolset (`web_search` and
+`web_extract`). Hermes chooses the backend, not this repository, from the `web` section
+of the profile's `config.yaml`, which staging copies unchanged. At the `29112bef`
+baseline (`tools/web_tools.py`):
 
-- **Moonshine model cache.** The model is fetched on first use; no documented
-  warm-up step populates the cache that `prepare` copies.
-- **Web tools.** The native profile selects the `web` toolset; which search backend
-  and credential it needs is not documented here.
+1. `web.search_backend` and `web.extract_backend` select a backend per tool.
+2. Otherwise `web.backend` selects one for both.
+3. With no stored selection, Hermes picks the first available of: an Exa, Parallel or
+   Keenable API key; a Firecrawl API key or self-hosted Firecrawl URL; the managed tool
+   gateway; a SearXNG URL; a Brave Search key; the `ddgs` package if it is importable.
+4. With none of those, it uses the keyless tier, unless `web.keyless_fallback` is
+   `false`.
+
+A stored selection is never replaced by another configured backend. Two keyless
+behaviors still apply to it. A selected Exa, Parallel, Firecrawl or Keenable backend
+with no key uses that vendor's keyless endpoint, unless `web.provider_tier.<name>` is
+`paid`. A failed keyed call is retried once through the keyless tier, unless
+`web.keyless_rescue` is `false`. Setting `web.keyless_fallback: false` turns the whole
+keyless tier off, including that retry.
+
+A keyed backend needs that provider's own API key, or for SearXNG and self-hosted
+Firecrawl a service URL, in the environment variable Hermes names for it. Put it in the
+profile source's `.env`. The owner starts the gateway with a reduced environment, so a
+key exported in your shell does not reach it. Never put a key in the plan,
+`config.yaml`, a command line or an issue.
+
+The keyless tier needs no credential. It sends search queries and requested URLs
+anonymously to third-party public endpoints, so a profile with no web selection and no
+web key still performs real retrieval.
+
+The owner sets `HERMES_DISABLE_LAZY_INSTALLS=1` for the gateway, so Hermes does not add
+packages to its own environment while running. Install any client package the selected
+backend needs into the Hermes environment first.
+
+No search backend is pinned or qualified for the native profile. Record the backend you
+selected with each observation. Web-only results can additionally be presented from
+bounded same-run passages with a validated sources list; that is the separate opt-in
+described in [native web evidence](native-web-evidence.md).
+
+### Support limits
+
+- **First launch.** `finalize` is the only command that writes `active.private.json`,
+  and it requires `--previous`: an earlier preview run directory with its stop records
+  and a saved `state\voice-tail-v1.json`. No maintained command creates that first
+  directory, so a machine with no earlier preview run cannot reach `launch` through
+  this procedure. The [manual full-host composition](local-livekit.md#full-loopback-host-and-constrained-desktop-human-gate)
+  can run a first session, but it is not source and wheel bound, and its state is not
+  a `--previous` directory.
+- **Clean-machine walkthrough.** These steps were checked against the source. Nobody
+  has yet followed them end to end on a clean machine with real installs
+  ([#295](https://github.com/sushiHex/hermes-realtime/issues/295)).
+- **Moonshine tier.** The plan parser accepts `stt_tier` `base`, but the host supports
+  only `tiny`, `small` and `medium`. Do not select `base`.
+- **Managed GPU speech.** The example plan is CPU-only. The GPU worker environment,
+  the scoped vram-mcp server and its operator profile are set up as
+  [managed Kokoro](kokoro-mcp.md) describes; the operator profile's values are
+  specific to one machine.
+- **Codex CLI and vram-mcp installs.** This repository documents no install command
+  for either, as stated above.
+
+## Plan reference
 
 The version 1 JSON plan binds the Hermes Realtime source revision/tree, wheel
 and installed runtime RECORD, Hermes source revision/tree, profile directory,
@@ -152,21 +277,50 @@ they do not infer abbreviation meanings or provide phoneme overrides. For exampl
 an operator can explicitly map `A P I` to `API` without expanding its meaning. Keep
 such choices profile-specific; text projection alone does not qualify pronunciation.
 
+## Commands
+
+Setup order, each step using the section named:
+
+1. Install Hermes at the commit the plan will bind, and prepare the profile source
+   (Prerequisites).
+2. Install the shared LiveKit server, the Codex CLI and vram-mcp (Prerequisites).
+3. Build the wheel from a clean checkout and install it into the runtime target with
+   `--no-deps` (Plan reference).
+4. Populate the two speech caches and write the receipt (Speech caches).
+5. Select the web backend and place its credential, if it needs one (Web tools).
+6. For managed GPU speech only, prepare the worker and its configuration
+   ([managed Kokoro](kokoro-mcp.md)).
+7. Write the plan outside the checkout, then run the commands below from the checkout
+   root.
+
 Use the existing host Python environment, which supplies the CPU speech packages,
 PyYAML, and packaging helpers. The commands below use `$previewPython` for its
-Python executable; they do not install dependencies into Hermes.
+Python executable; they do not install dependencies into Hermes. `<preview-root>` is a
+private directory outside the checkout that holds the plan and each run's output
+directory; `<output>` is the plan's `output` and `<previous-output>` is the earlier
+run's.
 
 ```powershell
-& $previewPython -I -B scripts/preview_cutover.py prepare --plan .\preview-plan.json
+& $previewPython -I -B scripts/preview_cutover.py make-speech-receipt `
+  --plan "<preview-root>\plan.json"
+& $previewPython -I -B scripts/preview_cutover.py prepare --plan "<preview-root>\plan.json"
 # After the previous owner reports a clean normal stop:
 & $previewPython -I -B scripts/preview_cutover.py finalize `
-  --prepared .\preview\prepared.private.json `
-  --previous .\previous-run
+  --prepared "<output>\prepared.private.json" `
+  --previous "<previous-output>"
 # Launch independently of the calling terminal or agent controller:
-& $previewPython -I -B scripts/preview_cutover.py launch --active .\preview\active.private.json
+& $previewPython -I -B scripts/preview_cutover.py launch --active "<output>\active.private.json"
 # Later, request graceful stop and wait for cleanup settlement:
-& $previewPython -I -B scripts/preview_cutover.py stop --output .\preview
+& $previewPython -I -B scripts/preview_cutover.py stop --output "<output>"
 ```
+
+Each command prints one `[voice-preview]` status line with a JSON `category`. The
+owner then writes
+`ready-receipt.private.json` when the preview is ready and
+`result-receipt.private.json` when it has stopped, both in `<output>`. Open
+`http://127.0.0.1:<ports.host>/` in a local browser once the ready receipt exists. The
+[acceptance procedure](native-preview-acceptance.md) lists what to observe and record
+from there.
 
 `prepare` and its `preflight` are offline. `finalize` refuses unless the prior
 run has a settled stop receipt, no owned survivors/listeners, and an empty task
