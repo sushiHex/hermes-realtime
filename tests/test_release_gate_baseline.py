@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -335,8 +336,9 @@ def test_self_test_rejects_a_weakened_baseline_binding(
             return "0" * 64
         if broken == "wrong_digest":
             # Every refusal intact; only the accepted binding is not the canonical one.
-            real_binding(source, baseline, revision=revision)
-            return "0" * 64
+            # It stays distinct per baseline, so only the equality check can see it.
+            exact = real_binding(source, baseline, revision=revision)
+            return hashlib.sha256(exact.encode("ascii")).hexdigest()
         return real(source, baseline, revision=revision)
 
     real_binding = gate.candidate_diff_binding
