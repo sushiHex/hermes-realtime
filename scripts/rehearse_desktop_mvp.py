@@ -454,25 +454,55 @@ def process_table() -> dict[int, tuple[int, str]]:
     return table
 
 
+class ProcessUnobservable(OSError):
+    """Whether a process is running could not be established; it is not known to be dead."""
+
+
 def started_at(pid: int) -> int | None:
-    """When a running process started (a PID-reuse guard), or None if it is not running."""
+    """When a running process started (a PID-reuse guard), or None if it is not running.
+
+    None is a finding, not a fallback: no process has this identifier, or its handle is
+    signaled. A process that cannot be opened, waited on or timed may still be running, so
+    those raise ProcessUnobservable instead.
+    """
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.OpenProcess.restype = ctypes.c_void_p
     handle = kernel.OpenProcess(0x00101000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
     if not handle:
-        return None
-    try:
-        times = [ctypes.c_uint64() for _ in range(4)]
-        if kernel.WaitForSingleObject(ctypes.c_void_p(handle), 0) != 258:
+        error = ctypes.get_last_error()
+        # ERROR_INVALID_PARAMETER is how OpenProcess reports an identifier no process has.
+        # Access denied and every other failure say nothing about whether it is running.
+        if type(error) is int and error == 87:
             return None
+        raise ProcessUnobservable("the process could not be opened")
+    try:
+        wait = kernel.WaitForSingleObject(ctypes.c_void_p(handle), 0)
+        if type(wait) is int and wait == 0:  # WAIT_OBJECT_0: the process object is signaled.
+            return None
+        if type(wait) is not int or wait != 258:  # Anything but WAIT_TIMEOUT, e.g. WAIT_FAILED.
+            raise ProcessUnobservable("the process could not be waited on")
+        times = [ctypes.c_uint64() for _ in range(4)]
         if not kernel.GetProcessTimes(
             ctypes.c_void_p(handle), *(ctypes.byref(time) for time in times)
         ):
-            return None
+            raise ProcessUnobservable("the process start time could not be read")
         return int(times[0].value)
     finally:
         kernel.CloseHandle(ctypes.c_void_p(handle))
+
+
+def _observed_start(pid: int) -> int | None:
+    """Bookkeeping's view: an unobservable process is neither recorded nor claimed as owned.
+
+    Settlement does not rest on this. survivors() classifies every candidate through
+    _cleanup_process_state, where one that cannot be observed counts as unknown.
+    """
+
+    try:
+        return started_at(pid)
+    except ProcessUnobservable:
+        return None
 
 
 class _BasicLimits(ctypes.Structure):
@@ -637,7 +667,7 @@ class Processes:
         roots = {process.pid for process in self.roots.values()}
         roots |= {pid for pid, _ in self.alive()}
         for pid in descendants(table, roots):
-            started = started_at(pid)
+            started = _observed_start(pid)
             if started is not None and pid not in self.seen:
                 self.seen[pid] = (table[pid][1], started)
 
@@ -647,7 +677,7 @@ class Processes:
         return [
             (pid, image)
             for pid, (image, started) in sorted(self.seen.items())
-            if started_at(pid) == started
+            if _observed_start(pid) == started
         ]
 
     def _record(self) -> None:

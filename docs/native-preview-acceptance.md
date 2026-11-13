@@ -81,8 +81,8 @@ any step here.
 ### 1. Launch and readiness
 
 - **Do:** run `prepare`, `finalize` and `launch`, then wait for the ready receipt.
-  `finalize` needs an earlier preview run directory; see the preview guide's
-  [support limits](native-work-preview.md#support-limits).
+  A first launch needs no earlier run; the plan's `state_root` may be absent or empty
+  ([conversation state](native-work-preview.md#conversation-state)).
 - **Expect:** `prepared`, `ready_to_launch` and `launch_requested`, then a ready
   receipt with `category: ready`.
 - **Record:** the three status categories; the receipt's `category`,
@@ -199,8 +199,9 @@ identifier, so typing that form by hand is not part of this step.
 ### 10. Stop, hand off and restart
 
 - **Do:** start one longer harmless task. While it is active, extract the markers, then
-  run `stop`. Prepare a plan with a new output directory, run `finalize` with
-  `--previous` naming the stopped run, then `launch` and **Connect**. With managed GPU
+  run `stop`. Prepare a plan with a new output directory and the same `state_root`, run
+  `finalize` with `--previous` naming the stopped run, then `launch` and **Connect**.
+  With managed GPU
   speech, the new output needs its own operator profile and configuration
   ([managed Kokoro](kokoro-mcp.md)). Ask a question that needs the fact from step 9.
 - **Expect:** `stop` reports `stopped`. The host stops the active task as it shuts
@@ -219,9 +220,10 @@ identifier, so typing that form by hand is not part of this step.
   request, the new run's `state\hermes-runs-v1.json` absent, or its `pending` and
   `admitted` counts (expect 0 and 0); stopped work started again yes or no.
 
-If the stop receipt is `refused` or the journal is not empty, `finalize` refuses.
-Record that as the outcome and mark the rest of this step `not_run`. Do not edit a
-receipt to continue.
+If the stop receipt is `refused` or the journal is not empty, `finalize --previous`
+refuses. Record that as the outcome. The conversation is in the `state_root` and does
+not depend on that run: run `finalize` again without `--previous`, record the handoff
+category `no_previous_handoff`, and continue the step. Do not edit a receipt.
 
 ### 11. Delete the voice conversation
 
@@ -269,9 +271,8 @@ These are outside the procedure today. Leave them `not_run` and name the reason.
 | Not covered | Why |
 | --- | --- |
 | Approval prompts, and what an approval card shows after Hermes times out, is cancelled or receives a late answer | The card states are tracked in [#291](https://github.com/sushiHex/hermes-realtime/issues/291) and are not implemented. |
-| Handoff from a run whose owner died, from an older run, or from a run already handed off | `finalize` accepts an abandoned run only when no work was recorded, and nothing ties `--previous` to the newest unconsumed run. Hardening is tracked in [#496](https://github.com/sushiHex/hermes-realtime/issues/496). |
-| Abrupt owner or host death while a task is active | The run record is then not empty and `finalize` refuses it. The preview has no maintained recovery command for that state. |
-| The first launch on a machine with no earlier preview run | `finalize` requires `--previous`; see the preview guide's [support limits](native-work-preview.md#support-limits). |
+| Abrupt owner or host death, with or without an active task | The next run acquires the `state_root` and restores the conversation, and a stopped task is not resumed. That run's record is then not empty, so `finalize --previous` refuses it as evidence. This procedure does not kill an owner, so the restart after one is not observed here. |
+| Adopting a conversation saved by an earlier version | `adopt-state` is a one-time migration, described in the preview guide's [conversation state](native-work-preview.md#conversation-state). |
 | Evidence capture, foreground public search, Tailscale and mobile | Not part of this profile. |
 
 ## Record and disposition

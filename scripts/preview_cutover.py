@@ -115,6 +115,7 @@ def _validate_native_model_binding(config: dict[str, Any], plan: PreviewPlanV1) 
 @dataclass(frozen=True)
 class PreviewPlanV1:
     output: Path
+    state_root: Path
     realtime_source: Path
     realtime_revision: str
     realtime_tree: str
@@ -147,6 +148,7 @@ def load_plan(path: Path) -> PreviewPlanV1:
         == {
             "version",
             "output",
+            "state_root",
             "realtime",
             "hermes",
             "profile_mode",
@@ -365,8 +367,20 @@ def load_plan(path: Path) -> PreviewPlanV1:
         "host_options_values",
     )
     _kokoro_mcp_config(host_options)
+    output = abs_path(value["output"], "output")
+    state_root = abs_path(value["state_root"], "state_root")
+    # One conversation store outlives every run, so it is neither a run directory nor
+    # inside one, and no run directory is inside it. A UNC or device path is refused here;
+    # the volume itself is checked where the store is used.
+    require(
+        not value["state_root"].startswith(("\\\\", "//"))
+        and not state_root.is_relative_to(output)
+        and not output.is_relative_to(state_root),
+        "state_root_path",
+    )
     return PreviewPlanV1(
-        output=abs_path(value["output"], "output"),
+        output=output,
+        state_root=state_root,
         realtime_source=abs_path(realtime["source"], "realtime_source"),
         realtime_revision=realtime["revision"],
         realtime_tree=realtime["tree"],
@@ -1481,21 +1495,238 @@ def _require_gateway_health_owner(health: Any, expected_pid: int, members: set[i
 
 
 def _started_at(pid: int) -> int | None:
-    from scripts.rehearse_desktop_mvp import started_at
+    from scripts.rehearse_desktop_mvp import ProcessUnobservable, started_at
 
-    return started_at(pid)
+    try:
+        return started_at(pid)
+    except ProcessUnobservable:
+        # Not known to be dead. Only a process that is positively not running is absent.
+        raise PreviewRefusal("previous_process_unobservable") from None
+
+
+def _previous_dev_readiness(policy: Any, plan: PreviewPlanV1, category: str) -> bool:
+    """The one pairing both stop categories enforce: a DEV run hands off only to a DEV plan."""
+    require(
+        type(policy) is str and policy in {"kernel_listeners", "dev_owned_services"}, category
+    )
+    previous_dev: bool = policy == "dev_owned_services"
+    require(not previous_dev or _dev_readiness(plan), category)
+    return previous_dev
+
+
+_TAIL = "voice-tail-v1.json"
+_DELETES = "voice-tail-v1.deletes.json"
+_HOST_LOCKS = ("hermes-runs-v1.json.lock", _TAIL + ".lock")
+_MAX_STATE_ENTRIES = 4096
+# Exactly the names run_record.write_run_record creates beside the three host records.
+_STATE_TEMPORARY = re.compile(
+    r"\.(?:hermes-runs-v1|voice-tail-v1|voice-tail-v1\.deletes)\.json\.[a-z0-9_]{8}\.tmp\Z"
+)
+
+
+def _state_temporaries(previous: Path) -> int:
+    """Count, never read or remove, the plaintext temporaries a killed host writer left.
+
+    Only a host that reopens a state directory removes them, and none reopens a previous run.
+    """
+    count = 0
+    try:
+        with os.scandir(previous / "state") as entries:
+            for index, entry in enumerate(entries):
+                require(index < _MAX_STATE_ENTRIES, "previous_state_bound")
+                count += _STATE_TEMPORARY.fullmatch(entry.name) is not None
+    except FileNotFoundError:
+        return 0
+    return count
+
+
+def _drive_type(anchor: str) -> int:
+    import ctypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kind: int = kernel.GetDriveTypeW(ctypes.c_wchar_p(anchor))
+    return kind
+
+
+def _conversation_store(plan: PreviewPlanV1) -> Path:
+    """The one voice tail every run of this state root opens. It is never in a run directory.
+
+    The store's lock and its atomic replace are only dependable on a local fixed volume.
+    """
+    if sys.platform == "win32":
+        kind = _drive_type(plan.state_root.anchor)
+        require(type(kind) is int and kind == 3, "state_root_not_local")  # DRIVE_FIXED
+    return plan.state_root / _TAIL
+
+
+def _require_host_locks_free(
+    state: Path, names: tuple[str, ...], file_category: str, held_category: str
+) -> None:
+    """Probe each existing host lock without creating or writing it; a held one refuses."""
+    for name in names:
+        lock_path = state / name
+        if _absent(lock_path):
+            continue
+        require(
+            lock_path.is_file()
+            and not lock_path.is_symlink()
+            and not (getattr(lock_path.lstat(), "st_file_attributes", 0) & 0x400),
+            file_category,
+        )
+        require(not _host_lock_held(lock_path), held_category)
+
+
+def _require_state_root_available(plan: PreviewPlanV1) -> None:
+    """Refuse, before this run owns anything, a store its host could not open and restore.
+
+    This only reads, and it is not what keeps two hosts off one conversation: the host
+    itself takes the store's lock when it opens the tail and holds it until it closes.
+    """
+    tail = _conversation_store(plan)
+    root = plan.state_root
+    if _absent(root):
+        return  # Genesis: the first host creates the store.
+    require(root.is_dir() and not _is_link(root), "state_root_directory")
+    _require_host_locks_free(root, (_TAIL + ".lock",), "state_root_lock_file", "state_root_held")
+    # A host writes a forget record only beside a tail it already wrote. Without its tail
+    # the record is an adoption that was interrupted; running it again completes it.
+    require(_absent(root / _DELETES) or not _absent(tail), "state_root_incomplete")
+
+
+def _voice_state_runtime(runtime_target: Path) -> tuple[int, int, Any]:
+    """The tail and forget-record bounds and the store's own writer, from the bound runtime."""
+    package_parent = runtime_target.resolve(strict=True)
+    sys.path.insert(0, str(package_parent))
+    try:
+        import hermes_realtime.integration.run_record as run_record
+        import hermes_realtime.integration.voice_deletes as voice_deletes
+        import hermes_realtime.integration.voice_tail as voice_tail
+
+        expected = runtime_target / "hermes_realtime" / "integration"
+        require(
+            all(
+                Path(module.__file__).resolve() == (expected / name).resolve()
+                for module, name in (
+                    (voice_tail, "voice_tail.py"),
+                    (voice_deletes, "voice_deletes.py"),
+                    (run_record, "run_record.py"),
+                )
+            ),
+            "voice_tail_import_origin",
+        )
+        return (
+            voice_tail.max_voice_tail_bytes(32, 1024),
+            voice_deletes.MAX_VOICE_DELETES_BYTES,
+            run_record,
+        )
+    finally:
+        with contextlib.suppress(ValueError):
+            sys.path.remove(str(package_parent))
+
+
+def _read_state_file(path: Path, maximum: int, category: str) -> bytes:
+    require(
+        path.is_file()
+        and not path.is_symlink()
+        and not (getattr(path.lstat(), "st_file_attributes", 0) & 0x400)
+        and path.stat().st_size <= maximum,
+        category,
+    )
+    return _read(path, maximum)
+
+
+def adopt_state(plan_path: Path, source: Path) -> dict[str, Any]:
+    """Carry one stopped run's saved conversation into an empty state root, once.
+
+    The source run is only read. The forget record is written before the tail, as the host
+    writes them, each through the store's own temporary, fsync and atomic replace, under
+    the store's lock. A kill at any point leaves the source intact and a store that this
+    same command completes when run again; a store holding anything else is refused.
+    """
+    plan = load_plan(plan_path)
+    tail = _conversation_store(plan)
+    root = plan.state_root
+    deletes = root / _DELETES
+    source_state = source / "state"
+    maximum, deletes_maximum, run_record = _voice_state_runtime(plan.runtime_target)
+    _require_host_locks_free(
+        source_state, _HOST_LOCKS, "adopt_source_lock_file", "adopt_source_held"
+    )
+    source_tail = source_state / _TAIL
+    source_deletes = source_state / _DELETES
+    require(not _absent(source_tail), "adopt_source_tail_missing")
+    raw = _read_state_file(source_tail, maximum, "adopt_source_tail")
+    # The forget record decides which tail binding may be restored; a tail never moves
+    # without it.
+    deletes_raw = (
+        None if _absent(source_deletes)
+        else _read_state_file(source_deletes, deletes_maximum, "adopt_source_deletes")
+    )
+    require(_absent(root) or (root.is_dir() and not _is_link(root)), "state_root_directory")
+    owner = run_record.lock_run_record(tail)
+    require(owner is not None, "state_root_held")
+    try:
+        # Everything is decided before anything is written. What is already there must be
+        # exactly what this adoption writes, in the order it writes it.
+        have_deletes = not _absent(deletes)
+        have_tail = not _absent(tail)
+        if have_deletes:
+            require(
+                deletes_raw is not None
+                and _read_state_file(deletes, deletes_maximum, "state_root_not_empty")
+                == deletes_raw,
+                "state_root_not_empty",
+            )
+        if have_tail:
+            require(
+                have_deletes == (deletes_raw is not None)
+                and _read_state_file(tail, maximum, "state_root_not_empty") == raw,
+                "state_root_not_empty",
+            )
+        # The lock holder may clear what a killed writer, this command included, left.
+        run_record.remove_orphaned_temporaries(tail)
+        run_record.remove_orphaned_temporaries(deletes)
+        if deletes_raw is not None and not have_deletes:
+            run_record.write_run_record(deletes, deletes_raw)
+        if not have_tail:
+            run_record.write_run_record(tail, raw)
+        tail_sha256 = hashlib.sha256(raw).hexdigest()
+        deletes_sha256 = None if deletes_raw is None else hashlib.sha256(deletes_raw).hexdigest()
+        require(
+            digest(tail) == tail_sha256
+            and (_absent(deletes) if deletes_raw is None else digest(deletes) == deletes_sha256),
+            "state_root_copy",
+        )
+        # A source that changed underneath was not a stopped run.
+        require(
+            digest(source_tail) == tail_sha256
+            and (
+                _absent(source_deletes) if deletes_raw is None
+                else digest(source_deletes) == deletes_sha256
+            ),
+            "adopt_source_changed",
+        )
+    finally:
+        run_record.unlock_run_record(owner)
+    return {
+        "category": "state_adopted",
+        "already_adopted": have_tail,
+        "bytes": len(raw),
+        "sha256": tail_sha256,
+        "deletes_bytes": None if deletes_raw is None else len(deletes_raw),
+        "deletes_sha256": deletes_sha256,
+    }
 
 
 def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
     result_path = previous / "result-receipt.private.json"
     result = _read_json_file(result_path)
-    previous_policy = result.get("readiness_policy", "kernel_listeners")
-    previous_dev = previous_policy == "dev_owned_services"
-    require(previous_policy in {"kernel_listeners", "dev_owned_services"}, "previous_normal_stop")
+    previous_dev = _previous_dev_readiness(
+        result.get("readiness_policy", "kernel_listeners"), plan, "previous_normal_stop"
+    )
     if previous_dev:
         require(
-            _dev_readiness(plan)
-            and result.get("listener_ownership") == "unavailable"
+            result.get("listener_ownership") == "unavailable"
             and result.get("remaining_owned_listeners") is None
             and result.get("protected_listeners_unchanged") is None
             and type(result.get("remaining_accepting_endpoints")) is int
@@ -1538,6 +1769,7 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         "protected_listeners_unchanged": (
             None if _dev_readiness(plan) else result["protected_listeners_unchanged"]
         ),
+        "state_temporaries": _state_temporaries(previous),
     }
 
 
@@ -1613,6 +1845,12 @@ def verify_previous_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         and type(ports) is dict,
         "previous_plan_binding",
     )
+    # A clean stop reads the policy from its receipt; here the hash-bound plan is the record.
+    _previous_dev_readiness(
+        previous_plan.get("readiness_policy", "kernel_listeners"),
+        plan,
+        "previous_readiness_policy",
+    )
     journal_present = _require_previous_quiescent(
         previous,
         plan,
@@ -1633,6 +1871,7 @@ def verify_previous_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         "work_journal_empty": True if journal_present else None,
         "work_journal_absent": not journal_present,
         "protected_listeners_unchanged": None,
+        "state_temporaries": _state_temporaries(previous),
     }
 
 
@@ -1670,17 +1909,9 @@ def _require_previous_quiescent(
         set(previous_ports) | {plan.ports[name] for name in ("api", "companion", "livekit", "host")}
     )
     require(not any(_endpoint_snapshot(plan, all_ports).values()), "previous_listener_alive")
-    for name in ("hermes-runs-v1.json.lock", "voice-tail-v1.json.lock"):
-        lock_path = previous / "state" / name
-        if _absent(lock_path):
-            continue
-        require(
-            lock_path.is_file()
-            and not lock_path.is_symlink()
-            and not (getattr(lock_path.lstat(), "st_file_attributes", 0) & 0x400),
-            "previous_lock_file",
-        )
-        require(not _host_lock_held(lock_path), "previous_lock_held")
+    _require_host_locks_free(
+        previous / "state", _HOST_LOCKS, "previous_lock_file", "previous_lock_held"
+    )
     journal_path = previous / "state" / "hermes-runs-v1.json"
     if journal_may_be_absent and _absent(journal_path):
         # The host writes its run record ahead of its first Hermes POST, and otherwise only
@@ -1825,73 +2056,13 @@ def _copy_profile_supplement(plan: PreviewPlanV1, prepared: dict[str, Any]) -> d
     }
 
 
-def _copy_voice_tail(previous: Path, output: Path, runtime_target: Path) -> dict[str, Any]:
-    source = previous / "state" / "voice-tail-v1.json"
-    require(
-        source.is_file()
-        and not source.is_symlink()
-        and source.resolve().parent == (previous / "state").resolve(),
-        "saved_voice_tail_missing",
-    )
-    package_parent = runtime_target.resolve(strict=True)
-    sys.path.insert(0, str(package_parent))
-    try:
-        import hermes_realtime.integration.voice_tail as voice_tail
+def finalize(prepared_path: Path, previous: Path | None = None) -> dict[str, Any]:
+    """Complete the staged profile and bind the launch. It carries no conversation state.
 
-        expected_module = runtime_target / "hermes_realtime" / "integration" / "voice_tail.py"
-        require(
-            Path(voice_tail.__file__).resolve() == expected_module.resolve(),
-            "voice_tail_import_origin",
-        )
-        maximum = voice_tail.max_voice_tail_bytes(32, 1024)
-        import hermes_realtime.integration.voice_deletes as voice_deletes
-
-        require(
-            Path(voice_deletes.__file__).resolve()
-            == expected_module.with_name("voice_deletes.py").resolve(),
-            "voice_tail_import_origin",
-        )
-        deletes_maximum = voice_deletes.MAX_VOICE_DELETES_BYTES
-    finally:
-        with contextlib.suppress(ValueError):
-            sys.path.remove(str(package_parent))
-    require(source.stat().st_size <= maximum, "saved_voice_tail_bound")
-    raw = _read(source, maximum)
-    # The forget record beside the tail decides which tail binding may be restored. Without
-    # it, a tail a forget had already retired would be restored into the new run.
-    deletes_source = previous / "state" / "voice-tail-v1.deletes.json"
-    deletes_raw: bytes | None = None
-    if not _absent(deletes_source):
-        require(
-            deletes_source.is_file()
-            and not deletes_source.is_symlink()
-            and not (getattr(deletes_source.lstat(), "st_file_attributes", 0) & 0x400),
-            "saved_voice_deletes_file",
-        )
-        require(deletes_source.stat().st_size <= deletes_maximum, "saved_voice_deletes_bound")
-        deletes_raw = _read(deletes_source, deletes_maximum)
-    target_state = output / "state"
-    target_state.mkdir(parents=False, exist_ok=False)
-    deletes_sha256: str | None = None
-    if deletes_raw is not None:
-        # The record first, as the host writes it: a tail never lands without its deletes.
-        deletes_target = target_state / "voice-tail-v1.deletes.json"
-        with deletes_target.open("xb") as stream:
-            stream.write(deletes_raw)
-        deletes_sha256 = digest(deletes_target)
-        require(digest(deletes_source) == deletes_sha256, "saved_voice_deletes_copy")
-    target = target_state / "voice-tail-v1.json"
-    target.write_bytes(raw)
-    require(digest(source) == digest(target), "saved_voice_tail_copy")
-    return {
-        "bytes": len(raw),
-        "sha256": digest(target),
-        "deletes_bytes": None if deletes_raw is None else len(deletes_raw),
-        "deletes_sha256": deletes_sha256,
-    }
-
-
-def finalize(prepared_path: Path, previous: Path) -> dict[str, Any]:
+    The conversation lives in the plan's state root, which the host acquires by its lock
+    when it starts, so a first run needs no predecessor. ``previous`` only adds evidence:
+    when given, that run must have stopped, and the handoff records what was verified.
+    """
     prepared = _read_json_file(prepared_path)
     require(
         prepared.get("version") == 1
@@ -1907,19 +2078,27 @@ def finalize(prepared_path: Path, previous: Path) -> dict[str, Any]:
     plan_path = output / "plan.private.json"
     require(digest(plan_path) == prepared.get("plan_sha256"), "prepared_plan_drift")
     plan = load_plan(plan_path)
-    stop = verify_previous_stop(previous, plan)
+    stop = None if previous is None else verify_previous_stop(previous, plan)
+    # A run of an earlier version kept the conversation in its own directory. Starting on
+    # an empty store would begin a new one, and adoption only fills an empty store.
+    require(
+        previous is None
+        or _absent(previous / "state" / _TAIL)
+        or not _absent(plan.state_root / _TAIL),
+        "previous_conversation_not_adopted",
+    )
     supplemental = _copy_profile_supplement(plan, prepared)
-    tail = _copy_voice_tail(previous, output, plan.runtime_target)
     handoff = {
         "version": 1,
         "category": (
-            "abandoned_stop_handoff_verified"
+            "no_previous_handoff"
+            if stop is None
+            else "abandoned_stop_handoff_verified"
             if stop["category"] == "abandoned_stop_verified"
             else "normal_stop_handoff_verified"
         ),
         "previous_stop": stop,
         "profile": supplemental,
-        "voice_tail": tail,
     }
     handoff_path = output / "handoff.private.json"
     with handoff_path.open("x", encoding="utf-8") as stream:
@@ -2110,7 +2289,10 @@ async def _run_host_child(active_path: Path, facts: dict[str, str]) -> int:
         "conversation_profile": options["conversation_profile"],
         "loopback_authorizer": host.LoopbackPeerAuthorizer(),
         "hermes_run_record": plan.output / "state" / "hermes-runs-v1.json",
-        "voice_tail": plan.output / "state" / "voice-tail-v1.json",
+        # The conversation is the state root's, acquired by its lock. This run owns only
+        # its own run record: its Hermes home is fresh, so a record that outlived the run
+        # would replay a pending entry against a home with no idempotency record of it.
+        "voice_tail": _conversation_store(plan),
         "voice_companion": companion,
     }
     if plan.policy_mode == "native":
@@ -2247,6 +2429,7 @@ def serve(active_path: Path) -> int:
         "gateway-witness.private.json",
     ):
         require(not (output / name).exists(), "run_artifact_exists")
+    _require_state_root_available(plan)
     ports = [plan.ports[name] for name in ("api", "companion", "livekit", "host")]
     from scripts.lookup_backend_task import request_json
 
@@ -2630,7 +2813,10 @@ def main(argv: list[str] | None = None) -> int:
     receipt_parser.add_argument("--plan", type=Path, required=True)
     finalize_parser = commands.add_parser("finalize")
     finalize_parser.add_argument("--prepared", type=Path, required=True)
-    finalize_parser.add_argument("--previous", type=Path, required=True)
+    finalize_parser.add_argument("--previous", type=Path)
+    adopt_parser = commands.add_parser("adopt-state")
+    adopt_parser.add_argument("--plan", type=Path, required=True)
+    adopt_parser.add_argument("--source", type=Path, required=True)
     serve_parser = commands.add_parser("serve")
     serve_parser.add_argument("--active", type=Path, required=True)
     launch_parser = commands.add_parser("launch")
@@ -2661,6 +2847,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "make-speech-receipt":
             emit(make_speech_receipt(load_plan(args.plan)))
+            return 0
+        if args.command == "adopt-state":
+            emit(adopt_state(args.plan, args.source))
             return 0
         if args.command == "finalize":
             result = finalize(args.prepared, args.previous)

@@ -403,6 +403,7 @@ def _plan(tmp_path: Path) -> tuple[Path, Path]:
     plan = {
         "version": 1,
         "output": str(tmp_path / "preview"),
+        "state_root": str(tmp_path / "state-root"),
         "realtime": {
             "source": str(tmp_path / "repo"),
             "revision": "a" * 40,
@@ -956,20 +957,15 @@ def test_prepared_replacement_follows_clean_normal_stop_without_path_constants(
         ),
         encoding="utf-8",
     )
-    (previous / "state" / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
     monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
-
-    def copy_tail(_previous, output, _runtime):
-        (output / "state").mkdir()
-        (output / "state" / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
-        return {"bytes": 2, "sha256": "e" * 64}
-
-    monkeypatch.setattr(preview_cutover, "_copy_voice_tail", copy_tail)
     output = tmp_path / "preview"
     result = preview_cutover.finalize(output / "prepared.private.json", previous)
 
     assert result["category"] == "ready_to_launch"
+    # The previous run is evidence only: nothing of its conversation enters the new run.
+    assert not (output / "state").exists()
+    assert not (tmp_path / "state-root").exists()
     staged_home = output / "input" / "home"
     assert not (staged_home / "plugins" / preview_cutover._PLUGIN).exists()
     assert (staged_home / "plugins/preserved-helper/__init__.py").is_file()
@@ -1047,13 +1043,17 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _abandoned_previous(tmp_path: Path, plan_path: Path, *, journal: object = "empty") -> Path:
+def _abandoned_previous(
+    tmp_path: Path, plan_path: Path, *, journal: object = "empty", policy: object = None
+) -> Path:
     """A run directory as `serve` leaves it when its owner dies before writing a receipt."""
     previous = tmp_path / "previous"
     (previous / "state").mkdir(parents=True)
     previous_plan = json.loads(plan_path.read_text(encoding="utf-8"))
     previous_plan["output"] = str(previous)
     previous_plan["ports"] = dict(_ABANDONED_PORTS)
+    if policy is not None:
+        previous_plan["readiness_policy"] = policy
     (previous / "plan.private.json").write_text(json.dumps(previous_plan), encoding="utf-8")
     (previous / "prepared.private.json").write_text(json.dumps({
         "version": 1, "plan": previous_plan, "plan_sha256": _sha256(previous / "plan.private.json"),
@@ -1082,7 +1082,6 @@ def _abandoned_previous(tmp_path: Path, plan_path: Path, *, journal: object = "e
         (previous / "state" / "hermes-runs-v1.json").write_text(
             json.dumps(journal), encoding="utf-8"
         )
-    (previous / "state" / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
     return previous
 
 
@@ -1123,21 +1122,12 @@ def test_finalize_accepts_abandoned_run_without_writing_it(tmp_path, monkeypatch
     monkeypatch.setattr(
         preview_cutover, "_listener_rows", lambda port: observed.append(port) or []
     )
-    copied: list[Path] = []
-
-    def copy_tail(source, output, _runtime):
-        copied.append(source)
-        (output / "state").mkdir()
-        (output / "state" / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
-        return {"bytes": 2, "sha256": "e" * 64}
-
-    monkeypatch.setattr(preview_cutover, "_copy_voice_tail", copy_tail)
     output = tmp_path / "preview"
 
     result = preview_cutover.finalize(output / "prepared.private.json", previous)
 
     assert result["category"] == "ready_to_launch"
-    assert copied == [previous]
+    assert not (output / "state").exists()
     assert sorted(observed) == sorted(
         {59876, 59877, 7880, 28765} | {59886, 59887, 7890, 28775}
     )
@@ -1320,100 +1310,863 @@ def _real_runtime() -> Path:
     return Path(voice_tail_module.__file__).resolve().parents[2]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("record", ["pending_forget", "other_live", "none"])
-async def test_voice_tail_copy_carries_the_deletes_record_so_a_forget_survives(
-    tmp_path, record
-):
+_STOPPED_RECEIPT = {
+    "version": 1, "category": "stopped", "cleanup_settled": True, "cleanup_failed": False,
+    "owned_survivor_count": 0, "remaining_owned_listeners": 0,
+    "protected_listeners_unchanged": True, "ports": [59886, 59887, 7890, 28775],
+}
+_SAID = "synthetic-heard-before-the-restart"
+_TAIL = "voice-tail-v1.json"
+_DELETES = "voice-tail-v1.deletes.json"
+
+
+def _prepared(root: Path, monkeypatch) -> Path:
+    root.mkdir()
+    plan_path, source_profile = _plan(root)
+    (source_profile / ".env").write_bytes(b"opaque-auth-value")
+    success = subprocess.CompletedProcess(
+        ["preflight"], 0,
+        stdout=(
+            '[voice-preview] {"category":"preflight_ready","launch_authorized":false,'
+            '"ports":[59876,59877,7880,28765]}\n'
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(preview_cutover, "run_preflight", lambda *_: success)
+    preview_cutover.prepare(plan_path)
+    return root / "preview"
+
+
+def _state_plan(tmp_path: Path, output: str = "preview") -> Path:
+    """A plan for one more run directory on the same state root, bound to the real runtime."""
+    base = tmp_path / "plan.json"
+    if not base.exists():
+        _plan(tmp_path)
+    value = json.loads(base.read_text(encoding="utf-8"))
+    value["output"] = str(tmp_path / output)
+    value["realtime"]["runtime_target"] = str(_real_runtime())
+    path = tmp_path / f"plan-{output}.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    return path
+
+
+async def _say(tail: Path, text: str, conversation_id: str = "old") -> None:
+    """What a host does to its store: open under the lock, hear something, close."""
     from hermes_realtime.conversation import ConversationContextStore
-    from hermes_realtime.integration.voice_deletes import VoiceDeletes, voice_deletes_bytes
     from hermes_realtime.integration.voice_tail import VoiceTailWriter
     from hermes_realtime.speech import Transcript
 
-    state = tmp_path / "previous" / "state"
-    state.mkdir(parents=True)
-    writer = VoiceTailWriter(state / "voice-tail-v1.json", conversation_ids=iter(["old"]).__next__)
+    writer = VoiceTailWriter(tail, conversation_ids=iter([conversation_id]).__next__)
     store = ConversationContextStore(on_change=writer.update)
     await writer.open(store)
-    store.record_user_transcript(Transcript(text="said before the forget", final=True))
+    store.record_user_transcript(Transcript(text=text, final=True))
     await writer.close()
-    deletes = state / "voice-tail-v1.deletes.json"
-    # The crash came after the record was written and before the cleared tail was.
+
+
+async def _restored(tail: Path) -> list[str]:
+    """What the next host restores from the store, by the host's own open."""
+    from hermes_realtime.conversation import ConversationContextStore
+    from hermes_realtime.integration.voice_tail import VoiceTailWriter
+
+    writer = VoiceTailWriter(tail, conversation_ids=iter(["new"]).__next__)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        return [message.text for message in store.snapshot().messages]
+    finally:
+        await writer.close()
+
+
+async def _saved_run(root: Path, record: str = "none") -> Path:
+    """A stopped run directory of the copying era, holding a saved conversation."""
+    from hermes_realtime.integration.voice_deletes import VoiceDeletes, voice_deletes_bytes
+
+    state = root / "state"
+    state.mkdir(parents=True)
+    await _say(state / _TAIL, _SAID)
     if record == "pending_forget":
-        deletes.write_bytes(voice_deletes_bytes(VoiceDeletes(pending=(("old", 0),))))
+        # The crash came after the record was written and before the cleared tail was.
+        (state / _DELETES).write_bytes(
+            voice_deletes_bytes(VoiceDeletes(pending=(("old", 0),)))
+        )
     elif record == "other_live":
-        deletes.write_bytes(
+        (state / _DELETES).write_bytes(
             voice_deletes_bytes(VoiceDeletes(outcome=("older", 0), live=("newer", 1)))
         )
-    output = tmp_path / "output"
-    output.mkdir()
-    before = _tree_snapshot(state.parent)
-
-    copied = preview_cutover._copy_voice_tail(state.parent, output, _real_runtime())
-
-    assert _tree_snapshot(state.parent) == before
-    target = output / "state" / "voice-tail-v1.json"
-    target_deletes = output / "state" / "voice-tail-v1.deletes.json"
-    expected_tail_sha256 = _sha256(target)
-    expected_deletes = None if record == "none" else target_deletes.read_bytes()
-    # The new run's own mirror decides: a forgotten conversation is retired, not restored.
-    reopened = VoiceTailWriter(target, conversation_ids=iter(["new"]).__next__)
-    reopened_store = ConversationContextStore(on_change=reopened.update)
-    await reopened.open(reopened_store)
-    try:
-        restored = [message.text for message in reopened_store.snapshot().messages]
-        assert restored == (["said before the forget"] if record == "none" else [])
-    finally:
-        await reopened.close()
-    assert copied["sha256"] == expected_tail_sha256 == _sha256(state / "voice-tail-v1.json")
-    if record == "none":
-        assert copied["deletes_sha256"] is None and copied["deletes_bytes"] is None
-    else:
-        assert expected_deletes == deletes.read_bytes()
-        assert copied["deletes_sha256"] == _sha256(deletes)
-        assert copied["deletes_bytes"] == deletes.stat().st_size
+    return root
 
 
 @pytest.mark.parametrize(
-    ("deletes", "category"),
+    ("edit", "category"),
     [
-        ("directory", "saved_voice_deletes_file"),
-        ("oversized", "saved_voice_deletes_bound"),
-        ("torn_copy", "saved_voice_deletes_copy"),
+        ("missing", "plan_fields"),
+        ("relative", "state_root_path"),
+        ("parent_reference", "state_root_path"),
+        ("not_text", "state_root_path"),
+        ("unc", "state_root_path"),
+        ("unc_forward", "state_root_path"),
+        ("device", "state_root_path"),
+        ("the_run_directory", "state_root_path"),
+        ("inside_the_run_directory", "state_root_path"),
+        ("around_the_run_directory", "state_root_path"),
     ],
 )
-def test_voice_tail_copy_refuses_an_unsafe_deletes_record(
-    tmp_path, monkeypatch, deletes, category
+def test_plan_requires_one_state_root_outside_every_run_directory(tmp_path, edit, category):
+    path, _ = _plan(tmp_path)
+    assert preview_cutover.load_plan(path).state_root == tmp_path / "state-root"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    output = Path(value["output"])
+    if edit == "missing":
+        del value["state_root"]
+    else:
+        value["state_root"] = {
+            "relative": "state-root",
+            "parent_reference": str(tmp_path / "elsewhere" / ".." / "state-root"),
+            "not_text": 7,
+            "unc": "\\\\fileserver\\share\\state-root",
+            "unc_forward": "//fileserver/share/state-root",
+            "device": "\\\\?\\C:\\state-root",
+            "the_run_directory": str(output),
+            "inside_the_run_directory": str(output / "state"),
+            "around_the_run_directory": str(output.parent),
+        }[edit]
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(preview_cutover.PreviewRefusal, match=category):
+        preview_cutover.load_plan(path)
+
+
+@pytest.mark.parametrize("kind", [0, 1, 2, 4, 5, 6, True, None])
+def test_state_root_on_a_volume_that_is_not_a_local_fixed_disk_refuses(
+    tmp_path, monkeypatch, kind
 ):
-    from hermes_realtime.integration.voice_deletes import MAX_VOICE_DELETES_BYTES
+    plan = preview_cutover.load_plan(_plan(tmp_path)[0])
+    anchors = []
+    monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
+    monkeypatch.setattr(preview_cutover, "_drive_type", lambda anchor: anchors.append(anchor) or 3)
+    assert preview_cutover._conversation_store(plan) == plan.state_root / _TAIL
+    assert anchors == [plan.state_root.anchor]
+    # Removable, network, optical, RAM or unknown: locks and atomic replace are not dependable.
+    monkeypatch.setattr(preview_cutover, "_drive_type", lambda _anchor: kind)
+    for use in (preview_cutover._conversation_store, preview_cutover._require_state_root_available):
+        with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_not_local"):
+            use(plan)
+    with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_not_local"):
+        preview_cutover.adopt_state(_state_plan(tmp_path), tmp_path / "source")
+    assert not plan.state_root.exists()
 
-    state = tmp_path / "previous" / "state"
-    state.mkdir(parents=True)
-    (state / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
-    path = state / "voice-tail-v1.deletes.json"
-    if deletes == "directory":
-        path.mkdir()
-    elif deletes == "oversized":
-        path.write_bytes(b" " * (MAX_VOICE_DELETES_BYTES + 1))
-    else:
-        path.write_bytes(b"{}")
-        read = preview_cutover._read
-        monkeypatch.setattr(
-            preview_cutover, "_read",
-            lambda source, limit=preview_cutover._JSON_LIMIT: (
-                read(source, limit) + (b" " if source == path else b"")
-            ),
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native volume query")
+def test_the_volume_of_a_local_temporary_directory_is_a_fixed_disk(tmp_path):
+    assert preview_cutover._drive_type(tmp_path.anchor) == 3
+    # No volume is mounted there: DRIVE_NO_ROOT_DIR, which is not a fixed disk either.
+    assert preview_cutover._drive_type(str(tmp_path / "no-such-volume") + "\\") == 1
+
+
+@pytest.mark.asyncio
+async def test_two_consecutive_runs_share_one_tail_and_nothing_is_copied(tmp_path):
+    import shutil
+
+    first = preview_cutover.load_plan(_state_plan(tmp_path, "first-run"))
+    second = preview_cutover.load_plan(_state_plan(tmp_path, "second-run"))
+    store = preview_cutover._conversation_store(first)
+    assert store == preview_cutover._conversation_store(second) == tmp_path / "state-root" / _TAIL
+    # Genesis: the first run needs no predecessor and no existing store.
+    assert not first.state_root.exists()
+    preview_cutover._require_state_root_available(first)
+    first.output.mkdir()
+    (first.output / "evidence.private.json").write_text("{}", encoding="utf-8")
+
+    await _say(store, _SAID)
+
+    assert sorted(item.name for item in first.output.iterdir()) == ["evidence.private.json"]
+    # Nothing in any run directory is needed to restore the conversation.
+    shutil.rmtree(first.output)
+    preview_cutover._require_state_root_available(second)
+    assert await _restored(preview_cutover._conversation_store(second)) == [_SAID]
+    assert not second.output.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_second_owner_on_the_same_root_refuses_while_the_first_holds_it(tmp_path):
+    from hermes_realtime.conversation import ConversationContextStore
+    from hermes_realtime.integration.voice_tail import VoiceTailWriter
+
+    plan = preview_cutover.load_plan(_state_plan(tmp_path, "second-run"))
+    store = preview_cutover._conversation_store(plan)
+    await _say(store, _SAID)
+    holder = VoiceTailWriter(store, conversation_ids=iter(["held"]).__next__)
+    await holder.open(ConversationContextStore(on_change=holder.update))
+    try:
+        before = _tree_snapshot(plan.state_root)
+        with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_held"):
+            preview_cutover._require_state_root_available(plan)
+        # The probe is a courtesy. With it bypassed, the host's own open is what refuses.
+        with pytest.raises(RuntimeError, match="another host holds the voice tail"):
+            await _restored(store)
+        assert _tree_snapshot(plan.state_root) == before
+    finally:
+        await holder.close()
+    preview_cutover._require_state_root_available(plan)
+    assert await _restored(store) == [_SAID]
+
+
+_HOLDER = """
+import asyncio, sys
+from pathlib import Path
+from hermes_realtime.conversation import ConversationContextStore
+from hermes_realtime.integration.voice_tail import VoiceTailWriter
+from hermes_realtime.speech import Transcript
+
+
+async def main():
+    tail, ready, said = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+    writer = VoiceTailWriter(tail, conversation_ids=iter(["old"]).__next__)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    store.record_user_transcript(Transcript(text=said, final=True))
+    while not (tail.exists() and said.encode() in tail.read_bytes()):
+        await asyncio.sleep(0.05)
+    ready.write_text("held", encoding="utf-8")
+    await asyncio.sleep(600)
+
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_killed_owner_leaves_a_root_the_next_run_acquires_with_the_tail_intact(tmp_path):
+    import asyncio
+
+    plan = preview_cutover.load_plan(_state_plan(tmp_path, "next-run"))
+    store = preview_cutover._conversation_store(plan)
+    script = tmp_path / "holder.py"
+    script.write_text(_HOLDER, encoding="utf-8")
+    ready = tmp_path / "holder.ready"
+    with (tmp_path / "holder.log").open("wb") as log:
+        owner = subprocess.Popen(
+            [sys.executable, str(script), str(store), str(ready), _SAID],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
         )
-    output = tmp_path / "output"
-    output.mkdir()
+        try:
+            for _ in range(600):
+                if ready.exists() or owner.poll() is not None:
+                    break
+                await asyncio.sleep(0.1)
+            assert ready.exists(), (tmp_path / "holder.log").read_text(errors="replace")
+            # Another process holds the store: refused across the process boundary.
+            with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_held"):
+                preview_cutover._require_state_root_available(plan)
+            with pytest.raises(RuntimeError, match="another host holds the voice tail"):
+                await _restored(store)
+        finally:
+            owner.kill()
+            owner.wait(timeout=30)
+    # No stop, no receipt, no cleanup: the kernel releases the lock with the process. The
+    # interpreter may be a child of the launcher that was killed, so its end is awaited.
+    for _ in range(300):
+        try:
+            preview_cutover._require_state_root_available(plan)
+            break
+        except preview_cutover.PreviewRefusal:
+            await asyncio.sleep(0.1)
+    stale = plan.state_root / ".voice-tail-v1.json.abcd1234.tmp"
+    stale.write_text("synthetic-unfinished-write", encoding="utf-8")
+    preview_cutover._require_state_root_available(plan)
 
-    with pytest.raises(ValueError, match=category):
-        preview_cutover._copy_voice_tail(state.parent, output, _real_runtime())
-    # Refused before anything lands, or, for a torn copy, before any tail lands beside it.
-    if deletes == "torn_copy":
-        assert not (output / "state" / "voice-tail-v1.json").exists()
+    assert await _restored(store) == [_SAID]
+    # The next lock holder clears a killed writer's temporaries; none outlive it in a run.
+    assert not stale.exists()
+
+
+@pytest.mark.parametrize(
+    ("fault", "category"),
+    [
+        ("root_is_a_file", "state_root_directory"),
+        ("lock_is_a_directory", "state_root_lock_file"),
+        ("deletes_without_tail", "state_root_incomplete"),
+        ("empty_directory", None),
+        ("tail_only", None),
+        ("tail_and_deletes", None),
+    ],
+)
+def test_state_root_is_checked_before_a_run_owns_anything(tmp_path, fault, category):
+    plan = preview_cutover.load_plan(_plan(tmp_path)[0])
+    root = plan.state_root
+    if fault == "root_is_a_file":
+        root.write_bytes(b"")
     else:
-        assert not (output / "state").exists()
+        root.mkdir()
+    if fault == "lock_is_a_directory":
+        (root / (_TAIL + ".lock")).mkdir()
+    if fault in {"deletes_without_tail", "tail_and_deletes"}:
+        (root / _DELETES).write_text("{}", encoding="utf-8")
+    if fault in {"tail_only", "tail_and_deletes"}:
+        (root / _TAIL).write_text("{}", encoding="utf-8")
+    before = _tree_snapshot(tmp_path)
+
+    if category is None:
+        preview_cutover._require_state_root_available(plan)
+    else:
+        with pytest.raises(preview_cutover.PreviewRefusal, match=category):
+            preview_cutover._require_state_root_available(plan)
+    assert _tree_snapshot(tmp_path) == before
+
+
+def test_serve_refuses_a_held_state_root_before_it_owns_anything(tmp_path, monkeypatch):
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+    from scripts import lookup_backend_task, rehearse_desktop_mvp
+
+    plan = preview_cutover.load_plan(_plan(tmp_path)[0])
+    plan.output.mkdir()
+    monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
+    monkeypatch.setattr(preview_cutover, "_active_plan", lambda path: (plan, {}, plan.output))
+    monkeypatch.setattr(preview_cutover, "preflight", lambda *_: None)
+    monkeypatch.setattr(lookup_backend_task, "listener_rows", lambda _: [])
+    monkeypatch.setattr(
+        rehearse_desktop_mvp, "Containment",
+        lambda: pytest.fail("a run that cannot have the store must not own children"),
+    )
+    owner = lock_run_record(preview_cutover._conversation_store(plan))
+    assert owner is not None
+    try:
+        before = _tree_snapshot(tmp_path)
+        with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_held"):
+            preview_cutover.serve(plan.output / "active.private.json")
+        # Nothing was created, so the run directory can be launched again later.
+        assert _tree_snapshot(tmp_path) == before
+    finally:
+        unlock_run_record(owner)
+    tree = ast.parse(inspect.getsource(preview_cutover.serve))
+    (probe_line,) = [
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node) == "_require_state_root_available(plan)"
+    ]
+    # The later of the two mentions is the exclusive create that makes the run single-use.
+    pid_line = max(
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and node.value == "supervisor.pid.private.txt"
+    )
+    assert probe_line < pid_line
+
+
+@pytest.mark.asyncio
+async def test_host_gets_the_state_root_tail_and_its_own_run_record(tmp_path, monkeypatch):
+    path, profile = _plan(tmp_path)
+    plan = preview_cutover.load_plan(path)
+    plan.output.mkdir()
+    (plan.output / "host.stop").touch()
+    seen = {}
+
+    class Launcher:
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+    def build(*, hermes_discover_tools=False, **kwargs):
+        seen.update(kwargs)
+        return Launcher()
+
+    host = SimpleNamespace(
+        _load_api_bearer=lambda _: "synthetic-not-a-credential",
+        _load_voice_companion=lambda *_: None,
+        LoopbackPeerAuthorizer=object,
+        build_local_host_launcher=build,
+    )
+    monkeypatch.setattr(preview_cutover, "_active_plan", lambda _: (plan, None, profile))
+    monkeypatch.setattr(preview_cutover, "_runtime_modules", lambda _: (None, host))
+
+    await preview_cutover._host_child(tmp_path / "active")
+
+    assert seen["voice_tail"] == tmp_path / "state-root" / _TAIL
+    assert not seen["voice_tail"].is_relative_to(plan.output)
+    # The run record stays with the run: its Hermes home does not outlive it either.
+    assert seen["hermes_run_record"] == plan.output / "state" / "hermes-runs-v1.json"
+
+
+def test_first_launch_needs_no_predecessor(tmp_path, monkeypatch, capsys):
+    output = _prepared(tmp_path / "first", monkeypatch)
+    plan = preview_cutover.load_plan(output / "plan.private.json")
+    assert not plan.state_root.exists()
+
+    assert preview_cutover.main(
+        ["finalize", "--prepared", str(output / "prepared.private.json")]
+    ) == 0
+
+    status = json.loads(capsys.readouterr().out.removeprefix("[voice-preview] "))
+    assert status["category"] == "ready_to_launch"
+    handoff = json.loads((output / "handoff.private.json").read_text())
+    assert handoff["category"] == "no_previous_handoff"
+    assert handoff["previous_stop"] is None
+    assert set(handoff) == {"version", "category", "previous_stop", "profile"}
+    assert (output / "input" / "home" / ".env").read_bytes() == b"opaque-auth-value"
+    # Finalizing neither creates nor needs conversation state.
+    assert not (output / "state").exists()
+    assert not plan.state_root.exists()
+    calls = []
+    monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
+    helper = SimpleNamespace(
+        PreviewOwnerLaunchRefusal=_OwnerLaunchRefusal,
+        launch_preview_owner=lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setitem(sys.modules, "scripts.preview_owner_launch", helper)
+    active = output / "active.private.json"
+
+    assert preview_cutover.main(["launch", "--active", str(active)]) == 0
+
+    assert calls == [{
+        "interpreter": plan.executables["host_python"], "active": active.resolve(),
+        "output": plan.output,
+    }]
+    launched = json.loads(capsys.readouterr().out.removeprefix("[voice-preview] "))
+    assert launched["category"] == "launch_requested"
+    preview_cutover._require_state_root_available(plan)
+
+
+@pytest.mark.parametrize("store", ["empty", "adopted"])
+def test_finalize_does_not_leave_an_earlier_runs_conversation_behind(
+    tmp_path, monkeypatch, store
+):
+    output = _prepared(tmp_path / "new", monkeypatch)
+    previous = _abandoned_previous(tmp_path, tmp_path / "new" / "plan.json")
+    # A run of the copying era: its conversation is still in its own directory.
+    (previous / "state" / _TAIL).write_text("{}", encoding="utf-8")
+    plan = preview_cutover.load_plan(output / "plan.private.json")
+    if store == "adopted":
+        plan.state_root.mkdir()
+        (plan.state_root / _TAIL).write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    before = _tree_snapshot(previous)
+
+    if store == "adopted":
+        preview_cutover.finalize(output / "prepared.private.json", previous)
+        assert (output / "active.private.json").is_file()
+    else:
+        with pytest.raises(
+            preview_cutover.PreviewRefusal, match="previous_conversation_not_adopted"
+        ):
+            preview_cutover.finalize(output / "prepared.private.json", previous)
+        # Refused before the launch is bound, so the same prepared run finalizes later.
+        assert not (output / "handoff.private.json").exists()
+        assert not (output / "input" / "home" / ".env").exists()
+        assert not plan.state_root.exists()
+    assert _tree_snapshot(previous) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", ["pending_forget", "other_live", "none"])
+async def test_adopt_carries_a_saved_conversation_with_its_forget_record(
+    tmp_path, capsys, record
+):
+    source = await _saved_run(tmp_path / "stopped-run", record)
+    plan_path = _state_plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    before = _tree_snapshot(source)
+    assert not plan.state_root.exists()
+
+    assert preview_cutover.main(
+        ["adopt-state", "--plan", str(plan_path), "--source", str(source)]
+    ) == 0
+
+    raw = capsys.readouterr().out
+    result = json.loads(raw.removeprefix("[voice-preview] "))
+    assert _tree_snapshot(source) == before
+    assert str(tmp_path) not in raw and _SAID not in raw
+    store = plan.state_root / _TAIL
+    assert result["category"] == "state_adopted" and result["already_adopted"] is False
+    assert result["sha256"] == _sha256(store) == _sha256(source / "state" / _TAIL)
+    assert result["bytes"] == store.stat().st_size
+    if record == "none":
+        assert result["deletes_sha256"] is None and result["deletes_bytes"] is None
+        assert not (plan.state_root / _DELETES).exists()
+    else:
+        assert result["deletes_sha256"] == _sha256(plan.state_root / _DELETES)
+        assert (plan.state_root / _DELETES).read_bytes() == (
+            source / "state" / _DELETES
+        ).read_bytes()
+    adopted = _tree_snapshot(plan.state_root)
+    # Running it again changes nothing and says so.
+    again = preview_cutover.adopt_state(plan_path, source)
+    assert again == dict(result, already_adopted=True)
+    assert _tree_snapshot(plan.state_root) == adopted
+    assert _tree_snapshot(source) == before
+    preview_cutover._require_state_root_available(plan)
+    # The host's own open decides: a forgotten conversation is retired, not restored.
+    assert await _restored(preview_cutover._conversation_store(plan)) == (
+        [_SAID] if record == "none" else []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "occupant",
+    [
+        "other_tail",
+        "other_tail_same_deletes",
+        "other_deletes_without_tail",
+        "deletes_the_source_lacks",
+        "same_tail_without_the_source_deletes",
+        "same_tail_with_other_deletes",
+        "tail_is_a_directory",
+    ],
+)
+async def test_adopt_refuses_a_state_root_that_holds_anything_else(tmp_path, occupant):
+    from hermes_realtime.integration.voice_deletes import VoiceDeletes, voice_deletes_bytes
+
+    source_has_deletes = occupant != "deletes_the_source_lacks"
+    source = await _saved_run(
+        tmp_path / "stopped-run", "pending_forget" if source_has_deletes else "none"
+    )
+    plan_path = _state_plan(tmp_path)
+    root = preview_cutover.load_plan(plan_path).state_root
+    root.mkdir()
+    source_tail = (source / "state" / _TAIL).read_bytes()
+    other_deletes = voice_deletes_bytes(VoiceDeletes(pending=(("another", 3),)))
+    if occupant in {"other_tail", "other_tail_same_deletes"}:
+        await _say(root / _TAIL, "synthetic-newer-conversation", "newer")
+    if occupant == "other_tail_same_deletes":
+        (root / _DELETES).write_bytes((source / "state" / _DELETES).read_bytes())
+    if occupant in {"other_deletes_without_tail", "deletes_the_source_lacks",
+                    "same_tail_with_other_deletes"}:
+        (root / _DELETES).write_bytes(other_deletes)
+    if occupant in {"same_tail_without_the_source_deletes", "same_tail_with_other_deletes"}:
+        (root / _TAIL).write_bytes(source_tail)
+    if occupant == "tail_is_a_directory":
+        (root / _TAIL).mkdir()
+
+    def contents():
+        # Taking the store's lock creates its lock file; nothing else may change.
+        return {
+            item.name: None if item.is_dir() else item.read_bytes()
+            for item in root.iterdir() if item.name != _TAIL + ".lock"
+        }
+
+    before = contents()
+    source_before = _tree_snapshot(source)
+
+    with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_not_empty"):
+        preview_cutover.adopt_state(plan_path, source)
+
+    # Refused before anything is written: nothing there is overwritten or completed.
+    assert contents() == before
+    assert _tree_snapshot(source) == source_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("record", "killed_at"),
+    [
+        ("pending_forget", "before_any_write"),
+        ("pending_forget", "inside_first_write"),
+        ("pending_forget", "between_writes"),
+        ("pending_forget", "after_last_write"),
+        ("none", "before_any_write"),
+        ("none", "inside_first_write"),
+        ("none", "after_last_write"),
+    ],
+)
+async def test_adopt_killed_at_any_step_is_completed_by_running_it_again(
+    tmp_path, monkeypatch, record, killed_at
+):
+    from hermes_realtime.integration import run_record
+
+    source = await _saved_run(tmp_path / "stopped-run", record)
+    plan_path = _state_plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    before = _tree_snapshot(source)
+    write = run_record.write_run_record
+    written: list[str] = []
+
+    def killed(path, data):
+        if killed_at == "inside_first_write" and not written:
+            # The process died after mkstemp wrote plaintext and before the replace.
+            (path.parent / f".{path.name}.abcd1234.tmp").write_bytes(data)
+            raise KeyboardInterrupt
+        if killed_at == "before_any_write" or (killed_at == "between_writes" and written):
+            raise KeyboardInterrupt
+        write(path, data)
+        written.append(path.name)
+        if killed_at == "after_last_write" and path.name == _TAIL:
+            # Written and replaced, but never verified or reported.
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(run_record, "write_run_record", killed)
+    with pytest.raises(KeyboardInterrupt):
+        preview_cutover.adopt_state(plan_path, source)
+    monkeypatch.setattr(run_record, "write_run_record", write)
+
+    assert _tree_snapshot(source) == before
+    present = {item.name for item in plan.state_root.iterdir()} - {_TAIL + ".lock"}
+    first = _DELETES if record == "pending_forget" else _TAIL
+    if killed_at == "before_any_write":
+        assert present == set()
+    elif killed_at == "inside_first_write":
+        assert present == {f".{first}.abcd1234.tmp"}
+    elif killed_at == "between_writes":
+        # Only one order exists: the forget record never trails its tail.
+        assert present == {_DELETES}
+    else:
+        assert present == {_TAIL} | ({_DELETES} if record == "pending_forget" else set())
+    if present == {_DELETES}:
+        # A host must not start on the forget record alone and begin a new conversation.
+        with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_incomplete"):
+            preview_cutover._require_state_root_available(plan)
+    # The lock died with the process, so the same command finishes the same adoption.
+    result = preview_cutover.adopt_state(plan_path, source)
+
+    assert result["already_adopted"] is (killed_at == "after_last_write")
+    assert _tree_snapshot(source) == before
+    expected = {_TAIL, _TAIL + ".lock"} | ({_DELETES} if record == "pending_forget" else set())
+    assert {item.name for item in plan.state_root.iterdir()} == expected
+    assert (plan.state_root / _TAIL).read_bytes() == (source / "state" / _TAIL).read_bytes()
+    preview_cutover._require_state_root_available(plan)
+    assert await _restored(preview_cutover._conversation_store(plan)) == (
+        [_SAID] if record == "none" else []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "category"),
+    [
+        ("source_tail_lock_held", "adopt_source_held"),
+        ("source_run_lock_held", "adopt_source_held"),
+        ("source_lock_directory", "adopt_source_lock_file"),
+        ("store_held", "state_root_held"),
+        ("no_tail", "adopt_source_tail_missing"),
+        ("tail_directory", "adopt_source_tail"),
+        ("tail_oversized", "adopt_source_tail"),
+        ("deletes_directory", "adopt_source_deletes"),
+        ("deletes_oversized", "adopt_source_deletes"),
+        ("root_is_a_file", "state_root_directory"),
+    ],
+)
+async def test_adopt_refuses_a_live_or_unsafe_source_or_store(tmp_path, fault, category):
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+    from hermes_realtime.integration.voice_deletes import MAX_VOICE_DELETES_BYTES
+    from hermes_realtime.integration.voice_tail import max_voice_tail_bytes
+
+    source = await _saved_run(tmp_path / "stopped-run", "pending_forget")
+    state = source / "state"
+    plan_path = _state_plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    owner = None
+    if fault == "source_tail_lock_held":
+        owner = lock_run_record(state / _TAIL)
+    elif fault == "source_run_lock_held":
+        owner = lock_run_record(state / "hermes-runs-v1.json")
+    elif fault == "store_held":
+        owner = lock_run_record(preview_cutover._conversation_store(plan))
+    elif fault == "source_lock_directory":
+        (state / (_TAIL + ".lock")).unlink()
+        (state / (_TAIL + ".lock")).mkdir()
+    elif fault == "no_tail":
+        (state / _TAIL).unlink()
+    elif fault == "tail_directory":
+        (state / _TAIL).unlink()
+        (state / _TAIL).mkdir()
+    elif fault == "tail_oversized":
+        (state / _TAIL).write_bytes(b" " * (max_voice_tail_bytes(32, 1024) + 1))
+    elif fault == "deletes_directory":
+        (state / _DELETES).unlink()
+        (state / _DELETES).mkdir()
+    elif fault == "deletes_oversized":
+        (state / _DELETES).write_bytes(b" " * (MAX_VOICE_DELETES_BYTES + 1))
+    elif fault == "root_is_a_file":
+        plan.state_root.write_bytes(b"")
+    assert owner is not None or "held" not in fault
+    before = _tree_snapshot(tmp_path)
+    try:
+        with pytest.raises(preview_cutover.PreviewRefusal, match=category):
+            preview_cutover.adopt_state(plan_path, source)
+        assert _tree_snapshot(tmp_path) == before
+    finally:
+        if owner is not None:
+            unlock_run_record(owner)
+
+
+@pytest.mark.asyncio
+async def test_adopt_refuses_a_source_that_changed_underneath_it(tmp_path, monkeypatch):
+    from hermes_realtime.integration import run_record
+
+    source = await _saved_run(tmp_path / "stopped-run")
+    plan_path = _state_plan(tmp_path)
+    write = run_record.write_run_record
+
+    def a_live_host_writes(path, data):
+        write(path, data)
+        (source / "state" / _TAIL).write_bytes(data + b" ")
+
+    monkeypatch.setattr(run_record, "write_run_record", a_live_host_writes)
+
+    with pytest.raises(preview_cutover.PreviewRefusal, match="adopt_source_changed"):
+        preview_cutover.adopt_state(plan_path, source)
+
+
+def test_adopt_refuses_a_store_that_does_not_hold_what_was_read(tmp_path, monkeypatch):
+    import asyncio
+
+    from hermes_realtime.integration import run_record
+
+    source = asyncio.run(_saved_run(tmp_path / "stopped-run"))
+    plan_path = _state_plan(tmp_path)
+    write = run_record.write_run_record
+    monkeypatch.setattr(
+        run_record, "write_run_record", lambda path, data: write(path, data[:-1])
+    )
+
+    with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_copy"):
+        preview_cutover.adopt_state(plan_path, source)
+
+
+@pytest.mark.parametrize(
+    ("previous_policy", "new_policy", "category"),
+    [
+        ("dev_owned_services", "kernel_listeners", "previous_readiness_policy"),
+        ("dev_owned_services", None, "previous_readiness_policy"),
+        ("dev_owned_services", "dev_owned_services", None),
+        ("kernel_listeners", "dev_owned_services", None),
+        (None, "kernel_listeners", None),
+        ("best_effort", "dev_owned_services", "previous_readiness_policy"),
+        (True, "dev_owned_services", "previous_readiness_policy"),
+    ],
+)
+def test_abandoned_run_pairs_readiness_policy_as_a_clean_stop_does(
+    tmp_path, monkeypatch, previous_policy, new_policy, category
+):
+    plan_path, _ = _plan(tmp_path)
+    previous = _abandoned_previous(tmp_path, plan_path, policy=previous_policy)
+    if new_policy is not None:
+        value = json.loads(plan_path.read_text(encoding="utf-8"))
+        value["readiness_policy"] = new_policy
+        plan_path.write_text(json.dumps(value), encoding="utf-8")
+    plan = preview_cutover.load_plan(plan_path)
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    monkeypatch.setattr(preview_cutover, "_tcp_accepting", lambda _port: False)
+    before = _tree_snapshot(previous)
+
+    if category is None:
+        assert preview_cutover.verify_previous_stop(previous, plan)["category"] == (
+            "abandoned_stop_verified"
+        )
+    else:
+        with pytest.raises(preview_cutover.PreviewRefusal, match=category):
+            preview_cutover.verify_previous_stop(previous, plan)
+    assert _tree_snapshot(previous) == before
+    # The clean-stop path decides the same pairing for the same two policies.
+    if type(previous_policy) is str and previous_policy in {
+        "kernel_listeners", "dev_owned_services"
+    }:
+        receipt = dict(_STOPPED_RECEIPT, readiness_policy=previous_policy)
+        if previous_policy == "dev_owned_services":
+            receipt |= {
+                "listener_ownership": "unavailable", "remaining_owned_listeners": None,
+                "protected_listeners_unchanged": None, "remaining_accepting_endpoints": 0,
+                "protected_endpoints_unchanged": None,
+            }
+        (previous / "result-receipt.private.json").write_text(
+            json.dumps(receipt), encoding="utf-8"
+        )
+        if category is None:
+            assert preview_cutover.verify_previous_stop(previous, plan)["category"] == (
+                "normal_stop_verified"
+            )
+        else:
+            with pytest.raises(preview_cutover.PreviewRefusal):
+                preview_cutover.verify_previous_stop(previous, plan)
+
+
+@pytest.mark.parametrize("stop", ["abandoned", "normal"])
+def test_handoff_counts_crashed_writer_temporaries_without_touching_them(
+    tmp_path, monkeypatch, stop
+):
+    output = _prepared(tmp_path / "new", monkeypatch)
+    previous = _abandoned_previous(tmp_path, tmp_path / "new" / "plan.json")
+    if stop == "normal":
+        (previous / "result-receipt.private.json").write_text(
+            json.dumps(_STOPPED_RECEIPT), encoding="utf-8"
+        )
+    state = previous / "state"
+    marker = "synthetic-heard-text"
+    # Exactly the names run_record.write_run_record leaves behind for the three host records.
+    for name in (
+        ".hermes-runs-v1.json.abcd1234.tmp",
+        ".voice-tail-v1.json.a_b_c_d0.tmp",
+        ".voice-tail-v1.json.zzzzzzzz.tmp",
+        ".voice-tail-v1.deletes.json.00000000.tmp",
+    ):
+        (state / name).write_text(marker, encoding="utf-8")
+    # Neighbours that are not such temporaries.
+    for name in (
+        ".voice-tail-v1.json.abcd123.tmp",
+        ".voice-tail-v1.json.ABCD1234.tmp",
+        ".other-record.json.abcd1234.tmp",
+        "voice-tail-v1.json.abcd1234.tmp",
+        ".voice-tail-v1.json.abcd1234.tmp.bak",
+    ):
+        (state / name).write_text(marker, encoding="utf-8")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    before = _tree_snapshot(previous)
+
+    preview_cutover.finalize(output / "prepared.private.json", previous)
+
+    assert _tree_snapshot(previous) == before
+    raw = (output / "handoff.private.json").read_text(encoding="utf-8")
+    assert json.loads(raw)["previous_stop"]["state_temporaries"] == 4
+    # Counts only: no name and no content of a temporary reaches the handoff.
+    assert marker not in raw and ".tmp" not in raw
+    assert not (output / "state").exists()
+
+
+def test_state_temporaries_scan_is_bounded(tmp_path, monkeypatch):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    previous = _abandoned_previous(tmp_path, plan_path)
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    assert preview_cutover.verify_previous_stop(previous, plan)["state_temporaries"] == 0
+    monkeypatch.setattr(preview_cutover, "_MAX_STATE_ENTRIES", 4)
+    for index in range(2):
+        (previous / "state" / f"extra-{index}").write_bytes(b"")
+
+    with pytest.raises(preview_cutover.PreviewRefusal, match="previous_state_bound"):
+        preview_cutover.verify_previous_stop(previous, plan)
+
+
+@pytest.mark.parametrize("stop", ["abandoned", "normal"])
+@pytest.mark.parametrize("unobservable", [101, 104])
+def test_a_process_that_cannot_be_observed_is_not_read_as_dead(
+    tmp_path, monkeypatch, stop, unobservable
+):
+    from scripts import rehearse_desktop_mvp
+
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    previous = _abandoned_previous(tmp_path, plan_path)
+    if stop == "normal":
+        (previous / "result-receipt.private.json").write_text(
+            json.dumps(_STOPPED_RECEIPT), encoding="utf-8"
+        )
+
+    def started_at(pid):
+        if pid == unobservable:
+            raise rehearse_desktop_mvp.ProcessUnobservable("synthetic private detail")
+        return None
+
+    monkeypatch.setattr(rehearse_desktop_mvp, "started_at", started_at)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    before = _tree_snapshot(previous)
+
+    with pytest.raises(preview_cutover.PreviewRefusal, match="previous_process_unobservable"):
+        preview_cutover.verify_previous_stop(previous, plan)
+    assert _tree_snapshot(previous) == before
 
 
 @pytest.mark.parametrize(
@@ -1690,6 +2443,7 @@ def test_actual_serve_refuses_inherited_job_before_containment_or_children(tmp_p
     ports = {"api": 49001, "companion": 49002, "livekit": 49003, "host": 49004,
              "protected": [49005]}
     plan = SimpleNamespace(output=tmp_path, ports=ports, readiness_policy="kernel_listeners",
+                           state_root=tmp_path.parent / (tmp_path.name + "-state"),
                            executables={"host_python": tmp_path / "bound-python"})
     calls = []
     monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
