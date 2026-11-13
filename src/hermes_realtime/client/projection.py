@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import re
@@ -431,13 +432,35 @@ class BrowserEventProjection:
             # A completed result is bounded in Unicode scalars. The browser bounds every other
             # result with String.length, so those are counted in UTF-16 code units.
             measure = len if status == "completed" else utf16_units
-            if (
-                type(text) is not str
-                or not text.strip()
-                or measure(text) > text_limit
-                or (status == "completed" and not has_valid_result_unicode(text))
-            ):
-                raise ValueError("task result text is invalid")
+            refusal: str | None = None
+            if type(text) is not str:
+                refusal = "result_text_type"
+            elif not text.strip():
+                refusal = "result_text_blank"
+            elif measure(text) > text_limit:
+                refusal = "result_text_scalars" if status == "completed" else "result_text_units"
+            elif status == "completed" and not has_valid_result_unicode(text):
+                refusal = "result_text_unicode"
+            if refusal is not None:
+                try:
+                    raise ValueError("task result text is invalid")
+                finally:
+                    evidence = {
+                        "category": refusal,
+                        "kind": kind,
+                        "limit": text_limit,
+                        "status": status,
+                        # A count only, capped one past the bound; never the text or the task.
+                        "units": min(measure(text), text_limit + 1) if type(text) is str else 0,
+                        "version": 1,
+                    }
+                    # Reporting a refusal must not replace it with a stream error.
+                    with contextlib.suppress(OSError, ValueError):
+                        print(
+                            "[task-result-projection] "
+                            + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                            flush=True,
+                        )
         if kind == "knowledge_timing":
             expected = {
                 "backend",
