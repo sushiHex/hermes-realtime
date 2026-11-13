@@ -135,7 +135,8 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Dep
 | Managed provider credentials | [Live access credentials](docs/live-credentials.md) |
 | Task results and web evidence | [Native web evidence](docs/native-web-evidence.md) |
 | Automated typed checks and timing limits | [Native journey client](docs/native-typed-journey.md) |
-| Desktop diagnostic and acceptance procedures | [Diagnostic guide](docs/desktop-mvp-diagnostic.md), [acceptance guide](docs/desktop-mvp-acceptance.md) |
+| Acceptance steps for the current native preview profile | [Native preview acceptance procedure](docs/native-preview-acceptance.md) |
+| Historical desktop diagnostic and acceptance procedures | [Diagnostic guide](docs/desktop-mvp-diagnostic.md), [acceptance guide](docs/desktop-mvp-acceptance.md) |
 | Architecture, source evidence and contribution workflow | [Collaborator guide](docs/README.md), [implementation status](docs/implementation-status.md), [work tracking](docs/work-tracking.md) |
 | Release qualification | [Release gates](docs/release-gates.md) |
 
