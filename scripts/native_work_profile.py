@@ -37,6 +37,10 @@ def web_evidence_selected(config: dict[str, Any]) -> bool:
     return selected
 
 
+class NativeProfileRefusal(ValueError):
+    """A fixed, content-free category the preview retains as refusal evidence."""
+
+
 def memory_provider_inspection(config: dict[str, Any]) -> str:
     """Refuse an external memory provider; report the config-only result by category.
 
@@ -48,14 +52,14 @@ def memory_provider_inspection(config: dict[str, Any]) -> str:
         return "absent"
     memory = config["memory"]
     if type(memory) is not dict:
-        raise ValueError("memory_provider_refused")
+        raise NativeProfileRefusal("memory_provider_refused")
     if "provider" not in memory:
         return "absent"
     provider = memory["provider"]
     if type(provider) is not str:
-        raise ValueError("memory_provider_refused")
+        raise NativeProfileRefusal("memory_provider_refused")
     if provider:
-        raise ValueError("memory_provider_selected")
+        raise NativeProfileRefusal("memory_provider_selected")
     return "builtin"
 
 

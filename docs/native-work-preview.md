@@ -41,9 +41,10 @@ an external memory provider: at the pinned Hermes baseline `memory.provider` alo
 selects one, and an absent key or its empty-string default means built-in memory only.
 Staging and preflight refuse a non-empty `memory.provider` with the fixed error
 `memory_provider_selected`, and a `memory` section or `memory.provider` of the wrong
-exact type with `memory_provider_refused`; neither prints the provider's settings. Like
-the other native profile refusals, `prepare`'s refusal receipt records these as
-`preparation_failed`. The `prepared.private.json`
+exact type with `memory_provider_refused`. The category alone, never the provider's
+name or settings, is retained as `failure_category` in `prepare`'s
+`preparation-refused.private.json` and in the preflight `[voice-preview]` status line.
+The `prepared.private.json`
 receipt records `memory_provider_config_inspection` (`absent` or `builtin`). This is a
 configuration inspection only; no runtime readback of the gateway's effective memory
 state exists. Configure the model provider with `hermes setup`; the
