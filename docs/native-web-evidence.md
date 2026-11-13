@@ -44,22 +44,29 @@ Version 1 (no `reason`) is no longer accepted.
 | `presented` | `null` | The bounded passage-backed formatter produced the published output. |
 | `no_web` | `null` | No web tool was observed; ordinary native output is preserved. |
 | `mixed_ungrounded` | `null` | Web and other effect tools were used; ordinary output is preserved without a grounding claim. |
-| `ungrounded` | `unobserved` | No middleware call observed the final answer; ordinary output is preserved without a grounding claim. |
+| `ungrounded` | `unobserved` | No middleware call observed the final answer of a no-web or mixed run; ordinary output is preserved without a grounding claim. |
 | `refused` | one refusal reason | Evidence capture or presentation could not establish this contract; the host withholds the result. |
 
 `ungrounded` is decided at the terminal status read. Hermes's turn-budget summary
 (`handle_max_iterations`) makes its final model call outside LLM middleware, so the
 observer never sees that answer; any other unobserved call path lands here too. The
-observer binds the decision to the SHA-256 of the exact completed output it reads
-from the status body, and a row retired before that read is kept, source-free, until
-it. Nothing previously refused is ever delivered this way.
+unobserved final gets the disposition an observed final would have had without
+presentation: a no-web or mixed run is delivered `ungrounded`, and a web-only run is
+`refused` with reason `unobserved`, because web-only output reaches the user only
+through the passage-backed presenter. The observer binds the decision to the
+SHA-256 of the exact completed output it reads from the status body, and a row
+retired before that read is kept, source-free, until it. Nothing previously refused
+is ever delivered this way. A final that Hermes builds outside middleware in a
+no-web run (for example an error text) is delivered `ungrounded` and relies on the
+host's ordinary result-envelope checks, as non-web runs already do.
 
 Refusal reasons form a closed set: `binding` (task, run or presentation ownership
 mismatch), `capture` (a web result could not be read), `closed` (stopped, cancelled
 or unloaded), `deadline`, `final_response` (the observed final answer was not a
 complete stop), `input_bound`, `insufficient` (no usable passage), `internal`,
 `presentation_failed`, `route` (formatter route does not match the native route),
-`source_changed`, and `unobserved` (a completed status with no bindable output). The
+`source_changed`, and `unobserved` (a web-only run's final answer was never observed,
+or a completed status had no bindable output). The
 first reason of a refusal is the one reported. The plugin's content-free
 `[web-evidence]` line carries the same `category` and `reason`; the host's
 `[hermes-web-evidence]` line carries `reason` too, or `attestation` when the

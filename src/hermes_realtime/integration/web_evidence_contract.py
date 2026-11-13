@@ -4,8 +4,9 @@
 None of them attests factual grounding; only ``presented`` identifies the bounded
 passage-backed presentation path. No disposition proves semantic correctness.
 ``ungrounded`` is the terminal decision for an answer the observer never saw (for
-example Hermes's turn-budget summary, which bypasses LLM middleware); it is bound to
-the exact output like every other disposition. ``refused`` withholds the output and
+example Hermes's turn-budget summary, which bypasses LLM middleware) in a no-web or
+mixed run; a web-only run's unobserved answer is refused. It is bound to the exact
+output like every other disposition. ``refused`` withholds the output and
 names why with one category from ``REFUSED_REASONS``.
 """
 

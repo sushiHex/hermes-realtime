@@ -1043,16 +1043,25 @@ async def _terminal_status(observer: NativeWebEvidence, body: dict[str, Any]) ->
         await client.close()
 
 
-async def _budget_spent_run(observer: NativeWebEvidence) -> None:
+_SHAPE_TOOLS = {
+    "web_only": ("web_search",),
+    "no_web": ("terminal",),
+    "mixed": ("web_search", "terminal"),
+}
+
+
+async def _budget_spent_run(observer: NativeWebEvidence, shape: str = "mixed") -> None:
     """Live shape: every observed model turn calls a tool; the final answer is unobserved."""
 
     async def native_run() -> None:
         def turns() -> None:
-            observer.tool_execution(
-                tool_name="web_search",
-                args={"query": "current report"},
-                next_call=lambda _args: _search_result(),
-            )
+            for tool in _SHAPE_TOOLS[shape]:
+                observer.tool_execution(
+                    tool_name=tool,
+                    args={"query": "current report"},
+                    next_call=lambda _args, tool=tool: (
+                        _search_result() if tool == "web_search" else "tool output"),
+                )
             tool_turn = _tool_call_response()
             assert observer.llm_execution(
                 request={"model": "test"}, provider="test", base_url="https://example.com",
@@ -1077,12 +1086,41 @@ UNOBSERVED_FINAL = "Here is what I found so far about the report."
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retired", [False, True])
-async def test_unobserved_terminal_answer_is_delivered_ungrounded_and_bound(
+async def test_unobserved_web_only_final_is_refused_not_delivered(
     retired: bool, capsys: Any
+) -> None:
+    """A web-only run reaches the user only through the passage-backed presenter."""
+    presentation = _Presentation()
+    observer = _observer(presentation)
+    await _budget_spent_run(observer, "web_only")
+    if retired:
+        with observer.lock:
+            observer._retire_locked()
+        assert RUN_ID not in observer.rows
+
+    raw = await _terminal_status(
+        observer, {"object": "hermes.run", "run_id": RUN_ID, "status": "completed",
+                   "output": UNOBSERVED_FINAL},
+    )
+
+    assert presentation.calls == 0
+    assert not attestation_valid(raw, GENERATION, RUN_ID, UNOBSERVED_FINAL)
+    assert attestation_outcome(raw, GENERATION, RUN_ID, UNOBSERVED_FINAL) == (
+        "refused", "unobserved")
+    assert capsys.readouterr().out == (
+        '[web-evidence] {"category":"refused","count":1,"reason":"unobserved"}\n'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retired", [False, True])
+@pytest.mark.parametrize("shape", ["no_web", "mixed"])
+async def test_unobserved_terminal_answer_is_delivered_ungrounded_and_bound(
+    shape: str, retired: bool, capsys: Any
 ) -> None:
     presentation = _Presentation()
     observer = _observer(presentation)
-    await _budget_spent_run(observer)
+    await _budget_spent_run(observer, shape)
     if retired:
         with observer.lock:
             observer._retire_locked()
@@ -1233,6 +1271,32 @@ async def test_each_refusal_reason_reaches_attestation_and_marker(
         if scenario.foreign is not None:
             scenario.foreign.cancel()
             await asyncio.gather(scenario.foreign, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_deterministic_render_failure_is_internal_not_retryable(
+    monkeypatch: Any, capsys: Any
+) -> None:
+    _install_fake_openai_models(monkeypatch)
+
+    class MalformedPresentation(_Presentation):
+        async def complete(self, *_args: Any, **_kwargs: Any) -> Any:
+            return _final_response("not a presentation envelope")
+
+    task = asyncio.current_task()
+    assert task is not None
+    observer = _observer(MalformedPresentation())
+    _bind_run(observer, task)
+    _web_turn(observer)
+    returned = await asyncio.to_thread(_final_turn, observer, _final_response())
+
+    published = returned.choices[0].message.content
+    assert published == '{"error": "policy_refused"}'
+    assert attestation_outcome(observer.reports[RUN_ID], GENERATION, RUN_ID, published) == (
+        "refused", "internal")
+    assert capsys.readouterr().out == (
+        '[web-evidence] {"category":"refused","count":1,"reason":"internal"}\n'
+    )
 
 
 def test_refusal_reason_table_is_closed_over_the_contract() -> None:

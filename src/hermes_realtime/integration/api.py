@@ -75,7 +75,8 @@ _WEB_REFUSAL_NOTICES = MappingProxyType({
     "route": "The web presentation model does not match the task's model, "
              "so the result was withheld.",
     "source_changed": "The web sources changed while being presented. Please try again.",
-    "unobserved": "The task ended before its answer could be checked.",
+    "unobserved": "The task's answer could not be checked against its web sources, "
+                  "so it was withheld.",
 })
 _LOOKUP_GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _RUN_ID_EXACT = re.compile(r"run_[a-fA-F0-9]{16,64}\Z")

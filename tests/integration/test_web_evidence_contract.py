@@ -416,6 +416,34 @@ async def test_turn_budget_final_answer_reaches_the_user_from_the_real_companion
     )
 
 
+@pytest.mark.asyncio
+async def test_web_only_turn_budget_final_is_withheld_with_a_truthful_notice(capsys):
+    from tests.test_native_web_evidence import GENERATION as COMPANION_GENERATION
+    from tests.test_native_web_evidence import (
+        RUN_ID,
+        UNOBSERVED_FINAL,
+        _budget_spent_run,
+        _observer,
+        _terminal_status,
+    )
+
+    observer = _observer()
+    await _budget_spent_run(observer, "web_only")
+    body = {"object": "hermes.run", "run_id": RUN_ID, "status": "completed",
+            "output": UNOBSERVED_FINAL}
+    raw = await _terminal_status(observer, body)
+
+    terminal = await _host_terminal(raw, body, RUN_ID, COMPANION_GENERATION)
+
+    assert terminal == {"event": "run.failed", "run_id": RUN_ID, "error": (
+        "The task's answer could not be checked against its web sources, so it was withheld."
+    )}
+    assert "try again" not in terminal["error"].lower()
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        '[hermes-web-evidence] {"category":"completion","reason":"unobserved","version":1}'
+    )
+
+
 _RETRYABLE = {"deadline", "presentation_failed", "source_changed"}
 
 

@@ -85,7 +85,7 @@ _REASONS = MappingProxyType({
 
 
 def _reason(error: BaseException, default: str) -> str:
-    if isinstance(error, asyncio.CancelledError):
+    if type(error) is asyncio.CancelledError:
         return "closed"
     category = error.args[0] if type(error) is ValueError and error.args else None
     reason = _REASONS.get(category, default) if type(category) is str else default
@@ -657,9 +657,9 @@ class NativeWebEvidence:
             }
             stage = "presentation_failed"
             formatted = await self.presentation.complete(self, run_id, row, source_input, evidence)
+            stage = "internal"
             rendered = render_presentation_response(
                 formatted, catalog, api_mode, evidence, passages=passages)
-            stage = "internal"
             with self.lock:
                 self._assert_current(run_id, row, enforce_deadline=True)
                 if row["urls"] != set(catalog) or row["passages"] is not passages:
@@ -775,9 +775,11 @@ class NativeWebEvidence:
         """Decide the run at its terminal status read; nothing is left undecided here.
 
         A row whose final answer no middleware call observed (Hermes's turn-budget summary
-        today, any other unobserved model call tomorrow) and that nothing refused is
-        delivered as ``ungrounded``: no sources claimed, bound to the exact completed
-        output, as ``no_web`` and ``mixed_ungrounded`` deliver ordinary output.
+        today, any other unobserved model call tomorrow) and that nothing refused gets the
+        disposition an observed final would have had without presentation: a no-web or
+        mixed run is delivered as ``ungrounded`` (no sources claimed, bound to the exact
+        completed output); a web-only run, which may reach the user only through the
+        passage-backed presenter, is refused.
         """
         marker: str | None = None
         with self.lock:
@@ -790,7 +792,10 @@ class NativeWebEvidence:
                 if row["disposition"] is None:
                     row["closed"] = True
                     self._drop_source_locked(row)
-                    if type(output) is str and not row.get("presentation_active"):
+                    # What an observed final would have been without presentation: a
+                    # web-only run may reach the user only through the presenter.
+                    if (type(output) is str and not row.get("presentation_active")
+                            and (not row["web_seen"] or row["other_tool_seen"])):
                         row["disposition"] = "ungrounded"
                         row["reason"] = "unobserved"
                         marker = "ungrounded"
