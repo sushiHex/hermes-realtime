@@ -61,8 +61,8 @@ Record once, so the session binds to one candidate:
   `host.private.log` in the output directory, and deletes them when it writes the stop
   receipt. Extract marker lines before you stop, with the command in the diagnostic
   guide's [Markers](desktop-mvp-diagnostic.md#markers) section, which also explains
-  each marker. The files are private; publish marker lines only. Writes are buffered,
-  so a marker can appear late. A marker missing from the file is unknown, not absent.
+  each marker. The files are private; publish marker lines only. Each chunk the owner
+  reads from a child is written to the file before it reads the next. A marker missing from the file is unknown, not absent.
   Markers printed during shutdown cannot be collected, because the files are gone when
   `stop` returns. The owner's own `owner.private.log` and `owner.stderr.private.log`
   remain; they are private too.

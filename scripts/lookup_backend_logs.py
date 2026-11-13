@@ -87,7 +87,10 @@ class CappedCapture:
         kept = chunk[: max(0, self.limit - self.stored)]
         self.overflow |= len(kept) != len(chunk)
         try:
+            # The operator reads this file while the child runs, and the owner deletes
+            # it at stop, so every kept byte must reach the OS before feed returns.
             self.stream.write(kept)
+            self.stream.flush()
             self.stored += len(kept)
         except OSError:
             self.read_failed = True
