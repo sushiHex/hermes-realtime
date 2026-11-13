@@ -170,6 +170,7 @@ def test_rehearsal_records_actual_reference_kinds_without_prompt_text() -> None:
         ConversationInferenceRequest,
         ConversationPromptUpdate,
     )
+    from hermes_realtime.conversation.turn import foreground_turn
     from hermes_realtime.memory import BuiltinMemorySnapshot
     from hermes_realtime.providers.ollama import OllamaStreamingInference
 
@@ -180,7 +181,9 @@ def test_rehearsal_records_actual_reference_kinds_without_prompt_text() -> None:
         updates=(ConversationPromptUpdate(sequence=1, task_id="task_2", status="completed",
                                           text="Synthetic result."),),
     )
-    messages = OllamaStreamingInference._messages(request, output_style="learning")
+    messages = OllamaStreamingInference._messages(
+        foreground_turn(request), output_style="learning",
+    )
     observed = rehearsal.prompt_observation(messages, "hoopoe")
     assert observed["reference_kinds"] == ["memory", "updates"]
     assert observed["output_style"] == "learning"
@@ -320,12 +323,13 @@ def test_prompt_observer_preserves_renderer_options(
     """Mutation: drop or override capability/style while observing the renderer."""
     from hermes_realtime.conversation.context import ConversationMessage
     from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+    from hermes_realtime.conversation.turn import foreground_turn
     from hermes_realtime.providers.ollama import OllamaStreamingInference
 
-    snapshot = ConversationInferenceRequest(
+    snapshot = foreground_turn(ConversationInferenceRequest(
         revision=1, active_tasks=(),
         messages=(ConversationMessage("user", "My favorite bird is the hoopoe."),),
-    )
+    ))
     options = {"output_style": "learning", "task_status_available": available}
     expected = OllamaStreamingInference._messages(snapshot, **options)
     monkeypatch.setattr(OllamaStreamingInference, "_messages", OllamaStreamingInference._messages)
@@ -346,6 +350,7 @@ def test_prompt_observer_preserves_renderer_argument_refusal(
 ) -> None:
     """Mutation: coerce a non-boolean capability instead of forwarding it unchanged."""
     from hermes_realtime.conversation.context import ConversationContextSnapshot
+    from hermes_realtime.conversation.turn import foreground_turn
     from hermes_realtime.providers.ollama import OllamaStreamingInference
 
     monkeypatch.setattr(OllamaStreamingInference, "_messages", OllamaStreamingInference._messages)
@@ -355,7 +360,9 @@ def test_prompt_observer_preserves_renderer_argument_refusal(
 
     with pytest.raises(TypeError, match="exact boolean"):
         OllamaStreamingInference._messages(
-            ConversationContextSnapshot(revision=1, messages=(), active_tasks=()),
+            foreground_turn(
+                ConversationContextSnapshot(revision=1, messages=(), active_tasks=()),
+            ),
             task_status_available=1,
         )
     assert capsys.readouterr().out == (

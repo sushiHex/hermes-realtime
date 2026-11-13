@@ -17,16 +17,13 @@ import aiohttp
 
 from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
-from hermes_realtime.conversation.streaming import (
-    ConversationInferenceRequest,
-    ModelOutputRefused,
-)
+from hermes_realtime.conversation.streaming import ModelOutputRefused
 from hermes_realtime.conversation.task_proposals import (
     MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
     HostTaskProposalRequest,
 )
 from hermes_realtime.conversation.task_status import HostSpeechRequest
-from hermes_realtime.conversation.turn import foreground_turn, turn_routes
+from hermes_realtime.conversation.turn import ForegroundTurn, foreground_turn, turn_routes
 from hermes_realtime.conversation.work_tools import (
     WORK_OBJECTIVE_CONTEXT_POLICY,
     WORK_ROUTING_POLICY,
@@ -386,16 +383,7 @@ class OllamaStreamingInference:
     ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]:
         style = require_output_style(self._output_style())
         turn = foreground_turn(snapshot)
-        accepted_objective = turn.accepted_objective
-        accepted_ack = accepted_objective is not None
-        if accepted_ack:
-            snapshot = ConversationContextSnapshot(
-                revision=snapshot.revision, messages=snapshot.messages,
-                active_tasks=snapshot.active_tasks,
-                terminal_task_count=snapshot.terminal_task_count, memory=snapshot.memory,
-                recent_task_results=snapshot.recent_task_results,
-            )
-        snapshot = self._trusted_snapshot(snapshot)
+        accepted_ack = turn.accepted_objective is not None
         self._validate_turn_id(turn_id)
         if turn_id != "turn_preflight":
             self._user_turn_admitted = True
@@ -418,8 +406,7 @@ class OllamaStreamingInference:
             )
             can_start = routes.start_work
             messages = self._messages(
-                snapshot, output_style=style, task_status_available=routes.task_status,
-                accepted_objective=accepted_objective,
+                turn, output_style=style, task_status_available=routes.task_status,
             )
             body: dict[str, object] = {
                 "model": self._model,
@@ -937,36 +924,12 @@ class OllamaStreamingInference:
             raise ValueError("turn_id must contain 1 to 128 characters")
 
     @staticmethod
-    def _trusted_snapshot(value: object) -> ConversationContextSnapshot:
-        if type(value) is ConversationInferenceRequest:
-            return ConversationInferenceRequest(
-                revision=value.revision,
-                messages=value.messages,
-                active_tasks=value.active_tasks,
-                terminal_task_count=value.terminal_task_count,
-                memory=value.memory,
-                recent_task_results=value.recent_task_results,
-                updates=value.updates,
-            )
-        if type(value) is not ConversationContextSnapshot:
-            raise TypeError(
-                "snapshot must be an exact ConversationContextSnapshot or inference request"
-            )
-        return ConversationContextSnapshot(
-            revision=value.revision,
-            messages=value.messages,
-            active_tasks=value.active_tasks,
-            terminal_task_count=value.terminal_task_count,
-            memory=value.memory,
-            recent_task_results=value.recent_task_results,
-        )
-
-    @staticmethod
     def _messages(
-        snapshot: ConversationContextSnapshot, *, output_style: str = "default",
+        turn: ForegroundTurn, *, output_style: str = "default",
         task_status_available: bool = False,
-        accepted_objective: str | None = None,
     ) -> list[dict[str, str]]:
+        snapshot = turn.context
+        accepted_objective = turn.accepted_objective
         sections: dict[str, object] = {}
         if accepted_objective is not None:
             sections["accepted_background_objective"] = accepted_objective
@@ -981,11 +944,11 @@ class OllamaStreamingInference:
                 "memory": snapshot.memory.memory, "user": snapshot.memory.user,
                 "truncated": snapshot.memory.truncated,
             }
-        if type(snapshot) is ConversationInferenceRequest and snapshot.updates:
+        if turn.updates:
             sections["updates"] = [
                 {"sequence": item.sequence, "task_id": item.task_id,
                  "status": item.status, "text": item.text}
-                for item in snapshot.updates
+                for item in turn.updates
             ]
         host_indices = snapshot.host_speech_message_indices
         if host_indices:

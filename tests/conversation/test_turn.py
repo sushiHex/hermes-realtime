@@ -7,10 +7,12 @@ from hermes_realtime.conversation.context import (
     ActiveTaskSummary,
     ConversationContextSnapshot,
     ConversationMessage,
+    RecentTaskResult,
 )
 from hermes_realtime.conversation.streaming import (
     AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
+    ConversationPromptUpdate,
 )
 from hermes_realtime.conversation.turn import (
     ForegroundTurn,
@@ -18,6 +20,7 @@ from hermes_realtime.conversation.turn import (
     foreground_turn,
     turn_routes,
 )
+from hermes_realtime.memory import BuiltinMemorySnapshot
 
 _USER = ConversationMessage("user", "Inspect the release.")
 _REPLY = ConversationMessage("assistant", "On it.")
@@ -25,61 +28,72 @@ _TASKS = (
     ActiveTaskSummary("task_other", "Another objective."),
     ActiveTaskSummary("task_public", "Inspect the release."),
 )
+_UPDATE = ConversationPromptUpdate(
+    sequence=1, task_id="task_done", status="completed", text="Synthetic finding.",
+)
+_REFERENCE: dict[str, Any] = {
+    "revision": 7,
+    "messages": (_USER,),
+    "active_tasks": _TASKS,
+    "terminal_task_count": 2,
+    "memory": BuiltinMemorySnapshot(memory="Synthetic memory.", user="Synthetic user."),
+    "recent_task_results": (
+        RecentTaskResult("task_done", "Earlier objective.", "completed", "Earlier result."),
+    ),
+}
 
 
-def _acknowledgment(**changes: Any) -> AcceptedStartInferenceRequest:
-    fields: dict[str, Any] = {
-        "revision": 1, "messages": (_USER,), "active_tasks": _TASKS, "task_id": "task_public",
-    }
-    return AcceptedStartInferenceRequest(**{**fields, **changes})
+def _context(*messages: ConversationMessage) -> ConversationContextSnapshot:
+    return ConversationContextSnapshot(revision=1, messages=messages, active_tasks=())
 
 
-def test_purpose_comes_from_the_exact_request_type() -> None:
-    admitted = ConversationInferenceRequest(revision=1, messages=(_USER,), active_tasks=())
-    plain = ConversationContextSnapshot(revision=1, messages=(_USER,), active_tasks=())
-
-    assert foreground_turn(admitted) == ForegroundTurn(
-        accepted_objective=None, admitted=True, awaiting_reply=True,
+def _turn(
+    *messages: ConversationMessage, objective: str | None = None, admitted: bool = False,
+) -> ForegroundTurn:
+    return ForegroundTurn(
+        context=_context(*messages), updates=(), accepted_objective=objective, admitted=admitted,
     )
-    assert foreground_turn(plain) == ForegroundTurn(
-        accepted_objective=None, admitted=False, awaiting_reply=True,
-    )
-    assert foreground_turn(_acknowledgment()) == ForegroundTurn(
-        accepted_objective="Inspect the release.", admitted=False, awaiting_reply=True,
-    )
 
 
-def test_a_subclass_earns_neither_admission_nor_acknowledgment() -> None:
-    class ForgedRequest(ConversationInferenceRequest):
+def test_each_exact_request_type_becomes_the_one_turn_with_its_purpose() -> None:
+    context = ConversationContextSnapshot(**_REFERENCE)
+
+    admitted = foreground_turn(ConversationInferenceRequest(**_REFERENCE, updates=(_UPDATE,)))
+    plain = foreground_turn(context)
+    acknowledgment = foreground_turn(
+        AcceptedStartInferenceRequest(**_REFERENCE, task_id="task_public"),
+    )
+
+    assert admitted == ForegroundTurn(
+        context=context, updates=(_UPDATE,), accepted_objective=None, admitted=True,
+    )
+    assert plain == ForegroundTurn(
+        context=context, updates=(), accepted_objective=None, admitted=False,
+    )
+    assert acknowledgment == ForegroundTurn(
+        context=context, updates=(), accepted_objective="Inspect the release.", admitted=False,
+    )
+    for turn in (admitted, plain, acknowledgment):
+        assert type(turn.context) is ConversationContextSnapshot
+        assert turn.context is not context
+
+
+@pytest.mark.parametrize("base", [
+    ConversationContextSnapshot, ConversationInferenceRequest, AcceptedStartInferenceRequest,
+])
+def test_a_request_subclass_is_refused(base: type[ConversationContextSnapshot]) -> None:
+    class Forged(base):  # type: ignore[valid-type, misc]
         pass
 
-    class ForgedAcknowledgment(AcceptedStartInferenceRequest):
-        pass
-
-    least = ForegroundTurn(accepted_objective=None, admitted=False, awaiting_reply=True)
-
-    assert foreground_turn(
-        ForgedRequest(revision=1, messages=(_USER,), active_tasks=()),
-    ) == least
-    assert foreground_turn(ForgedAcknowledgment(
-        revision=1, messages=(_USER,), active_tasks=_TASKS, task_id="task_public",
-    )) == least
+    fields = {"revision": 1, "messages": (_USER,), "active_tasks": _TASKS}
+    if base is AcceptedStartInferenceRequest:
+        fields["task_id"] = "task_public"
+    with pytest.raises(TypeError, match="exact ConversationContextSnapshot or inference request"):
+        foreground_turn(Forged(**fields))
 
 
-def test_awaiting_reply_is_true_only_when_the_last_heard_row_is_the_user() -> None:
-    def awaiting(*messages: ConversationMessage) -> bool:
-        return foreground_turn(ConversationInferenceRequest(
-            revision=1, messages=messages, active_tasks=(),
-        )).awaiting_reply
-
-    assert awaiting(_USER) is True
-    assert awaiting(_REPLY, _USER) is True
-    assert awaiting() is False
-    assert awaiting(_USER, _REPLY) is False
-
-
-def test_request_that_is_not_a_snapshot_or_was_altered_is_refused() -> None:
-    with pytest.raises(TypeError, match="snapshot"):
+def test_a_request_that_is_not_a_snapshot_or_was_altered_is_refused() -> None:
+    with pytest.raises(TypeError, match="exact ConversationContextSnapshot or inference request"):
         foreground_turn(cast(ConversationContextSnapshot, {"messages": (_USER,)}))
 
     altered_rows = ConversationInferenceRequest(revision=1, messages=(_USER,), active_tasks=())
@@ -87,35 +101,69 @@ def test_request_that_is_not_a_snapshot_or_was_altered_is_refused() -> None:
     with pytest.raises(TypeError, match="messages"):
         foreground_turn(altered_rows)
 
-    forged_row = ConversationInferenceRequest(revision=1, messages=(_USER,), active_tasks=())
-    object.__setattr__(forged_row, "messages", ({"role": "user"},))
-    with pytest.raises(TypeError, match="messages"):
-        foreground_turn(forged_row)
+    altered_updates = ConversationInferenceRequest(revision=1, messages=(_USER,), active_tasks=())
+    object.__setattr__(altered_updates, "updates", ({"sequence": 1},))
+    with pytest.raises(TypeError, match="ConversationPromptUpdate"):
+        foreground_turn(altered_updates)
 
-    retargeted = _acknowledgment()
+    retargeted = AcceptedStartInferenceRequest(**_REFERENCE, task_id="task_public")
     object.__setattr__(retargeted, "task_id", "task_absent")
     with pytest.raises(ValueError, match="one active task"):
         foreground_turn(retargeted)
 
 
-def test_turn_facts_are_exact_and_consistent() -> None:
+def test_the_turn_rebuilds_and_bounds_what_it_holds() -> None:
+    context = _context(_USER)
+    turn = ForegroundTurn(
+        context=context, updates=(_UPDATE,), accepted_objective=None, admitted=True,
+    )
+    assert turn.context == context and turn.context is not context
+    assert turn.updates == (_UPDATE,) and turn.updates[0] is not _UPDATE
+
+    with pytest.raises(TypeError, match="exact ConversationContextSnapshot"):
+        ForegroundTurn(
+            context=ConversationInferenceRequest(revision=1, messages=(_USER,), active_tasks=()),
+            updates=(), accepted_objective=None, admitted=True,
+        )
+    with pytest.raises(TypeError, match="exact tuple"):
+        ForegroundTurn(
+            context=context, updates=cast(tuple[ConversationPromptUpdate, ...], [_UPDATE]),
+            accepted_objective=None, admitted=True,
+        )
+    with pytest.raises(ValueError, match="capacity"):
+        ForegroundTurn(
+            context=context, updates=(_UPDATE,) * 4096, accepted_objective=None, admitted=True,
+        )
+    with pytest.raises(ValueError, match="admitted user turn"):
+        ForegroundTurn(
+            context=context, updates=(_UPDATE,), accepted_objective=None, admitted=False,
+        )
     with pytest.raises(TypeError):
-        ForegroundTurn(accepted_objective=None, admitted=cast(bool, 1), awaiting_reply=True)
+        ForegroundTurn(
+            context=context, updates=(), accepted_objective=None, admitted=cast(bool, 1),
+        )
     with pytest.raises(TypeError):
-        ForegroundTurn(accepted_objective=None, admitted=True, awaiting_reply=cast(bool, "yes"))
-    with pytest.raises(TypeError):
-        ForegroundTurn(accepted_objective=cast(str, b"x"), admitted=False, awaiting_reply=True)
+        ForegroundTurn(
+            context=context, updates=(), accepted_objective=cast(str, b"x"), admitted=False,
+        )
     with pytest.raises(ValueError):
-        ForegroundTurn(accepted_objective="   ", admitted=False, awaiting_reply=True)
+        ForegroundTurn(context=context, updates=(), accepted_objective="   ", admitted=False)
     with pytest.raises(ValueError, match="acknowledgment"):
-        ForegroundTurn(accepted_objective="Inspect.", admitted=True, awaiting_reply=True)
+        ForegroundTurn(context=context, updates=(), accepted_objective="Inspect.", admitted=True)
     with pytest.raises(TypeError):
         TurnRoutes(start_work=cast(bool, 1), task_status=False)
     with pytest.raises(TypeError):
         TurnRoutes(start_work=False, task_status=cast(bool, None))
 
 
-_OPEN = ForegroundTurn(accepted_objective=None, admitted=True, awaiting_reply=True)
+def test_awaiting_reply_is_true_only_when_the_last_heard_row_is_the_user() -> None:
+    assert _turn(_USER).awaiting_reply is True
+    assert _turn(_REPLY, _USER).awaiting_reply is True
+    assert _turn().awaiting_reply is False
+    assert _turn(_USER, _REPLY).awaiting_reply is False
+
+
+_OPEN = _turn(_USER, admitted=True)
 _FACTS = {
     "work_bound": True, "private_material": False, "lookup_attempted": False,
     "start_requires_admission": False,
@@ -134,11 +182,11 @@ def test_an_admitted_user_turn_with_bound_work_is_offered_both_routes() -> None:
             id="no work handler",
         ),
         pytest.param(
-            ForegroundTurn(accepted_objective=None, admitted=True, awaiting_reply=False), {},
+            _turn(_USER, _REPLY, admitted=True), {},
             TurnRoutes(start_work=False, task_status=False), id="last row is not the user",
         ),
         pytest.param(
-            ForegroundTurn(accepted_objective="Inspect.", admitted=False, awaiting_reply=True), {},
+            _turn(_USER, objective="Inspect."), {},
             TurnRoutes(start_work=False, task_status=False), id="acknowledgment",
         ),
         pytest.param(
@@ -150,13 +198,11 @@ def test_an_admitted_user_turn_with_bound_work_is_offered_both_routes() -> None:
             id="a lookup withdraws only the start",
         ),
         pytest.param(
-            ForegroundTurn(accepted_objective=None, admitted=False, awaiting_reply=True), {},
-            TurnRoutes(start_work=True, task_status=False),
+            _turn(_USER), {}, TurnRoutes(start_work=True, task_status=False),
             id="unadmitted request keeps the start where admission is not required",
         ),
         pytest.param(
-            ForegroundTurn(accepted_objective=None, admitted=False, awaiting_reply=True),
-            {"start_requires_admission": True},
+            _turn(_USER), {"start_requires_admission": True},
             TurnRoutes(start_work=False, task_status=False),
             id="unadmitted request loses the start where admission is required",
         ),
@@ -175,10 +221,9 @@ def test_no_route_is_offered_without_bound_work_or_a_user_row_to_answer() -> Non
     ):
         if objective is not None and admitted:
             continue
+        rows = (_USER,) if awaiting else (_USER, _REPLY)
         routes = turn_routes(
-            ForegroundTurn(
-                accepted_objective=objective, admitted=admitted, awaiting_reply=awaiting,
-            ),
+            _turn(*rows, objective=objective, admitted=admitted),
             work_bound=bound, private_material=private, lookup_attempted=attempted,
             start_requires_admission=required,
         )

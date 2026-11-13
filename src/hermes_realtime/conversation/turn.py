@@ -1,4 +1,4 @@
-"""What one foreground turn is and which routes it may offer.
+"""The one foreground turn a model adapter renders, and the routes it may offer.
 
 Decided here, once, from the request and the host facts; a model adapter renders the
 answer and never re-derives it from the request's type or its last row.
@@ -6,13 +6,12 @@ answer and never re-derives it from the request's type or its last row.
 
 from dataclasses import dataclass
 
-from .context import (
-    _MAX_ITEM_CHARS_LIMIT,
-    ConversationContextSnapshot,
-    ConversationMessage,
-    ConversationRole,
+from .context import _MAX_ITEM_CHARS_LIMIT, ConversationContextSnapshot, ConversationRole
+from .streaming import (
+    AcceptedStartInferenceRequest,
+    ConversationInferenceRequest,
+    ConversationPromptUpdate,
 )
-from .streaming import AcceptedStartInferenceRequest, ConversationInferenceRequest
 
 
 def _require_bool(name: str, value: object) -> None:
@@ -22,20 +21,36 @@ def _require_bool(name: str, value: object) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ForegroundTurn:
-    """What the request handed to a model adapter says about its turn.
+    """One request for foreground inference, in the only form an adapter renders.
 
-    ``accepted_objective`` is set only on the acknowledgment of an accepted start.
-    ``admitted`` is true only for a user turn the streaming loop admitted.
-    ``awaiting_reply`` is true only when the last heard row is the user's.
+    ``context`` and ``updates`` are rebuilt here, so what an adapter reads was validated
+    by this type and not by the caller. ``accepted_objective`` is set only on the
+    acknowledgment of an accepted start. ``admitted`` is true only for a user turn the
+    streaming loop admitted, and only such a turn carries updates.
     """
 
+    context: ConversationContextSnapshot
+    updates: tuple[ConversationPromptUpdate, ...]
     accepted_objective: str | None
     admitted: bool
-    awaiting_reply: bool
 
     def __post_init__(self) -> None:
+        if type(self.context) is not ConversationContextSnapshot:
+            raise TypeError("context must be an exact ConversationContextSnapshot")
         _require_bool("admitted", self.admitted)
-        _require_bool("awaiting_reply", self.awaiting_reply)
+        request = ConversationInferenceRequest(
+            revision=self.context.revision,
+            messages=self.context.messages,
+            active_tasks=self.context.active_tasks,
+            terminal_task_count=self.context.terminal_task_count,
+            memory=self.context.memory,
+            recent_task_results=self.context.recent_task_results,
+            updates=self.updates,
+        )
+        if request.updates and not self.admitted:
+            raise ValueError("only an admitted user turn carries updates")
+        object.__setattr__(self, "context", request.context)
+        object.__setattr__(self, "updates", request.updates)
         if self.accepted_objective is None:
             return
         if type(self.accepted_objective) is not str:
@@ -48,15 +63,22 @@ class ForegroundTurn:
         if self.admitted:
             raise ValueError("an acknowledgment is not an admitted user turn")
 
+    @property
+    def awaiting_reply(self) -> bool:
+        """Whether the last heard row is the user's."""
+        messages = self.context.messages
+        return bool(messages) and messages[-1].role == ConversationRole.USER.value
+
 
 def foreground_turn(snapshot: ConversationContextSnapshot) -> ForegroundTurn:
-    """Classify one request by its exact type and its own rows."""
+    """Turn one of the three exact request types into the turn an adapter renders.
 
-    # A subclass is deliberately not refused here: it is classified as a plain snapshot,
-    # which earns neither admission nor an acknowledgment.
-    if not isinstance(snapshot, ConversationContextSnapshot):
-        raise TypeError("snapshot must be a ConversationContextSnapshot")
+    The purpose comes from the exact type; anything else, a subclass included, is refused.
+    """
+
+    admitted = False
     accepted_objective: str | None = None
+    updates: tuple[ConversationPromptUpdate, ...] = ()
     if type(snapshot) is AcceptedStartInferenceRequest:
         # Rebuilt so a request altered after construction cannot name another objective.
         accepted = AcceptedStartInferenceRequest(
@@ -68,15 +90,25 @@ def foreground_turn(snapshot: ConversationContextSnapshot) -> ForegroundTurn:
         accepted_objective = next(
             task.objective for task in accepted.active_tasks if task.task_id == accepted.task_id
         )
-    messages = snapshot.messages
-    if type(messages) is not tuple or (
-        messages and type(messages[-1]) is not ConversationMessage
-    ):
-        raise TypeError("snapshot messages must be an exact tuple of ConversationMessage values")
+    elif type(snapshot) is ConversationInferenceRequest:
+        admitted = True
+        updates = snapshot.updates
+    elif type(snapshot) is not ConversationContextSnapshot:
+        raise TypeError(
+            "snapshot must be an exact ConversationContextSnapshot or inference request"
+        )
     return ForegroundTurn(
+        context=ConversationContextSnapshot(
+            revision=snapshot.revision,
+            messages=snapshot.messages,
+            active_tasks=snapshot.active_tasks,
+            terminal_task_count=snapshot.terminal_task_count,
+            memory=snapshot.memory,
+            recent_task_results=snapshot.recent_task_results,
+        ),
+        updates=updates,
         accepted_objective=accepted_objective,
-        admitted=type(snapshot) is ConversationInferenceRequest,
-        awaiting_reply=bool(messages) and messages[-1].role == ConversationRole.USER.value,
+        admitted=admitted,
     )
 
 

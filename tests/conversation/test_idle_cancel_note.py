@@ -23,6 +23,7 @@ from hermes_realtime.conversation import (
     ForegroundTurnCoordinator,
     StreamingSpeechLoop,
 )
+from hermes_realtime.conversation.turn import foreground_turn
 from hermes_realtime.conversation.work_tools import ConversationWorkControlSurface
 from hermes_realtime.conversation.worker import ConversationSessionWorker
 from hermes_realtime.host_launcher import ProactiveCompletionUpdatePolicy
@@ -125,7 +126,7 @@ async def test_idle_typed_cancel_keeps_cancelled_task_note_in_next_prompt() -> N
         await worker.wait_for_responses()
 
         assert len(inference.requests) == 1
-        prompt = OllamaStreamingInference._messages(inference.requests[0])
+        prompt = OllamaStreamingInference._messages(foreground_turn(inference.requests[0]))
         # Idle floor: the policy spoke the terminal at once rather than deferring it to
         # this turn, so the note reaches the prompt as a reference and a heard row,
         # never as a pending update.
