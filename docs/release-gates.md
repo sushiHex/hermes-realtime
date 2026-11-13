@@ -596,6 +596,30 @@ Commit review changes before treating its result as release evidence; staging is
 not sufficient. It intentionally leaves
 no release artifacts in the checkout.
 
+The next line, `canonical candidate diff SHA-256: <digest>`, binds the candidate
+to a baseline commit. A root or single-parent candidate has only one possible
+baseline, so none is named. A merge candidate, such as a branch refreshed by
+merging `main`, has several, and the gate never chooses a merge parent. Name the
+baseline by its full commit OID:
+
+```sh
+uv run --frozen --group dev python scripts/release_gate.py --candidate . --baseline <full-commit-oid>
+```
+
+`--baseline` takes exactly 40 lowercase hexadecimal characters. A ref, a
+revision expression, an abbreviation, an annotated tag object, a missing
+object, the candidate itself, and a commit outside the candidate's history are
+all refused before any scan, archive, or test runs. A merge candidate without
+`--baseline` is refused the same way. Each refusal prints one
+`[release-gate-baseline]` JSON line carrying a fixed category and whether a
+baseline was supplied; it contains no OID and no path. Naming the baseline of a
+single-parent candidate is allowed; naming its only parent yields the same
+digest as omitting it.
+
+The required PR checks do not take this option. They run
+`scripts/candidate_e2e_fast_track.py`, which does not print this digest and
+records its internal candidate identity against `HEAD^`.
+
 For a fast adversarial regression check of the release script itself, run:
 
 ```sh
@@ -604,7 +628,10 @@ uv run --frozen --group dev python scripts/release_gate.py --self-test
 
 The self-test proves that a tracked secret excluded by `export-ignore` is absent
 from `git archive` yet still rejected from its committed blob, and that stale
-packaged static files fail the pre-build snapshot comparison.
+packaged static files fail the pre-build snapshot comparison. It also proves
+that a merge candidate is refused without a baseline, that an abbreviated,
+non-commit, self-referential, or unrelated baseline is refused, and that each
+named merge parent yields the digest of the equivalent single-parent commit.
 
 To reproduce the native integration portion locally, first install the shared pinned server
 with `uv run python -m scripts.local_livekit install` as described in
