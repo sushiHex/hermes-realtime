@@ -33,6 +33,29 @@ The operator profile binds the device, worker/interpreter and model/voice assets
 execution policy, reservation estimate and free headroom. These values are not
 model-controlled tool arguments. Keep the configuration and profile private.
 Never include provider credentials in either file.
+
+The operator profile is a version `1` JSON file that the scoped vram-mcp server reads.
+The host checks only its shape: exactly the fields `version`, `python`,
+`python_sha256`, `venv_python`, `venv_python_sha256`, `worker`, `worker_sha256`,
+`model`, `model_sha256`, `voices`, `voices_sha256`, `gpu_index`, `gpu_uuid`,
+`reserve_gb`, `headroom_mb`, `voice` and `language`, plus an optional
+`execution_policy`, which is `cuda-primary-profiled` (the default) or
+`cuda-primary-profiled-kokoro-v1-benchmark`. `venv_python`, `worker`, `model` and
+`voices` are absolute paths, and `gpu_index` is a non-negative integer.
+`venv_python` is the worker environment's interpreter, created by
+[`scripts/setup-kokoro-cuda-worker.sh`](../scripts/setup-kokoro-cuda-worker.sh) from
+the [pinned worker dependencies](../requirements/README.md). The meaning and checking
+of the remaining values belong to vram-mcp; this repository documents no procedure for
+choosing a reservation or headroom.
+
+The host refuses a profile whose `model`, `voices`, their digests, `voice` or
+`language` differ from what it is about to load. The host's Kokoro language is
+`en-gb`. In a managed preview, the host loads the staged copies, so `model` and
+`voices` must name the files under the plan's output,
+`<output>\input\home\.cache\hermes-realtime\kokoro\<model-sha256>\`, and `voice` must
+equal the plan's `speech.tts_voice`. Each `prepare` uses a new output directory, so
+each prepared run needs a new operator profile, a configuration carrying that
+profile's digest, and that configuration's digest in the plan.
 Before the first GPU load, verify that a temporary control claim made through the
 existing coordinator is visible through the configured scoped server. A separate
 home directory must not silently create a separate reservation domain.

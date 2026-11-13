@@ -14,7 +14,9 @@ these are operator settings, not a change to portable defaults. The relevant
 references are [live access credentials](live-credentials.md),
 [managed Kokoro and its CPU option](kokoro-mcp.md), and
 [typed runtime checks](native-typed-journey.md). Their scoped API/typed evidence
-does not qualify the whole profile's physical voice experience. Use the
+does not qualify the whole profile's physical voice experience. The
+[native preview acceptance procedure](native-preview-acceptance.md) holds the current
+profile's session steps. Use the
 [acceptance guide](desktop-mvp-acceptance.md) for provenance and observation limits,
 not to substitute frozen Phi/Qwen settings into the current native route.
 
