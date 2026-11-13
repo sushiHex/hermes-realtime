@@ -41,6 +41,43 @@ check explicitly selects the materialized candidate. Gate commands ignore ambien
 uv project, working-directory, environment-location, and configuration overrides;
 CI cache and interpreter-installation locations remain available.
 
+### Local declared-tool check
+
+Hosted runners provide no Codex or Ollama. A local gate keeps the developer
+`PATH`, so a test that reaches one can pass locally and fail hosted. To reproduce
+hosted executable discovery locally, run (Windows only):
+
+```bash
+python scripts/release_gate.py --candidate . --declared-tool-path
+```
+
+Each stage's `PATH` is rebuilt from the directories of its exact declared tools,
+plus the Windows system directories. Both stages also ignore the developer's
+global Git config (`GIT_CONFIG_GLOBAL` set to the null device), because hosted
+runners have none. System Git config is kept. Launch the check from PowerShell
+or cmd. From Git Bash, `git` resolves to Git for Windows' shell-internal
+`mingw64\bin` binary instead of the `cmd\git.exe` launcher that hosted runners
+use, and the gate refuses it.
+
+| Stage | Declared tools |
+| --- | --- |
+| uv commands, tests, builds | `uv`, `git`, and the Python 3.11 that uv selects |
+| Browser `npm` commands | `node`, `npm`, `npx` |
+
+A directory is not a tool. After building each environment, the gate resolves
+every guarded name (`uv`, `git`, `python`, `node`, `npm`, `npx`, `codex`,
+`ollama`). A declared tool must resolve to its exact original executable, uv
+must still select the same interpreter, and an undeclared guarded tool must not
+resolve. A shared directory that exposes one fails the gate; it is not dropped.
+Each refusal writes one `[declared-tool-path]` JSON line to stderr, giving the
+stage, a fixed refusal category and the guarded tool name. It contains no paths,
+no `PATH` contents and no versions.
+
+CI does not use this mode. Hosted `PATH` is already the reference, and setup-python
+supplies uv's interpreter there. Explicit injection in tests remains the primary
+guarantee; this check is secondary. It guards only the listed names, does not
+block network endpoints, and leaves the native LiveKit loopback stage unchanged.
+
 The `release-candidate` job runs, from that fresh candidate:
 
 1. a forced import from `src/`, then the focused provider request-size, status-authority
