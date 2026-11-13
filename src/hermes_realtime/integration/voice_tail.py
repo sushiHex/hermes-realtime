@@ -30,7 +30,6 @@ import contextlib
 import json
 import logging
 import math
-import re
 import time
 import uuid
 from collections.abc import Callable
@@ -63,6 +62,7 @@ from hermes_realtime.integration.voice_deletes import (
     parse_voice_deletes,
     voice_deletes_bytes,
 )
+from hermes_realtime.protocol.identifiers import VOICE_CONVERSATION_ID as _CONVERSATION_ID
 
 # Version 4 also held a delete intent; that intent now lives in the delete record, so a
 # version-4 tail is read only to move its intent there, and every write is version 3.
@@ -110,7 +110,6 @@ _REVIEW_ROW_COST_CAP = REVIEW_SNAPSHOT_BYTES + 1
 _MAX_RECENT_ROWS = MAX_REVIEW_ROWS
 _REVIEW_PENDING_FIELDS = frozenset({"seq_from", "seq_through", "users", "closing"})
 _OUTBOX_FIELDS = frozenset({"gap_before", "interrupted", "role", "seq", "text", "ts"})
-_CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 MAX_IDENTITY = 2**53 - 1
 DEFAULT_MAX_OUTBOX_ROWS = 128
 DEFAULT_MAX_BATCH_ROWS = 32

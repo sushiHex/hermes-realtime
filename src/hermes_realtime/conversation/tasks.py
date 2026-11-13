@@ -27,19 +27,18 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedPayload,
     WorkTerminalStatus,
 )
+from hermes_realtime.protocol.identifiers import DELEGATION_RUN_ID as _RUN_ID_PATTERN
+from hermes_realtime.protocol.identifiers import IDENTIFIER as _IDENTIFIER_PATTERN
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN
+from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID_PATTERN
 from hermes_realtime.result_limits import MAX_COMPLETED_RESULT_CHARS, has_valid_result_unicode
 
 from .context import ConversationContextStore, PrivateRunDisclosureError, TaskAdmission
 from .result_projection import completed_result_reference
 from .task_status import TaskStatusSnapshot
 
-_TASK_ID_PATTERN = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_RUN_ID_PATTERN = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_PRIVATE_RUN_TOKEN_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*"
-)
-_MAX_TASK_ID_CHARS = 128
+# Narrower than the shared rule: a token preceded by a letter or digit is not refused here.
+_PRIVATE_RUN_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9])" + PRIVATE_RUN_TOKEN.pattern)
 _MAX_OUTCOME_TEXT_CHARS = 1024
 _MAX_COMPLETED_SUMMARY_CHARS = MAX_COMPLETED_RESULT_CHARS
 _MAX_PROTOCOL_SEQUENCE = (1 << 63) - 1
@@ -49,7 +48,7 @@ _TERMINAL_STATUSES = frozenset(("completed", "failed", "interrupted"))
 def _validate_task_id(task_id: str) -> None:
     if type(task_id) is not str:
         raise TypeError("task_id must be an exact built-in string")
-    if len(task_id) > _MAX_TASK_ID_CHARS or _TASK_ID_PATTERN.fullmatch(task_id) is None:
+    if _TASK_ID_PATTERN.fullmatch(task_id) is None:
         raise ValueError("task_id must use the bounded task_ namespace")
     if _PRIVATE_RUN_TOKEN_PATTERN.search(task_id) is not None:
         raise PrivateRunDisclosureError("model-visible text contains a private run token")
@@ -58,14 +57,14 @@ def _validate_task_id(task_id: str) -> None:
 def _validate_run_id(run_id: str) -> None:
     if type(run_id) is not str:
         raise TypeError("run_id must be an exact built-in string")
-    if len(run_id) > _MAX_TASK_ID_CHARS or _RUN_ID_PATTERN.fullmatch(run_id) is None:
+    if _RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ValueError("run_id must use the bounded deleg_ namespace")
 
 
 def _validate_protocol_identifier(value: str, field_name: str) -> None:
     if type(value) is not str:
         raise TypeError(f"{field_name} must be an exact built-in string")
-    if len(value) > _MAX_TASK_ID_CHARS or _IDENTIFIER_PATTERN.fullmatch(value) is None:
+    if _IDENTIFIER_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{field_name} must be a canonical protocol identifier")
 
 

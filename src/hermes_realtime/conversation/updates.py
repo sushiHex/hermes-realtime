@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
 from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
+
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN as _PRIVATE_RUN_TOKEN_PATTERN
 
 from .context import (
     ConversationContextSnapshot,
@@ -19,7 +20,6 @@ from .tasks import ConversationTaskController, TaskTerminalOutcome
 
 _MAX_UPDATE_TEXT_CHARS = 4096
 _MAX_DECISION_SEQUENCE = (1 << 63) - 1
-_PRIVATE_RUN_TOKEN_PATTERN = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 
 
 class UpdateDecisionKind(StrEnum):

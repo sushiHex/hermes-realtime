@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from threading import Lock
 
+from hermes_realtime.protocol.identifiers import BROWSER_IDENTITY as _IDENTITY
+
 SEARCH_EGRESS_CONSENT_VERSION = "realtime-search-egress-consent-v1"
 SEARCH_EGRESS_DISCLOSURE_TEXT = (
     "Public search is optional. It is unavailable unless the host operator enables it, and it "
@@ -26,7 +28,6 @@ SEARCH_EGRESS_DISCLOSURE_TEXT = (
 )
 SEARCH_EGRESS_DISCLOSURE_BYTES = SEARCH_EGRESS_DISCLOSURE_TEXT.encode("utf-8")
 SEARCH_EGRESS_DISCLOSURE_DIGEST = hashlib.sha256(SEARCH_EGRESS_DISCLOSURE_BYTES).hexdigest()
-_IDENTITY = re.compile(r"browser_[0-9a-f]{16,64}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_SAFE_INTEGER = (1 << 53) - 1
 
