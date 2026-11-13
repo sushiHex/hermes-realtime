@@ -32,6 +32,31 @@ def validate_task_start_policy(value: TaskStartPolicy) -> None:
         raise ValueError("task start policy must be exactly 'confirm' or 'automatic'")
 
 
+# Host-authored speech for a selected automatic start that was not accepted (#353).
+# Each sentence must be true for every result that maps to it, so neither denies a start
+# that Hermes may have accepted: a rejection carrying a task identity can follow an
+# accepted dispatch that a pending cancel then found inactive.
+UNACCEPTED_START_UNAVAILABLE = (
+    "Background task control is unavailable, so that task was not started."
+)
+UNACCEPTED_START_NOT_RUNNING = "No new background task is running for that request."
+
+
+def unaccepted_start_speech(result: WorkStartResult | None) -> str | None:
+    """Select one fixed sentence by typed result category; never echo result text."""
+    if result is None:
+        # The one-use consume refused before any dispatch.
+        return UNACCEPTED_START_NOT_RUNNING
+    if type(result) is not WorkStartResult:
+        raise TypeError("work start result must be exact")
+    if result.accepted:
+        return None
+    if result.task_id is None and result.reason == _UNAVAILABLE_REASON:
+        # Only the host's pre-dispatch refusal has no task identity and this reason.
+        return UNACCEPTED_START_UNAVAILABLE
+    return UNACCEPTED_START_NOT_RUNNING
+
+
 @dataclass(frozen=True, slots=True)
 class HostTaskProposalRequest:
     """An effect-free, terminal provider selection; not an admission receipt."""
