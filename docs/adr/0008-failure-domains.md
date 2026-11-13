@@ -1,8 +1,11 @@
 # ADR 0008: A latch ends its holder
 
-Status: Proposed. It awaits the owner decisions listed below. No owning issue exists; each
-migration step gets one before work starts ([ADR 0001](0001-github-work-tracking.md)). It
-elaborates Move 3 and decision 7 of [ADR 0006](0006-architecture-direction.md) ("a host-wide
+Status: Proposed. The owner's instruction of 2026-11-13 on
+[#159](https://github.com/sushiHex/hermes-realtime/issues/159) settles decisions 1 to 4 below
+as recommended, for the two reproduced faults tracked as
+[#531](https://github.com/sushiHex/hermes-realtime/issues/531); decisions 5 to 10 are open.
+Each other migration step gets an issue before work starts
+([ADR 0001](0001-github-work-tracking.md)). It elaborates Move 3 and decision 7 of [ADR 0006](0006-architecture-direction.md) ("a host-wide
 fault exits the host and restart recovers") and changes neither.
 Reviewed source: [`5b66d584`](https://github.com/sushiHex/hermes-realtime/commit/5b66d5842d626531d81d4911348f6a4b8a60b972).
 Every `file:line` is at that commit, relative to `src/hermes_realtime/` unless it starts with
@@ -41,13 +44,20 @@ qualification channel failure, SIGTERM off Windows and SIGBREAK in qualification
    `:775-777`). Every later turn then fails at `reserve_response` (`:349`, from
    `conversation/worker.py:1131`), and every new binding fails at `start` (`:332`, from
    `conversation/worker.py:317`). One unanswered resend (`integration/api.py:882-886`) is enough.
+   Reproduced by execution in [#530](https://github.com/sushiHex/hermes-realtime/pull/530):
+   after the failed dispatch an ordinary turn is refused before any inference and nothing is
+   spoken, and a rebind fails and leaves no binding. It is not silent: the command path
+   shows one `uncertain` task state and prints one `[task-command-settlement]` line. Nothing
+   says the conversation has ended, and nothing exits.
 2. The work-control health is per host (`host_launcher.py:2326`,
    `conversation/work_tools.py:684-686`, `:1014-1016`). The user is told to "Restart the
    session" (`conversation/commands.py:363`), which cannot clear it.
 3. A dead Codex child is never replaced: start-up returns while a transport is held
    (`providers/codex_app_server.py:1899-1901`), and a failed send closes the adapter for the
    process (`:2137-2154`, `:1797`). The preview's foreground model is Codex
-   (`scripts/preview_cutover.py:2097`).
+   (`scripts/preview_cutover.py:2097`). Reproduced in #530: the next turn fails at its first
+   send with one `[codex-send-bound]` line, every later turn is refused, and the transport
+   factory is never called again.
 4. The managed speech worker launches once (`providers/kokoro_mcp.py:409-413`); after a fault
    the client asks for a second launch (`providers/kokoro_worker.py:459-461`, `:492-493`,
    `:509-510`) and is refused on every later synthesis.
@@ -215,25 +225,32 @@ or speak cannot say so, and the page and the restart announcement carry it.
 ## Migration
 
 Each step ships alone. "After" means after desktop MVP acceptance
-([#159](https://github.com/sushiHex/hermes-realtime/issues/159)).
+([#159](https://github.com/sushiHex/hermes-realtime/issues/159)). "Now" marks what the owner's
+instruction of 2026-11-13 moved ahead of acceptance, limited to the two faults of
+[#531](https://github.com/sushiHex/hermes-realtime/issues/531): the dispatch latch with its
+director and executor, and the dead Codex child. The remaining host latches follow after.
 
 | # | Step | Label | RED test | When |
 | --- | --- | --- | --- | --- |
 | 1 | A ratchet test listing every latch with its holder's lifetime, bound by equality | Preserving; test only | A new latch, or a stale entry, fails it | Before |
 | 2 | One evidence line when a host-lifetime latch first trips, and one per tail write-failure episode | Preserving; adds lines only | Trip each with a fake: exactly one line. Mutation: drop the print | Before |
 | 3 | One latch type that requires its terminator; today's latches re-expressed with today's outcomes | Preserving | The existing suite, plus construction without a terminator refused | After |
-| 4 | `escalate`: host-domain latches exit the host with the reserved status | Change | Per latch: exit status, one line, the tail equals the heard rows, the record still holds the pending entry. A hung flush still exits. Mutations: drop the timer; run the orderly close | After |
-| 5 | The owner holds a Job per host incarnation and restarts in place within a budget | Change | Reserved status: the new host takes the lock, restores, announces stopped work. Budget spent, another status, or a held lock: torn down as today, with the category | After |
-| 6 | Readiness at use: Codex liveness, verifier loss and one-use lease expiry end the host | Change | One fake per dependency that dies after preflight | After 4 |
+| 4 | `escalate`: host-domain latches exit the host with the reserved status | Change | Per latch: exit status, one line, the tail equals the heard rows, the record still holds the pending entry. A hung flush still exits. Mutations: drop the timer; run the orderly close | Now for #531; the rest after |
+| 5 | The owner holds a Job per host incarnation and restarts in place within a budget | Change | Reserved status: the new host takes the lock, restores, announces stopped work. Budget spent, another status, or a held lock: torn down as today, with the category | Now, once [#496](https://github.com/sushiHex/hermes-realtime/issues/496) lands |
+| 6 | Readiness at use: Codex liveness, verifier loss and one-use lease expiry end the host | Change | One fake per dependency that dies after preflight | Now for the Codex child; the rest after 4 |
 | 7 | A retention lease on foreground Ollama requests | Change; request bytes differ | The golden request matrix of ADR 0006 Move 2 shows the one new field | After |
-| 8 | Remove "Restart the session" once step 4 makes it unreachable | Change | The sentence has no producer | After 4 |
+| 8 | Correct "Restart the session", which a session restart cannot honour | Change | The sentence no longer promises it | Now, with 4 |
 
-Only steps 1 and 2 are stricter-only evidence. Step 7 loads a model, so its real-path check
+Only steps 1 and 2 are stricter-only evidence. Until the state root of #496 lands, a host
+that exits leaves a `refused` receipt, and `finalize` does not carry a conversation from such
+a run (`scripts/preview_cutover.py:1515-1522`), so step 4 ahead of #496 trades a live host
+that cannot converse for a stopped preview whose conversation is not carried forward. Step 7 loads a model, so its real-path check
 goes through `vram-mcp` as the development guide requires.
 
 ## Owner decisions
 
-Each is yes or no; the recommendation is yes throughout.
+Each is yes or no; the recommendation is yes throughout. Decisions 1 to 4 were decided yes by
+the owner's instruction of 2026-11-13 on #159, for the purpose of fixing #531.
 
 1. Adopt "a latch ends its holder" as the test for failure handling: no latch reset, no error
    reclassified to choose a domain.
@@ -252,8 +269,10 @@ Each is yes or no; the recommendation is yes throughout.
 
 ## Not verified
 
-- The cascade in case 1, and cases 3, 4, 5 and 7, are read from source and were not exercised.
-  No test was found that drives a dispatch exception through to the next turn.
+- Cases 4, 5 and 7 are read from source and were not exercised. Cases 1 and 3 were exercised
+  in #530 with these limits: the dispatch failure was driven through the typed command only,
+  not a natural start or the audio path; what the browser then shows is read from source; and
+  a Codex reader that dies while the child still accepts writes was not driven.
 - The latch inventory came from a delegated read. The rows cited here were re-read; the leaves
   (review sender, memory receiver, evidence capture) and the companion-side latches were not.
 - That case 9 is reachable. The serializer was not read for what it can raise.
