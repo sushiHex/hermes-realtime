@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import re
@@ -16,6 +17,7 @@ from hermes_realtime.protocol.identifiers import METRIC_LABEL as _METRIC_LABEL
 from hermes_realtime.protocol.identifiers import PRIVATE_HANDLE as _PRIVATE_HANDLE
 from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID
 from hermes_realtime.protocol.identifiers import TURN_ID as _TURN_ID
+from hermes_realtime.protocol.limits import utf16_units
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
     MAX_LEGACY_RESULT_CHARS,
@@ -427,13 +429,38 @@ class BrowserEventProjection:
                 if status == "completed"
                 else MAX_LEGACY_RESULT_CHARS
             )
-            if (
-                type(text) is not str
-                or not text.strip()
-                or len(text) > text_limit
-                or (status == "completed" and not has_valid_result_unicode(text))
-            ):
-                raise ValueError("task result text is invalid")
+            # A completed result is bounded in Unicode scalars. The browser bounds every other
+            # result with String.length, so those are counted in UTF-16 code units.
+            measure = len if status == "completed" else utf16_units
+            refusal: str | None = None
+            if type(text) is not str:
+                refusal = "result_text_type"
+            elif not text.strip():
+                refusal = "result_text_blank"
+            elif measure(text) > text_limit:
+                refusal = "result_text_scalars" if status == "completed" else "result_text_units"
+            elif status == "completed" and not has_valid_result_unicode(text):
+                refusal = "result_text_unicode"
+            if refusal is not None:
+                try:
+                    raise ValueError("task result text is invalid")
+                finally:
+                    evidence = {
+                        "category": refusal,
+                        "kind": kind,
+                        "limit": text_limit,
+                        "status": status,
+                        # A count only, capped one past the bound; never the text or the task.
+                        "units": min(measure(text), text_limit + 1) if type(text) is str else 0,
+                        "version": 1,
+                    }
+                    # Reporting a refusal must not replace it with a stream error.
+                    with contextlib.suppress(OSError, ValueError):
+                        print(
+                            "[task-result-projection] "
+                            + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                            flush=True,
+                        )
         if kind == "knowledge_timing":
             expected = {
                 "backend",

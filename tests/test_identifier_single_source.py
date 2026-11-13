@@ -229,6 +229,21 @@ def test_every_browser_pattern_is_an_owned_rendering_or_a_listed_literal() -> No
         assert literal != f"/{SEARCHED[owner].pattern}/", reason
 
 
+def test_browser_counts_the_legacy_result_bound_in_the_unit_the_server_counts() -> None:
+    """``protocol.limits.utf16_units`` is String.length; the browser must bound with exactly it."""
+    source = (ROOT / "web/src/protocol.ts").read_text(encoding="utf-8")
+    assert source.count(": text.length <= MAX_LEGACY_RESULT_CHARS);") == 1
+    assert source.count("MAX_LEGACY_RESULT_CHARS") == 2, "one definition, one bound"
+
+    for relative in ("client/projection.py", "client/http.py", "conversation/result_projection.py"):
+        python = (ROOT / "src/hermes_realtime" / relative).read_text(encoding="utf-8")
+        assert "utf16_units" in python and '"utf-16' not in python, relative
+    bounded = (ROOT / "src/hermes_realtime/conversation/result_projection.py").read_text(
+        encoding="utf-8"
+    )
+    assert "len(text) <= MAX_LEGACY_RESULT_CHARS" not in bounded
+
+
 def test_a_changed_browser_pattern_is_reported(tmp_path: Path) -> None:
     source = tmp_path / "web/src"
     source.mkdir(parents=True)

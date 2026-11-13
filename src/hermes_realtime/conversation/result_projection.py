@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from hermes_realtime.protocol.identifiers import PRIVATE_HANDLE as _PRIVATE_RESULT_HANDLE
 from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN
+from hermes_realtime.protocol.limits import truncate_to_utf16_units, utf16_units
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
     MAX_LEGACY_RESULT_CHARS,
@@ -229,9 +230,11 @@ def _browser_safe_task_result(detail: str, *, completed: bool = False) -> str:
 
 
 def _bounded_result(text: str) -> str:
-    if len(text) <= MAX_LEGACY_RESULT_CHARS:
+    """Shorten to the legacy bound, which the browser counts in UTF-16 code units."""
+    if utf16_units(text) <= MAX_LEGACY_RESULT_CHARS:
         return text
-    boundary = text.rfind(" ", 0, MAX_LEGACY_RESULT_CHARS - 3)
-    if boundary < MAX_LEGACY_RESULT_CHARS // 2:
-        boundary = MAX_LEGACY_RESULT_CHARS - 3
-    return text[:boundary].rstrip() + "..."
+    head = truncate_to_utf16_units(text, MAX_LEGACY_RESULT_CHARS - 3)
+    boundary = head.rfind(" ")
+    if boundary >= 0 and utf16_units(head[:boundary]) >= MAX_LEGACY_RESULT_CHARS // 2:
+        head = head[:boundary]
+    return head.rstrip() + "..."

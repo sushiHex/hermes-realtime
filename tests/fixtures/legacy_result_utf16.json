@@ -1,0 +1,189 @@
+{
+ "comment": "Failed-result reasons and the exact text the server publishes for each. A text is its [string, repeat] segments concatenated.",
+ "limit_utf16_units": 1024,
+ "cases": [
+  {
+   "name": "astral only",
+   "reason": [
+    [
+     "\ud83d\ude00",
+     1024
+    ]
+   ],
+   "text": [
+    [
+     "\ud83d\ude00",
+     510
+    ],
+    [
+     "...",
+     1
+    ]
+   ]
+  },
+  {
+   "name": "astral at the unit bound",
+   "reason": [
+    [
+     "\ud83d\ude00",
+     512
+    ]
+   ],
+   "text": [
+    [
+     "\ud83d\ude00",
+     512
+    ]
+   ]
+  },
+  {
+   "name": "basic plane at the bound",
+   "reason": [
+    [
+     "x",
+     1024
+    ]
+   ],
+   "text": [
+    [
+     "x",
+     1024
+    ]
+   ]
+  },
+  {
+   "name": "astral words break at a space",
+   "reason": [
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ]
+   ],
+   "text": [
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     " ",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     100
+    ],
+    [
+     "...",
+     1
+    ]
+   ]
+  },
+  {
+   "name": "odd offset never splits a pair",
+   "reason": [
+    [
+     "x",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     600
+    ]
+   ],
+   "text": [
+    [
+     "x",
+     1
+    ],
+    [
+     "\ud83d\ude00",
+     510
+    ],
+    [
+     "...",
+     1
+    ]
+   ]
+  }
+ ]
+}
