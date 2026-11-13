@@ -3249,8 +3249,7 @@ class CodexAppServerStreamingInference:
                  "status": result.status, "text": result.text}
                 for result in snapshot.recent_task_results
             ]
-        host_indices = [index for index, message in enumerate(snapshot.messages)
-                        if message.source in {"host_task_status", "host_task_proposal"}]
+        host_indices = snapshot.host_speech_message_indices
         if host_indices:
             payload["host_speech_message_indices"] = host_indices
         if snapshot.memory is not None:

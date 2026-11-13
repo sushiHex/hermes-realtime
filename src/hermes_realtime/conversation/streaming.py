@@ -1011,10 +1011,7 @@ class StreamingSpeechLoop:
                         _committed_conversation_context_snapshot_bytes(
                             revision=snapshot.revision,
                             memory=snapshot.memory,
-                            host_speech_message_indices=tuple(
-                                index for index, message in enumerate(snapshot.messages)
-                                if message.source in {"host_task_status", "host_task_proposal"}
-                            ),
+                            host_speech_message_indices=snapshot.host_speech_message_indices,
                             messages=tuple(
                                 (message.role, message.text, True)
                                 if message.interrupted
