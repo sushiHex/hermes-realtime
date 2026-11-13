@@ -36,7 +36,17 @@ actually install.
 The source profile's `config.yaml` must match the plan's background model and
 effort, keep `agent.reasoning_overrides` empty, use manual approvals with
 unattended consequential effects denied, and set the `hermes-realtime` plugin entry's
-`allow_tool_override` to `false`; staging keeps only that plugin. Configure the model provider with `hermes setup`; the
+`allow_tool_override` to `false`; staging keeps only that plugin. It must not select
+an external memory provider: at the pinned Hermes baseline `memory.provider` alone
+selects one, and an absent key or its empty-string default means built-in memory only.
+Staging and preflight refuse a non-empty `memory.provider` with the fixed error
+`memory_provider_selected`, and a `memory` section or `memory.provider` of the wrong
+exact type with `memory_provider_refused`; neither prints the provider's settings. Like
+the other native profile refusals, `prepare`'s refusal receipt records these as
+`preparation_failed`. The `prepared.private.json`
+receipt records `memory_provider_config_inspection` (`absent` or `builtin`). This is a
+configuration inspection only; no runtime readback of the gateway's effective memory
+state exists. Configure the model provider with `hermes setup`; the
 optional live-Codex `key_cmd` route is described in
 [live credentials](live-credentials.md). `native_status.command` is the launcher of
 the public [vram-mcp](https://github.com/sushiHex/vram-mcp) server; the staged

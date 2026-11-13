@@ -1286,6 +1286,17 @@ def stage_preflight_profile(plan: PreviewPlanV1) -> Path:
     return profile
 
 
+def _memory_provider_config_inspection(plan: PreviewPlanV1, profile: Path) -> str | None:
+    """The staged config's memory-provider category; configuration only, never a readback."""
+    if plan.policy_mode != "native":
+        return None
+    from scripts.native_work_profile import memory_provider_inspection
+
+    return memory_provider_inspection(
+        _profile_config(_read(profile / "config.yaml", _JSON_LIMIT))
+    )
+
+
 def run_preflight(plan_path: Path, home: Path) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
@@ -1365,6 +1376,7 @@ def prepare(plan_path: Path) -> dict[str, Any]:
         ),
         "output": str(plan.output),
         "policy_mode": plan.policy_mode,
+        "memory_provider_config_inspection": _memory_provider_config_inspection(plan, profile),
         "profile_complete": False,
         "preflight": "accepted",
     }
