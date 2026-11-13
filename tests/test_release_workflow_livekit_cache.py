@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 from runpy import run_path
@@ -74,9 +75,28 @@ def _install_script() -> str:
 
 def _archive(payload: bytes) -> bytes:
     buffer = io.BytesIO()
+    # Every field of the member is fixed, so equal payloads give equal archive bytes and
+    # therefore equal digests, whenever and wherever they are built.
+    member = zipfile.ZipInfo("livekit-server.exe", date_time=(1980, 1, 1, 0, 0, 0))
+    member.compress_type = zipfile.ZIP_STORED
+    member.create_system = 0
+    member.external_attr = 0
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("livekit-server.exe", payload)
+        archive.writestr(member, payload)
     return buffer.getvalue()
+
+
+def test_fixture_archive_bytes_do_not_depend_on_the_wall_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fixture and the digest it is compared with come from separate builds. A member
+    # timestamp taken from the clock would make them differ whenever two builds straddle
+    # a two-second boundary, and a correct workflow would then be refused.
+    first = _archive(b"pinned server")
+    later = time.localtime(time.time() + 86_400)
+    monkeypatch.setattr(time, "localtime", lambda *_: later)
+
+    assert _archive(b"pinned server") == first
 
 
 class _Run:
