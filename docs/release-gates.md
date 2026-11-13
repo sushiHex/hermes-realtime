@@ -41,6 +41,43 @@ check explicitly selects the materialized candidate. Gate commands ignore ambien
 uv project, working-directory, environment-location, and configuration overrides;
 CI cache and interpreter-installation locations remain available.
 
+### Local declared-tool check
+
+Hosted runners provide no Codex or Ollama. A local gate keeps the developer
+`PATH`, so a test that reaches one can pass locally and fail hosted. To reproduce
+hosted executable discovery locally, run (Windows only):
+
+```bash
+python scripts/release_gate.py --candidate . --declared-tool-path
+```
+
+Each stage's `PATH` is rebuilt from the directories of its exact declared tools,
+plus the Windows system directories. Both stages also ignore the developer's
+global Git config (`GIT_CONFIG_GLOBAL` set to the null device), because hosted
+runners have none. System Git config is kept. Launch the check from PowerShell
+or cmd. From Git Bash, `git` resolves to Git for Windows' shell-internal
+`mingw64\bin` binary instead of the `cmd\git.exe` launcher that hosted runners
+use, and the gate refuses it.
+
+| Stage | Declared tools |
+| --- | --- |
+| uv commands, tests, builds | `uv`, `git`, and the Python 3.11 that uv selects |
+| Browser `npm` commands | `node`, `npm`, `npx` |
+
+A directory is not a tool. After building each environment, the gate resolves
+every guarded name (`uv`, `git`, `python`, `node`, `npm`, `npx`, `codex`,
+`ollama`). A declared tool must resolve to its exact original executable, uv
+must still select the same interpreter, and an undeclared guarded tool must not
+resolve. A shared directory that exposes one fails the gate; it is not dropped.
+Each refusal writes one `[declared-tool-path]` JSON line to stderr, giving the
+stage, a fixed refusal category and the guarded tool name. It contains no paths,
+no `PATH` contents and no versions.
+
+CI does not use this mode. Hosted `PATH` is already the reference, and setup-python
+supplies uv's interpreter there. Explicit injection in tests remains the primary
+guarantee; this check is secondary. It guards only the listed names, does not
+block network endpoints, and leaves the native LiveKit loopback stage unchanged.
+
 The `release-candidate` job runs, from that fresh candidate:
 
 1. a forced import from `src/`, then the focused provider request-size, status-authority
@@ -72,6 +109,32 @@ The Packaged capture and spool recovery job consumes the existing Pure candidate
 packaged producers verify the wheel digest and every runtime source blob,
 then execute the unpacked pure wheel in an owned process. These packaged
 scenarios do not establish the full installed dependency or physical matrix.
+
+Both jobs that need the LiveKit server first try to restore its release archive
+from the Actions cache, under a key that names the pinned version and the pinned
+archive SHA-256. The cache is transport only. GitHub's
+[dependency caching reference](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
+states that cache contents "are not signed or verified", so the install step
+applies one SHA-256 comparison to the archive whether it was restored or
+downloaded, and fails on a mismatch without downloading a replacement. On a miss
+the step downloads the archive with the same bounded retry as before. The cache
+action saves the archive when the job ends, and only if the job succeeded, which
+includes that comparison. A failure of the cache step falls back to the download
+and does not fail the job. A pull request can read a cache saved by a `main` run
+or by its own earlier runs, not one saved by another pull request, and GitHub
+removes an entry that no run has read for seven days, so the first run after
+either still downloads. Changing the pinned version or digest changes the key.
+The repository's allowed actions include `actions/cache`, pinned here by commit
+like the others.
+
+While the cache answers, the release gates no longer show that the upstream
+release still exists and still matches its pin. The scheduled
+[pinned-inputs workflow](../.github/workflows/pinned-inputs.yml) downloads it
+from upstream once a week without the cache, through
+`python -m scripts.local_livekit verify-upstream`, and prints one
+`[pinned-input]` line whose category is `verified`, `pin_mismatch` or
+`download_unavailable`. It is not a required check and never runs on a pull
+request.
 
 The `native-livekit` job downloads the documented Windows LiveKit 1.13.4
 binary, verifies its SHA-256, starts it on `127.0.0.1` in development mode, and
