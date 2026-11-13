@@ -21,6 +21,16 @@ or as one of the assembled forms in ``_computed``. A prefix built any other way 
 from a list, read from data, added by a helper) is not seen. ``UNPROVEN_VALUES`` is a
 superset of the free strings: a value it lists may be a number or a fixed label that the
 scan could not follow, and a value it accepts is literal only as far as one module shows.
+
+Two limits of the kind tags in ``UNPROVEN_VALUES``:
+
+- A value is tagged by the expression the scan stopped at, not by where the value came
+  from. One that reaches the payload through a tuple assignment, a loop or a ``with``
+  target is tagged ``bound`` whatever it is: ``kind, tool = type(error).__name__, None``
+  yields ``bound``, not ``class-name``. A ``bound`` row has to be read in source.
+- A payload printed whole (the result of a call, an awaited value, a built dictionary) is
+  one row with the field ``*`` or ``**``. The scan cannot see its members, and a change
+  inside the function that builds it changes no row.
 """
 
 from __future__ import annotations

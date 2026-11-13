@@ -384,6 +384,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "real-hermes-gate": {
         "scripts/real_hermes_api_gate.py": 1,
     },
+    "release-gate-baseline": {
+        "scripts/release_gate.py": 1,
+    },
     "session-model-refusal": {
         "web/src/protocol.ts": 1,
     },
@@ -833,6 +836,9 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
         "declared-tool-path": (
             "refusal: bound: refusal",
         ),
+        "release-gate-baseline": (
+            "category: attribute: error.category",
+        ),
         "test-ownership": (
             "refusal: bound: refusal",
             "tests: bound: tests",
@@ -1123,6 +1129,9 @@ READERS: dict[str, dict[str, int]] = {
     },
     "real-hermes-gate": {
         "scripts/rehearse_desktop_mvp.py": 1,
+    },
+    "release-gate-baseline": {
+        "scripts/release_gate.py": 1,
     },
     "voice-archive": {
         "scripts/qualify_hermes_voice_archive.py": 1,
