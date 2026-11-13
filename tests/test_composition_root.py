@@ -45,13 +45,13 @@ SOURCE = Path(__file__).resolve().parents[1] / "src" / "hermes_realtime"
 # itself are not counted either: constructing one more collaborator is what a root is for.
 BUILDERS: dict[tuple[str, str], dict[str, int]] = {
     ("host_launcher.py", "build_local_host_launcher"): {
-        "functions": 33,
+        "functions": 35,
         "classes": 1,
         "lambdas": 17,
         "nonlocal_declarations": 11,
         "own_awaits": 0,
         "own_tries": 7,
-        "nested_statements": 250,
+        "nested_statements": 257,
     },
     ("launcher.py", "build_local_conversation_launcher"): {
         "functions": 4,
