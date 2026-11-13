@@ -1,9 +1,9 @@
 # ADR 0006: One owner per fact
 
-Status: Proposed for review. Direction approved by the owner on 2026-11-12; this record is not
-accepted until the open decisions in the last sections are answered on the pull request that
-carries it. No umbrella work item exists; each move links its own issue, and a move without
-one gets an issue before work starts ([ADR 0001](0001-github-work-tracking.md)).
+Status: Accepted by owner decision on 2026-11-12
+([decision record](https://github.com/sushiHex/hermes-realtime/pull/512#issuecomment-6843021669)),
+which answers the ten decisions listed under "Owner decisions" below. No umbrella work item
+exists; each move links its own issue, and a move without one gets an issue before work starts ([ADR 0001](0001-github-work-tracking.md)).
 Reviewed source: [`ae48cad8`](https://github.com/sushiHex/hermes-realtime/commit/ae48cad8a1fdd39c5c7a96b044bf58dde7274966).
 Every `file:line` is at that commit, relative to `src/hermes_realtime/` unless it starts with
 `scripts/`, `tests/`, `web/`, `docs/` or `.github/`. Nothing below is implemented. This record
@@ -73,7 +73,9 @@ are generated or test-pinned. A ratcheting test enforces the inward import rule.
   boundary and is a labelled change with its own RED tests, never part of a move.
 - **First step:** the ratchet test, with an exception list bound by equality to today's
   violations so that both a new edge and a stale exception fail; then imports replacing
-  copies only where the copy is byte-identical.
+  copies only where the copy is byte-identical. The tier placement used by that test
+  ([#511](https://github.com/sushiHex/hermes-realtime/pull/511)) was approved by the owner on
+  2026-11-12, in the same decision record.
 - **Deletes:** the local pattern copies, `result_limits.py` as a root module, the lazy import at
   `protocol/events.py:583`, and one exception entry per later step.
 
@@ -200,42 +202,43 @@ name-keyed model table, a third adapter before Move 2, change-scoped CI.
 
 | Conflict | Resolution |
 | --- | --- |
-| The #499 design note proposes a session-constant tool superset with host rejection, for cache stability. The foreground review and ADR 0005 (routes equal the advertised set) require exact per-turn routes. | Exact. A superset advertises a route the request does not contain, which is a second owner. Open decision 1. |
-| ADR 0005 Decision 1: adapters construct the context and read the clock. Move 2: `conversation/` builds it; adapters hold no clock. | Move 2 governs, with the clock injected. ADR 0005's fields, bounds and no-authority rule stand; its RED case "no module outside the providers imports the type" is withdrawn. Open decision 2. |
-| ADR 0005 puts the facts block inside the Ollama system message, ahead of history. The foreground review puts per-turn facts after history on both adapters, for a stable prefix. | Open decision 3. Not resolved here: whether small-model templates accept a trailing system message is unverified. |
-| ADR 0004: provenance is bounded to the process and the saved tail is unchanged. The foreground review persists row source and time. | ADR 0004 stands until amended. Open decision 4. |
+| The #499 design note proposes a session-constant tool superset with host rejection, for cache stability. The foreground review and ADR 0005 (routes equal the advertised set) require exact per-turn routes. | Exact. A superset advertises a route the request does not contain, which is a second owner. Decided: exact per-turn routes (decision 1). |
+| ADR 0005 Decision 1: adapters construct the context and read the clock. Move 2: `conversation/` builds it; adapters hold no clock. | Move 2 governs, with the clock injected. ADR 0005's fields, bounds and no-authority rule stand; its RED case "no module outside the providers imports the type" is withdrawn. Decided: ADR 0005 is to be amended accordingly (decision 2). |
+| ADR 0005 puts the facts block inside the Ollama system message, ahead of history. The foreground review puts per-turn facts after history on both adapters, for a stable prefix. | Decided: after the history on both adapters, after desktop MVP acceptance and only once the template question is answered for the configured local model (decision 3). Whether small-model templates accept a trailing system message is still unverified. |
+| ADR 0004: provenance is bounded to the process and the saved tail is unchanged. The foreground review persists row source and time. | ADR 0004 stands until amended. Decided: amend it after desktop MVP acceptance, with a new tail version that still reads the old ones (decision 4). |
 | ADR 0004: Ollama buffers the whole envelope. The foreground review offers early reply streaming. | Not adopted. A separate latency decision, outside this record. |
-| The lifecycle review moves the run record into the state root. It also warns that a pending entry replayed against a fresh Hermes home would start work and then stop it. Sequencing puts the state root before acceptance and Hermes home persistence after. | Open decision 5. Derived from reading, not exercised. |
+| The lifecycle review moves the run record into the state root. It also warns that a pending entry replayed against a fresh Hermes home would start work and then stop it. Sequencing puts the state root before acceptance and Hermes home persistence after. | Decided: the run record stays per run until the Hermes home persists (decision 5). The warning is derived from reading, not exercised. |
 | The lifecycle review offers two interim fixes: a `HEAD` record, and carrying state from a run whose cleanup was refused. | Both harden the copy. Refused by the principle; Move 3 replaces them. |
 | The lifecycle review would keep an unparseable tail aside. ADR 0003 says the next write replaces it. | Not adopted. ADR 0003 stands. |
 | The evidence review proposes one rerun for failures classed as external input. The development guide requires attempt 1. | Not adopted. The pinned-binary cache removes the measured cause. |
 | The structure review reports the package at 62,995 lines and scripts at 73,709. The evidence review reports the reverse. | The evidence review is right: 73,709 lines in 112 package files, 62,995 in 125 scripts. |
 
-## Open owner decisions
+## Owner decisions (2026-11-12)
 
-Each blocks a move. A recommendation is not a decision.
+Decided by the owner in the
+[decision record](https://github.com/sushiHex/hermes-realtime/pull/512#issuecomment-6843021669).
+"After acceptance" means after desktop MVP acceptance
+([#159](https://github.com/sushiHex/hermes-realtime/issues/159)).
 
-1. Should routes be advertised exactly per turn, accepting a second cache lineage on turns
-   that withdraw a route? **Recommend yes.**
-2. Should ADR 0005 be amended so that `conversation/` builds the decision context from an
-   injected clock? **Recommend yes.**
-3. Should per-turn host facts sit after the history on both adapters? **Recommend yes**, after
-   acceptance, and only once the template question is answered for the configured local model.
-4. Should ADR 0004 be amended so the saved tail records each row's source and time, in a new
-   tail version that still reads the old ones? **Recommend yes**, after acceptance.
-5. Should the run record stay per run until the Hermes home persists, so that the state root
-   first holds only the tail and its deletes record? **Recommend yes.** Move 3's first step
-   is being built on this answer and would have to change if the owner decides otherwise.
-6. Should Hermes-side state (archive, companion store, memory) persist across preview runs?
-   **Recommend yes**, after acceptance; ADR 0003's purpose depends on it.
-7. May the owner restart the host child in place after a host-wide latch?
-   **Recommend yes**, after acceptance.
-8. Should a scheduled cold fetch of the pinned binary accompany the cache?
-   **Recommend yes**; without it an upstream deletion goes unseen.
-9. Should the qualification issues be closed into registry rows once the matrix and its stored
-   results exist, each row linking its former issue? **Recommend yes.**
-10. May heard-context eviction move to whole-turn blocks, changing the documented window?
-    **Recommend yes**, after acceptance, as a labelled behaviour change.
+1. Routes are advertised exactly per turn, accepting a second cache lineage on turns that
+   withdraw a route.
+2. ADR 0005 is to be amended so that `conversation/` builds the decision context from an
+   injected clock.
+3. Per-turn host facts sit after the history on both adapters, after acceptance, and only
+   once the template question is answered for the configured local model.
+4. ADR 0004 is to be amended so the saved tail records each row's source and time, in a new
+   tail version that still reads the old ones, after acceptance.
+5. The run record stays per run until the Hermes home persists, so the state root first holds
+   only the tail and its deletes record. Move 3's first step is built on this.
+6. Hermes-side state (archive, companion store, memory) persists across preview runs, after
+   acceptance; ADR 0003's purpose depends on it.
+7. The owner may restart the host child in place after a host-wide latch, after acceptance.
+8. A scheduled cold fetch of the pinned binary accompanies the cache; without it an upstream
+   deletion goes unseen.
+9. The qualification issues are closed into registry rows once the matrix and its stored
+   results exist, each row linking its former issue.
+10. Heard-context eviction moves to whole-turn blocks, changing the documented window, after
+    acceptance, as a labelled behaviour change.
 
 ## Not verified
 
@@ -246,7 +249,7 @@ Each blocks a move. A recommendation is not a decision.
   prompt-cache effect of request order on either adapter.
 - That importing `conversation` loads an HTTP client. It follows from module-level imports;
   nothing was run.
-- Archive fencing after a handoff, and the run-record replay in open decision 5.
+- Archive fencing after a handoff, and the run-record replay behind decision 5.
 - The reported divergences in run-id patterns, loopback definitions and canonical-JSON
   helpers. They are not in the table above for that reason.
 - That a host-wide latch leaves a host unable to work. The latches were read
