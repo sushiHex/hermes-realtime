@@ -25,6 +25,9 @@ from hermes_realtime.conversation.output_style import (
     QUANTITY_PRESENTATION_POLICY,
     SPEECH_WORDING_POLICY,
 )
+from hermes_realtime.conversation.result_projection import (
+    UNUSABLE_RESULT_SUMMARY as _UNUSABLE_RESULT_SUMMARY,
+)
 from hermes_realtime.integration import run_record
 from hermes_realtime.integration import web_evidence_contract as web_contract
 from hermes_realtime.integration.run_record import PendingRun
@@ -88,7 +91,6 @@ _RESTART_SETTLEMENT_PREFIX = "[hermes-restart-settlement] "
 _RUN_RECORD_LOCK_PREFIX = "[hermes-run-record-lock] "
 _MAX_RUN_RECORD_BYTES = run_record.max_run_record_bytes(_MAX_ACTIVE_RUNS, _MAX_HTTP_BODY_BYTES)
 _RESULT_REFUSAL_PREFIX = "[hermes-result-refusal] "
-_UNUSABLE_RESULT_SUMMARY = "The task finished, but its result could not be used."
 _BACKGROUND_RESULT = re.compile(
     r"<voice>(?P<voice>[\s\S]*?)</voice><detail>(?P<detail>[\s\S]*?)</detail>"
 )
