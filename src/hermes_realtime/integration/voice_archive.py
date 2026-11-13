@@ -39,6 +39,7 @@ from hermes_realtime.protocol import (
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
     VoiceArchiveRow,
+    voice_refusal_label,
 )
 
 _MARKER = "[voice-archive-send] "
@@ -231,13 +232,13 @@ class VoiceArchiveSender:
                     # The companion cannot take it now; the batch is not wrong. One marker
                     # per episode, which the next acknowledgment ends.
                     if not self._transient:
-                        evidence = {"transient": reply.category}
+                        evidence = {"transient": voice_refusal_label(reply.category)}
                     self._transient = True
                     return "transient"
                 # Integrity, or a category neither set lists: fail closed to a fence. The
                 # connection is dropped too: nothing more is sent on it.
                 self._fence = reply.category
-                evidence = {"fence": reply.category}
+                evidence = {"fence": voice_refusal_label(reply.category)}
                 await self._drop()
                 return "refused"
             if type(reply) is VoiceArchiveAckEvent and self._writer.acknowledge(

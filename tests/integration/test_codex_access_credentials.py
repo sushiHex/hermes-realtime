@@ -83,6 +83,35 @@ def test_cli_refusal_never_prints_credentials_or_private_path(tmp_path, capsys, 
     assert str(path) not in captured.err and "NEVER-EXPORT" not in captured.err
 
 
+def test_a_free_text_refusal_never_reaches_the_cli_marker(tmp_path, capsys, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise credentials.AccessCredentialError("SENTINEL_PRIVATE detail at C:/private")
+
+    monkeypatch.setattr(credentials, "read_access_credential", refuse)
+    assert credentials.main(["--auth-file", str(tmp_path / "a.json"),
+                             "--account-sha256", "a" * 64]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "SENTINEL_PRIVATE" not in captured.err and "private" not in captured.err
+    assert json.loads(captured.err.split("] ", 1)[1]) == {
+        "version": 1, "category": "unlisted",
+    }
+
+
+@pytest.mark.parametrize("category", [
+    "credential_invalid", "credential_unavailable", "account_mismatch", "credential_expired",
+])
+def test_every_listed_category_keeps_its_token(category):
+    error = credentials.AccessCredentialError(category)
+    assert error.category == category and str(error) == category
+
+
+@pytest.mark.parametrize("category", ["credential_other", "", None, 7])
+def test_an_unlisted_category_fails_closed_at_construction(category):
+    error = credentials.AccessCredentialError(category)
+    assert error.category == "unlisted" and str(error) == "unlisted"
+
+
 def test_command_builder_is_fixed_argv_and_quotes_shell_arguments(tmp_path):
     argv = credentials.command_argv(tmp_path / "host python.exe", tmp_path / "helper.py",
                                     tmp_path / "auth file.json", "a" * 64)
