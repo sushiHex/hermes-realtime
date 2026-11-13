@@ -281,6 +281,48 @@ async def test_capacity_refusal_blocks_retries_and_retains_exact_range(tmp_path:
         await writer.close()
 
 
+@pytest.mark.asyncio
+async def test_an_unlisted_review_refusal_never_reaches_the_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=lambda: "conv")
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    link = _Link()
+    link.permanent_refusal = "sentinel_private"
+
+    async def connect() -> _Link:
+        return link
+
+    sender = VoiceReviewSender(
+        writer,
+        connect,
+        idle_allowed=lambda: False,
+        initial_backoff_seconds=0.001,
+        max_backoff_seconds=0.002,
+    )
+    sender.start()
+    try:
+        store.record_user_transcript(Transcript(text="one", final=True))
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        writer.request_review_close()
+        await _until(lambda: sender._blocked)
+    finally:
+        await sender.close()
+        await writer.close()
+    output = capsys.readouterr().out
+    assert "sentinel_private" not in output
+    markers = [
+        json.loads(line.removeprefix("[voice-review-send] "))
+        for line in output.splitlines()
+        if line.startswith("[voice-review-send] ")
+    ]
+    assert markers == [{"closing": 1, "refusal": "unlisted", "version": 1}]
+
+
 @pytest.mark.parametrize(
     "category",
     [

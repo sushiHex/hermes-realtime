@@ -17,6 +17,7 @@ from hermes_realtime.protocol import (
     VoiceForgetAckEvent,
     VoiceForgetEvent,
     VoiceForgetRefusedEvent,
+    voice_refusal_label,
 )
 
 _MARKER = "[voice-forget-send] "
@@ -176,7 +177,7 @@ class VoiceForgetSender:
             raise RuntimeError("forget intent changed before acknowledgment")
         reason = reply.category if type(reply) is VoiceForgetRefusedEvent else "pending"
         if self._last_failure != reason:
-            _marker({"outcome": reason})
+            _marker({"outcome": voice_refusal_label(reason)})
         self._last_failure = reason
         return False
 

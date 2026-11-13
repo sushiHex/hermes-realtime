@@ -355,6 +355,20 @@ VOICE_REFUSAL_CATEGORIES = frozenset(
         "window",
     }
 )
+# What an evidence marker prints for a wire category outside the set above.
+VOICE_UNLISTED_REFUSAL = "unlisted"
+
+
+def voice_refusal_label(category: object) -> str:
+    """The marker label for a refusal category: a listed category, else one fixed label.
+
+    The wire type stays open so a newer companion's category still parses; a marker line
+    still prints only the closed vocabulary, never the received string.
+    """
+    if type(category) is str and category in VOICE_REFUSAL_CATEGORIES:
+        return category
+    return VOICE_UNLISTED_REFUSAL
+
 
 # The categories split into two closed sets whose union is exactly the set above. A
 # transient refusal says the companion cannot take the batch now (not ready, a lease, the
