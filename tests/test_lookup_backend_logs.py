@@ -27,6 +27,17 @@ def test_fixed_foreground_failure_survives_split_drain_and_finish(tmp_path):
     assert "foreground-failure" not in json.dumps(facts)
 
 
+def test_kept_bytes_are_on_disk_when_feed_returns(tmp_path):
+    path = tmp_path / "child.private.log"
+    capture = CappedCapture(path)
+    capture.feed(b"listening on 127.0.0.1\n")
+    try:
+        with path.open("rb") as reader:
+            assert reader.read() == b"listening on 127.0.0.1\n"
+    finally:
+        capture.finish()
+
+
 def test_refused_foreground_failure_is_counted_not_invalid(tmp_path):
     capture = CappedCapture(tmp_path / "child.private.log")
     capture.feed(marker(failure_kind="refused", text_phase="after_text"))
