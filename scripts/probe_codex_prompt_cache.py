@@ -43,6 +43,8 @@ VERDICT_MEANINGS = {
     "inconclusive": "a deciding count is missing, too small, or contradicts the table",
 }
 
+_MARKER = "[codex-cache-probe] "
+_PROBE = "codex-prompt-cache/1"
 _STAGES = ("a1", "a2", "b1", "b2", "c1", "c2")
 _MAX_COUNT = (1 << 53) - 1
 _NONCE = re.compile(r"[0-9a-f]{16}")
@@ -263,8 +265,59 @@ def _snapshot(revision: int, *texts: str) -> ConversationInferenceRequest:
     )
 
 
+class _OwnedProcesses:
+    """Everything the probe launched, closed to settlement outside any deadline.
+
+    Each app-server holds a temporary copy of the login. A transport's own close is bounded
+    and ends in a kill, but only if it is allowed to finish; a deadline or cancellation that
+    interrupts it leaves the process and that copy behind. So a launch is shielded, which
+    means a process started as the deadline expires is still known here, and ``close_all``
+    is not abandoned until every close has returned.
+    """
+
+    def __init__(self) -> None:
+        self._closers: list[Callable[[], Awaitable[None]]] = []
+
+    def own(self, close: Callable[[], Awaitable[None]]) -> None:
+        self._closers.append(close)
+
+    async def launch(self, factory: TransportFactory, cwd: str) -> CodexJsonLineTransport:
+        launching = asyncio.ensure_future(factory(cwd))
+
+        async def close() -> None:
+            transport = await launching
+            await transport.close()
+
+        self._closers.append(close)
+        return await asyncio.shield(launching)
+
+    async def _close_each(self) -> str | None:
+        first_error: str | None = None
+        for close in self._closers:
+            try:
+                await close()
+            except Exception as error:
+                first_error = first_error or type(error).__name__
+        return first_error
+
+    async def close_all(self) -> str | None:
+        """Return the first close error's type name, or ``None``; re-raise cancellation after."""
+
+        closing = asyncio.ensure_future(self._close_each())
+        cancelled = False
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return closing.result()
+
+
 async def _run_cases(
     recorder: _Recorder,
+    owned: _OwnedProcesses,
     *,
     transport_factory: TransportFactory,
     model: str,
@@ -274,8 +327,10 @@ async def _run_cases(
     sleep: Callable[[float], Awaitable[None]],
     nonce: str,
 ) -> None:
+    """Send the six requests. Closing is the caller's: nothing here may own a deadline."""
+
     async def observed() -> CodexJsonLineTransport:
-        return _ObservedTransport(await transport_factory(cwd), recorder)
+        return _ObservedTransport(await owned.launch(transport_factory, cwd), recorder)
 
     first, follow_up = synthetic_text("a", nonce), synthetic_text("a-follow-up", nonce)
     inference = CodexAppServerStreamingInference(
@@ -285,39 +340,33 @@ async def _run_cases(
         transport_factory=observed,
         request_timeout_seconds=60.0,
     )
-    try:
-        for stage, snapshot in (
-            ("a1", _snapshot(1, first)),
-            ("a2", _snapshot(2, first, follow_up)),
-        ):
-            recorder.stage = stage
-            async for _ in inference.stream(snapshot, turn_id=f"turn_probe_{stage}"):
-                pass
-    finally:
-        await inference.close()
+    owned.own(inference.close)
+    for stage, snapshot in (
+        ("a1", _snapshot(1, first)),
+        ("a2", _snapshot(2, first, follow_up)),
+    ):
+        recorder.stage = stage
+        async for _ in inference.stream(snapshot, turn_id=f"turn_probe_{stage}"):
+            pass
 
     recorder.stage = "b1"
-    transport = await observed()
-    try:
-        client = _RawClient(transport, model=model, effort=effort, cwd=cwd)
-        await client.initialize()
-        repeated = synthetic_text("b", nonce)
-        persisted = await client.start_thread(ephemeral=False)
-        await client.turn(persisted, repeated)
-        # Both deciding requests wait equally, so a slow cache write cannot favour one case.
-        await sleep(pause_seconds)
-        recorder.stage = "b2"
-        recorder.records["b2"].model = recorder.records["b1"].model
-        await client.turn(persisted, repeated)
+    client = _RawClient(await observed(), model=model, effort=effort, cwd=cwd)
+    await client.initialize()
+    repeated = synthetic_text("b", nonce)
+    persisted = await client.start_thread(ephemeral=False)
+    await client.turn(persisted, repeated)
+    # Both deciding requests wait equally, so a slow cache write cannot favour one case.
+    await sleep(pause_seconds)
+    recorder.stage = "b2"
+    recorder.records["b2"].model = recorder.records["b1"].model
+    await client.turn(persisted, repeated)
 
-        identical = synthetic_text("c", nonce)
-        recorder.stage = "c1"
-        await client.turn(await client.start_thread(ephemeral=True), identical)
-        await sleep(pause_seconds)
-        recorder.stage = "c2"
-        await client.turn(await client.start_thread(ephemeral=True), identical)
-    finally:
-        await transport.close()
+    identical = synthetic_text("c", nonce)
+    recorder.stage = "c1"
+    await client.turn(await client.start_thread(ephemeral=True), identical)
+    await sleep(pause_seconds)
+    recorder.stage = "c2"
+    await client.turn(await client.start_thread(ephemeral=True), identical)
 
 
 def _verdict(persisted: _RequestRecord, fresh: _RequestRecord) -> str:
@@ -351,14 +400,17 @@ async def run_probe(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> dict[str, object]:
     recorder = _Recorder()
+    owned = _OwnedProcesses()
     failure: dict[str, str] | None = None
     with tempfile.TemporaryDirectory(
         prefix="hermes-realtime-cache-probe-", ignore_cleanup_errors=True
     ) as workspace:
         try:
+            # The deadline bounds the measurement only. Shutdown follows it, self-bounded.
             async with asyncio.timeout(timeout_seconds):
                 await _run_cases(
                     recorder,
+                    owned,
                     transport_factory=transport_factory,
                     model=model,
                     effort=effort,
@@ -370,13 +422,17 @@ async def run_probe(
         except Exception as error:
             # The type name only: provider messages can carry text, paths or identities.
             failure = {"stage": recorder.stage or "launch", "error": type(error).__name__}
+        finally:
+            close_error = await owned.close_all()
+        if close_error is not None and failure is None:
+            failure = {"stage": "shutdown", "error": close_error}
     verdict = (
         "inconclusive"
         if failure is not None
         else _verdict(recorder.records["b2"], recorder.records["c2"])
     )
     report: dict[str, object] = {
-        "probe": "codex-prompt-cache/1",
+        "probe": _PROBE,
         "status": "completed" if failure is None else "failed",
         "codexVersion": recorder.codex_version,
         "minimumCacheableInputTokens": MINIMUM_CACHEABLE_INPUT_TOKENS,
@@ -398,6 +454,10 @@ async def run_probe(
     if failure is not None:
         report["failure"] = failure
     return report
+
+
+def _failed(stage: str, error: str) -> dict[str, object]:
+    return {"probe": _PROBE, "status": "failed", "failure": {"stage": stage, "error": error}}
 
 
 def _bounded_seconds(minimum: float, maximum: float) -> Callable[[str], float]:
@@ -422,29 +482,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=_bounded_seconds(1, 900), default=300.0,
                         help="hard limit for the whole probe")
     args = parser.parse_args(argv)
-    if not args.acknowledged:
-        print(
-            f"Refusing to run: this probe sends {REQUEST_COUNT} model requests and spends "
-            f"quota. Pass {QUOTA_FLAG} to proceed.",
-            file=sys.stderr,
-        )
-        return 2
-    executable = _resolve_codex_executable(args.codex_executable)
+    # Every outcome past argument parsing leaves one bounded line of evidence: a result, a
+    # refusal, an expired bound or a failure. Counts, kinds and categories only.
+    report: dict[str, object] = _failed("launch", "Interrupted")
+    try:
+        if not args.acknowledged:
+            report = {
+                "probe": _PROBE,
+                "status": "refused",
+                "refusal": "quota_acknowledgement_missing",
+            }
+            print(
+                f"Refusing to run: this probe sends {REQUEST_COUNT} model requests and spends "
+                f"quota. Pass {QUOTA_FLAG} to proceed.",
+                file=sys.stderr,
+            )
+            return 2
+        executable = _resolve_codex_executable(args.codex_executable)
 
-    async def transport_factory(cwd: str) -> CodexJsonLineTransport:
-        return await SubprocessCodexJsonLineTransport.create(executable=executable, cwd=cwd)
+        async def transport_factory(cwd: str) -> CodexJsonLineTransport:
+            return await SubprocessCodexJsonLineTransport.create(executable=executable, cwd=cwd)
 
-    report = asyncio.run(
-        run_probe(
-            transport_factory=transport_factory,
-            model=args.model,
-            effort=args.effort,
-            pause_seconds=args.pause_seconds,
-            timeout_seconds=args.timeout_seconds,
+        report = asyncio.run(
+            run_probe(
+                transport_factory=transport_factory,
+                model=args.model,
+                effort=args.effort,
+                pause_seconds=args.pause_seconds,
+                timeout_seconds=args.timeout_seconds,
+            )
         )
-    )
-    print(json.dumps(report, indent=2))
-    return 0 if report["status"] == "completed" else 1
+        return 0 if report["status"] == "completed" else 1
+    except Exception as error:
+        report = _failed("launch", type(error).__name__)
+        return 1
+    finally:
+        print(_MARKER + json.dumps(report, separators=(",", ":")), flush=True)
 
 
 if __name__ == "__main__":

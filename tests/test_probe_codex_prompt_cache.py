@@ -33,10 +33,13 @@ class FakeAppServer:
     """One scripted app-server shared by every transport the probe opens."""
 
     def __init__(self, last: list[dict[str, object]], *, stall_turn: int | None = None,
-                 failed_turn: int | None = None) -> None:
+                 failed_turn: int | None = None, close_seconds: float = 0.0,
+                 launch_seconds: float = 0.0) -> None:
         self.last = last
         self.stall_turn = stall_turn
         self.failed_turn = failed_turn
+        self.close_seconds = close_seconds
+        self.launch_seconds = launch_seconds
         self.transports: list[FakeTransport] = []
         self.thread_starts: list[dict[str, Any]] = []
         self.turn_starts: list[dict[str, Any]] = []
@@ -52,6 +55,7 @@ class FakeTransport:
     def __init__(self, server: FakeAppServer) -> None:
         self.server = server
         self.incoming: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self.closing = False
         self.closed = False
 
     async def send(self, message: Mapping[str, object]) -> None:
@@ -105,13 +109,18 @@ class FakeTransport:
         return await self.incoming.get()
 
     async def close(self) -> None:
+        # Like the real transport: interrupted before the end, the process is still alive.
+        self.closing = True
+        await asyncio.sleep(self.server.close_seconds)
         self.closed = True
 
 
 async def _run(server: FakeAppServer, *, timeout_seconds: float = 30.0,
                pauses: list[float] | None = None) -> dict[str, Any]:
     async def factory(cwd: str) -> FakeTransport:
-        return server.transport()
+        created = server.transport()
+        await asyncio.sleep(server.launch_seconds)
+        return created
 
     async def sleep(seconds: float) -> None:
         server.order.append("pause")
@@ -261,8 +270,40 @@ def test_refuses_to_run_without_the_quota_flag(
 
     assert probe.main([]) == 2
     captured = capsys.readouterr()
-    assert captured.out == ""
+    assert _evidence(captured.out) == {
+        "probe": "codex-prompt-cache/1",
+        "status": "refused",
+        "refusal": "quota_acknowledgement_missing",
+    }
     assert _FLAG in captured.err and "6 model requests" in captured.err
+
+
+def _evidence(output: str) -> dict[str, Any]:
+    """The one bounded, marker-prefixed JSON line every outcome must emit."""
+
+    assert output.endswith("\n") and output.count("\n") == 1
+    assert output.startswith("[codex-cache-probe] ") and len(output) < 4096
+    evidence = json.loads(output.removeprefix("[codex-cache-probe] "))
+    assert type(evidence) is dict
+    return evidence
+
+
+def test_launch_failure_emits_evidence_without_the_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def missing(explicit: str | None) -> str:
+        raise FileNotFoundError("C:/private/place/codex.exe")
+
+    monkeypatch.setattr(probe, "_resolve_codex_executable", missing)
+
+    assert probe.main([_FLAG]) == 1
+    captured = capsys.readouterr()
+    assert _evidence(captured.out) == {
+        "probe": "codex-prompt-cache/1",
+        "status": "failed",
+        "failure": {"stage": "launch", "error": "FileNotFoundError"},
+    }
+    assert "private" not in captured.out + captured.err
 
 
 def _strings(value: object) -> list[str]:
@@ -282,7 +323,7 @@ def test_output_is_numbers_and_fixed_labels_only(
     assert probe.main([_FLAG, "--pause-seconds", "0"]) == 0
     captured = capsys.readouterr()
     assert captured.err == ""
-    report = json.loads(captured.out)
+    report = _evidence(captured.out)
     assert report["verdict"] == "affinity_per_thread"
 
     assert set(report) == {
@@ -322,7 +363,7 @@ def test_failed_turn_reports_stage_and_error_type_only(
     _patch_launch(monkeypatch, server)
 
     assert probe.main([_FLAG, "--pause-seconds", "0"]) == 1
-    report = json.loads(capsys.readouterr().out)
+    report = _evidence(capsys.readouterr().out)
     assert report["status"] == "failed"
     assert report["failure"] == {"stage": "b2", "error": "RuntimeError"}
     assert report["verdict"] == "inconclusive"
@@ -339,6 +380,42 @@ async def test_hard_timeout_closes_every_transport() -> None:
     assert report["failure"] == {"stage": "c1", "error": "TimeoutError"}
     assert report["verdict"] == "inconclusive"
     assert report["requests"][3]["cachedInputTokens"] == 2048
+    assert len(server.transports) == 2 and all(item.closed for item in server.transports)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_is_not_cut_short_by_the_probe_deadline() -> None:
+    # Closing takes longer than the whole deadline. The measurement finished in time, so the
+    # deadline has nothing left to bound, and every process must still be closed.
+    server = FakeAppServer(_six(2048, 1900), close_seconds=1.0)
+    report = await _run(server, timeout_seconds=0.5)
+
+    assert report["status"] == "completed"
+    assert report["verdict"] == "affinity_survives_new_thread"
+    assert len(server.transports) == 2 and all(item.closed for item in server.transports)
+
+
+@pytest.mark.asyncio
+async def test_process_launched_as_the_deadline_expires_is_still_closed() -> None:
+    server = FakeAppServer(_six(2048, 1900), launch_seconds=1.0)
+    report = await _run(server, timeout_seconds=0.3)
+
+    assert report["status"] == "failed"
+    assert report["failure"] == {"stage": "a1", "error": "TimeoutError"}
+    assert len(server.transports) == 1 and server.transports[0].closed
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_shutdown_still_closes_every_transport() -> None:
+    server = FakeAppServer(_six(2048, 1900), close_seconds=0.5)
+    running = asyncio.create_task(_run(server))
+    async with asyncio.timeout(10):
+        while not any(item.closing for item in server.transports):
+            await asyncio.sleep(0.01)
+    running.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await running
     assert len(server.transports) == 2 and all(item.closed for item in server.transports)
 
 
