@@ -77,9 +77,9 @@ class _Companion:
             )
         if action in ("not_ready", "lease_held", "conversations"):
             return VoiceArchiveRefusedEvent(type="voice_archive_refused", category=action, **fields)
-        if action == "novel":
+        if action in ("novel", "sentinel_private"):
             # A category neither set lists (a newer companion), exactly as the wire carries it.
-            raw = json.dumps(fields | {"type": "voice_archive_refused", "category": "novel"})
+            raw = json.dumps(fields | {"type": "voice_archive_refused", "category": action})
             return parse_voice_event(raw.encode("utf-8"))
         if action == "drop":
             raise BridgeProtocolError("the companion closed before answering")
@@ -262,7 +262,27 @@ async def test_a_refusal_category_in_neither_set_fails_closed_to_a_fence(
         await asyncio.sleep(0.05)
         assert sender.fence == "novel"
         assert len(companion.sent) == 1
-        assert _markers(capsys.readouterr().out) == [{"fence": "novel", "version": 1}]
+        # The fence keeps the received category; the marker prints only the closed vocabulary.
+        assert _markers(capsys.readouterr().out) == [{"fence": "unlisted", "version": 1}]
+    finally:
+        await sender.close()
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_wire_category_never_reaches_the_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    companion = _Companion()
+    companion.script = ["sentinel_private"]
+    writer, store, sender = await _setup(tmp_path, companion)
+    try:
+        _say(store, "One")
+        await _until(lambda: sender.fence is not None)
+        assert sender.fence == "sentinel_private"
+        output = capsys.readouterr().out
+        assert "sentinel_private" not in output
+        assert _markers(output) == [{"fence": "unlisted", "version": 1}]
     finally:
         await sender.close()
         await writer.close()

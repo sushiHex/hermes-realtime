@@ -167,6 +167,59 @@ async def test_public_summary_refuses_stop_error_even_after_healthy_query(
     assert "private" not in json.dumps(summary)
 
 
+def _stub_rehearsal(run_dir, monkeypatch):
+    run = SimpleNamespace(
+        home=run_dir / "home", logs_dir=run_dir / "logs", state_dir=run_dir / "state",
+        records=[{"step": "1", "outcome": "as_expected"}], stand_in=SimpleNamespace(requests={}),
+        close=AsyncMock(return_value={"processes_left": {}, "ports_listening": 0}),
+    )
+    for name in (
+        "setup", "gate", "start_and_talk", "typed", "delegate", "interrupt", "cancel",
+        "reconnect", "restart", "delete", "reload_inputs", "cleanup",
+    ):
+        setattr(run, name, AsyncMock())
+    monkeypatch.setattr(rehearsal, "Rehearsal", lambda *a: run)
+    monkeypatch.setattr(rehearsal, "Containment", lambda: None)
+    monkeypatch.setattr(rehearsal, "_synthesize_clips", AsyncMock(return_value={}))
+
+
+@pytest.mark.asyncio
+async def test_summary_never_carries_the_caller_chosen_run_directory(
+    tmp_path, monkeypatch, capsys
+):
+    run_dir = tmp_path / "sentinelprivate-run"
+    run_dir.mkdir()
+    _stub_rehearsal(run_dir, monkeypatch)
+    assert await rehearsal._rehearse(run_dir, "stand-in") == 0
+    line = capsys.readouterr().out.splitlines()[-1]
+    assert "sentinelprivate" not in line
+    summary = json.loads(line.removeprefix(rehearsal._PREFIX))
+    assert summary["name"] == "summary"
+    assert "run_dir" not in summary
+    assert summary["default_run_dir"] is False
+
+
+@pytest.mark.parametrize("chosen", [False, True])
+def test_main_reports_only_whether_the_default_run_directory_was_used(
+    tmp_path, monkeypatch, chosen
+):
+    monkeypatch.setattr(rehearsal, "take_rehearsal_lock", lambda: None)
+    monkeypatch.setattr(rehearsal, "preflight", lambda model: [])
+    monkeypatch.setattr(rehearsal.tempfile, "mkdtemp", lambda prefix: str(tmp_path / "default"))
+    seen = []
+
+    async def recorded(run_dir, model, recall_trials, **options):
+        seen.append(options)
+        return 0
+
+    monkeypatch.setattr(rehearsal, "_rehearse", recorded)
+    arguments = ["--ollama-model", "synthetic"]
+    if chosen:
+        arguments += ["--run-dir", str(tmp_path / "sentinelprivate-run")]
+    assert rehearsal.main(arguments) == 0
+    assert seen == [{"default_run_dir": not chosen}]
+
+
 def test_unknown_cleanup_category_cannot_collide_with_an_image(tmp_path, monkeypatch, capsys):
     owner = rehearsal.Processes(tmp_path)
     states = iter(["running_or_terminating", "unknown"])

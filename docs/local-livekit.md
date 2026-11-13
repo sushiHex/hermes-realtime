@@ -656,7 +656,8 @@ categories: `outcome`, `timings`, markers and `notes`. Markers are kept by name,
 components this session runs. They are re-rendered from their values, which may only be counts,
 flags and short categories; anything else is counted and dropped. A failed step is recorded, a
 later step reconnects the page if it must, and the rehearsal continues. The final `summary` line
-counts what is left running by image name, and it must be empty. The exit code is 0 only when
+counts what is left running by image name, and it must be empty. It says whether the default
+temporary run directory was used (`default_run_dir`), never the directory's name. The exit code is 0 only when
 every step was `as_expected` and nothing was left.
 
 **One run at a time.** Before anything else, a run takes an exclusive lock:

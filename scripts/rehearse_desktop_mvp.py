@@ -2990,7 +2990,9 @@ async def _synthesize_clips() -> dict[str, str]:
     return clips
 
 
-async def _rehearse(run_dir: Path, model: str, recall_trials: int = 0) -> int:
+async def _rehearse(
+    run_dir: Path, model: str, recall_trials: int = 0, *, default_run_dir: bool = False
+) -> int:
     rehearsal = Rehearsal(run_dir, model, recall_trials)
     for directory in (rehearsal.home, rehearsal.logs_dir, rehearsal.state_dir):
         directory.mkdir(parents=True, exist_ok=True)
@@ -3022,8 +3024,10 @@ async def _rehearse(run_dir: Path, model: str, recall_trials: int = 0) -> int:
         _emit(
             {
                 "name": "summary",
+                # Whether the default temporary directory held the run: never its name,
+                # which ``--run-dir`` lets the caller choose.
+                "default_run_dir": default_run_dir,
                 "outcomes": outcomes,
-                "run_dir": run_dir.name,
                 "stand_in_requests": dict(rehearsal.stand_in.requests),
                 "version": 1,
             }
@@ -3184,7 +3188,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if occupied else 0
     run_dir = args.run_dir or Path(tempfile.mkdtemp(prefix="hermes-mvp-rehearsal-"))
     run_dir.mkdir(parents=True, exist_ok=True)
-    return asyncio.run(_rehearse(run_dir.resolve(), args.ollama_model, args.recall_trials))
+    return asyncio.run(
+        _rehearse(
+            run_dir.resolve(),
+            args.ollama_model,
+            args.recall_trials,
+            default_run_dir=args.run_dir is None,
+        )
+    )
 
 
 if __name__ == "__main__":

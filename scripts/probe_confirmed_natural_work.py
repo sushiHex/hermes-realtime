@@ -457,7 +457,9 @@ def main(argv: list[str] | None = None) -> int:
             codex_executable=args.codex_executable,
             codex_executable_sha256=args.codex_executable_sha256,
         )
-        configuration = {"inference_provider": args.inference_provider, "model": model,
+        # Printed only once verified: the provider and effort are from closed sets and the
+        # digest is hex. The model tag is free text the operator chose, so it is never printed.
+        configuration = {"inference_provider": args.inference_provider,
                          "model_digest": args.model_digest, "codex_effort": args.codex_effort}
         harness.verify_imports()
         before = harness.source_binding()
