@@ -167,7 +167,10 @@ gate reads it before continuing. The two reports partition the collected tests:
 | Native stage | A selected test that was skipped; a selector that collected nothing; a test outside the selection. |
 | Default suite | A test skipped for a reason only the native environment lifts (the LiveKit opt-in, or a missing import) that the native stage does not select; a native-stage test that also ran here; a selector absent from the collection. |
 
-Each check prints one `test ownership verified:` line with its counts. A unit test
+Each check prints one `test ownership verified:` line with its counts. A refusal
+writes exactly one `[test-ownership]` JSON line to stderr with a version, the
+stage, a fixed category and a count of offending tests. It contains no test names
+or paths; the exception names at most ten tests and counts the rest. A unit test
 additionally binds the selection to the set of test files that carry the LiveKit
 opt-in, by equality.
 

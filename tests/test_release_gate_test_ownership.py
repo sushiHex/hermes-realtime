@@ -10,6 +10,7 @@ stage selects, and every test the native stage selects must run there.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import sys
@@ -304,6 +305,203 @@ def test_real_pytest_report_carries_the_reasons_the_ownership_check_keys_on(
     assert gate["native_enabled_skip"](outcomes[("test_probe", "test_import")])
     assert gate["native_enabled_skip"](outcomes[("test_probe", "test_gated")])
     assert not gate["native_enabled_skip"]("linux-null-capture gate")
+
+
+# Refusal evidence (AGENTS.md): one bounded marker line per guard rejection, from a
+# `finally`, carrying a fixed category and a count. Test names stay out of the marker.
+PRIVATE_NAME = "test_private_sentinel_7f3a"
+MARKER = "[test-ownership] "
+
+
+def _malformed(path: Path, gate: dict[str, Any]) -> Path:
+    path.write_text("<testsuites><testsuite>", encoding="utf-8")
+    return path
+
+
+def _raw(body: str) -> Any:
+    def write(path: Path, gate: dict[str, Any]) -> Path:
+        path.write_text(
+            f"<testsuites><testsuite>{body}</testsuite></testsuites>", encoding="utf-8"
+        )
+        return path
+
+    return write
+
+
+def _cases(build: Any) -> Any:
+    return lambda path, gate: _report(path, build(gate))
+
+
+def _native_with(change: Any) -> Any:
+    def build(gate: dict[str, Any]) -> list[Case]:
+        cases = _every_native_selector(gate, None)
+        return list(change(cases))
+
+    return _cases(build)
+
+
+def _default_with(change: Any) -> Any:
+    def build(gate: dict[str, Any]) -> list[Case]:
+        cases = _every_native_selector(gate, LIVEKIT_REASON)
+        return list(change(cases))
+
+    return _cases(build)
+
+
+REFUSALS = [
+    ("native-stage", "report_missing_or_malformed", 0, _malformed),
+    ("default-suite", "report_missing_or_malformed", 0, _malformed),
+    (
+        "native-stage",
+        "report_invalid_case",
+        1,
+        _raw(f'<testcase classname="tests.a" name="{PRIVATE_NAME}"><failure/></testcase>'),
+    ),
+    ("default-suite", "empty_report", 0, _raw("")),
+    ("native-stage", "selector_unmatched", 2, _native_with(lambda cases: cases[2:])),
+    ("default-suite", "selector_unmatched", 1, _default_with(lambda cases: cases[1:])),
+    (
+        "native-stage",
+        "native_ran_outside_selection",
+        3,
+        _native_with(
+            lambda cases: [*cases, *(("tests.other", f"{PRIVATE_NAME}_{i}", None) for i in "abc")]
+        ),
+    ),
+    (
+        "native-stage",
+        "native_test_skipped",
+        2,
+        _native_with(lambda cases: [(c, n, "any reason") for c, n, _ in cases[:2]] + cases[2:]),
+    ),
+    (
+        "default-suite",
+        "skipped_in_no_stage",
+        2,
+        _default_with(
+            lambda cases: [
+                *cases,
+                ("tests.new", f"{PRIVATE_NAME}_a", LIVEKIT_REASON),
+                ("tests.new", f"{PRIVATE_NAME}_b", IMPORT_REASON),
+            ]
+        ),
+    ),
+    (
+        "default-suite",
+        "native_test_ran_in_default",
+        3,
+        _default_with(lambda cases: [(c, n, None) for c, n, _ in cases[:3]] + cases[3:]),
+    ),
+]
+
+
+def _check(gate: dict[str, Any], stage: str, report: Path) -> None:
+    if stage == "native-stage":
+        gate["check_native_stage_outcomes"](report)
+    else:
+        gate["check_default_suite_outcomes"](report, native_stage_ran=False)
+
+
+@pytest.mark.parametrize(
+    ("stage", "category", "count", "write"),
+    REFUSALS,
+    ids=[f"{stage}:{category}" for stage, category, _, _ in REFUSALS],
+)
+def test_each_ownership_rejection_emits_exactly_one_bounded_marker_line(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    stage: str,
+    category: str,
+    count: int,
+    write: Any,
+) -> None:
+    gate = _gate()
+    report = write(tmp_path / "report.xml", gate)
+
+    with pytest.raises(RuntimeError) as raised:
+        _check(gate, stage, report)
+
+    assert type(raised.value).__name__ == "OwnershipRefusal"
+    assert raised.value.refusal == category
+    captured = capsys.readouterr()
+    assert captured.err == (
+        MARKER
+        + json.dumps({"version": 1, "stage": stage, "refusal": category, "tests": count})
+        + "\n"
+    )
+    assert MARKER not in captured.out
+    assert PRIVATE_NAME not in captured.out + captured.err
+    assert str(tmp_path) not in captured.err + str(raised.value)
+
+
+def test_ownership_categories_are_a_closed_set_that_every_rejection_test_covers() -> None:
+    gate = _gate()
+
+    assert gate["TEST_OWNERSHIP_REFUSALS"] == {category for _, category, _, _ in REFUSALS} | {
+        "unexpected_error"
+    }
+    with pytest.raises(ValueError, match="unknown test-ownership refusal category"):
+        gate["OwnershipRefusal"]("something_else", ())
+    for category in (None, "", ["native_test_skipped"]):
+        with pytest.raises(ValueError):
+            gate["OwnershipRefusal"](category, ())
+
+
+def test_an_unexpected_error_inside_a_check_still_emits_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = _gate()
+
+    def explode(*_args: object) -> None:
+        raise KeyError(PRIVATE_NAME)
+
+    namespace = gate["check_native_stage_outcomes"].__globals__
+    monkeypatch.setitem(namespace, "read_test_outcomes", explode)
+    with pytest.raises(KeyError):
+        gate["check_native_stage_outcomes"](tmp_path / "report.xml")
+
+    assert capsys.readouterr().err == (
+        MARKER
+        + '{"version": 1, "stage": "native-stage", "refusal": "unexpected_error", "tests": 0}\n'
+    )
+
+
+def test_passing_ownership_checks_emit_no_refusal_evidence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _gate()
+
+    gate["check_native_stage_outcomes"](
+        _report(tmp_path / "native.xml", _every_native_selector(gate, None))
+    )
+    gate["check_default_suite_outcomes"](
+        _report(tmp_path / "suite.xml", _every_native_selector(gate, LIVEKIT_REASON)),
+        native_stage_ran=False,
+    )
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert MARKER not in captured.out
+
+
+def test_refusal_message_names_a_fixed_number_of_tests_and_counts_the_rest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _gate()
+    limit = gate["OWNERSHIP_NAMED_TESTS"]
+    extra = [("tests.new", f"test_{index:03d}", IMPORT_REASON) for index in range(limit + 25)]
+    report = _report(
+        tmp_path / "suite.xml", [*_every_native_selector(gate, LIVEKIT_REASON), *extra]
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        gate["check_default_suite_outcomes"](report, native_stage_ran=False)
+
+    message = str(raised.value)
+    assert limit == 10
+    assert message.count("tests.new::") == limit
+    assert message.endswith(" and 25 more")
+    assert f'"tests": {limit + 25}' in capsys.readouterr().err
 
 
 class _Stop(Exception):

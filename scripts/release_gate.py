@@ -1041,13 +1041,72 @@ def native_enabled_skip(reason: str | None) -> bool:
     )
 
 
+TEST_OWNERSHIP_STAGES = frozenset({"native-stage", "default-suite"})
+# Each category's fixed message. Test names appear only in the exception, never the marker.
+_OWNERSHIP_MESSAGES = {
+    "report_missing_or_malformed": "test outcome report is missing or malformed",
+    "report_invalid_case": (
+        "test outcome report holds a duplicate, unnamed, failed or unrecognized test"
+    ),
+    "empty_report": "test outcome report holds no test",
+    "selector_unmatched": "native stage selector collected no test",
+    "native_ran_outside_selection": "native stage ran a test outside its selection",
+    "native_test_skipped": "native stage test did not run",
+    "skipped_in_no_stage": "skipped test runs in no gate stage",
+    "native_test_ran_in_default": "native stage test also ran in the default suite",
+    "unexpected_error": "test ownership check did not complete",
+}
+TEST_OWNERSHIP_REFUSALS = frozenset(_OWNERSHIP_MESSAGES)
+OWNERSHIP_NAMED_TESTS = 10
+
+
+class OwnershipRefusal(RuntimeError):
+    """A test-ownership guard rejection with a fixed category and a count of tests."""
+
+    def __init__(self, refusal: str, tests: tuple[str, ...]) -> None:
+        if type(refusal) is not str or refusal not in TEST_OWNERSHIP_REFUSALS:
+            raise ValueError("unknown test-ownership refusal category")
+        message = _OWNERSHIP_MESSAGES[refusal]
+        if tests:
+            message += ": " + ", ".join(tests[:OWNERSHIP_NAMED_TESTS])
+        if len(tests) > OWNERSHIP_NAMED_TESTS:
+            message += f" and {len(tests) - OWNERSHIP_NAMED_TESTS} more"
+        super().__init__(message)
+        self.refusal = refusal
+        self.tests = len(tests)
+
+
+@contextlib.contextmanager
+def _test_ownership_refusal_evidence(stage: str) -> Iterator[None]:
+    """Emit one bounded marker line when an ownership check refuses: a category and a count."""
+    record: dict[str, object] | None = None
+    try:
+        yield
+    except BaseException as error:
+        if type(error) is OwnershipRefusal:
+            refusal, tests = error.refusal, error.tests
+        else:
+            refusal, tests = "unexpected_error", 0
+        record = {
+            "version": 1,
+            "stage": stage if stage in TEST_OWNERSHIP_STAGES else None,
+            "refusal": refusal,
+            "tests": tests,
+        }
+        raise
+    finally:
+        if record is not None:
+            print("[test-ownership] " + json.dumps(record), file=sys.stderr, flush=True)
+
+
 def read_test_outcomes(report: Path) -> dict[tuple[str, str], str | None]:
     """Read one pytest JUnit report: every collected test, and why it was skipped if it was."""
 
     try:
         cases = list(ElementTree.parse(report).getroot().iter("testcase"))
-    except (OSError, ElementTree.ParseError) as error:
-        raise RuntimeError("test outcome report is missing or malformed") from error
+    except (OSError, ElementTree.ParseError):
+        # The parser's own message can quote the report path; the category says enough.
+        raise OwnershipRefusal("report_missing_or_malformed", ()) from None
     outcomes: dict[tuple[str, str], str | None] = {}
     for case in cases:
         classname, name = case.get("classname"), case.get("name")
@@ -1065,30 +1124,34 @@ def read_test_outcomes(report: Path) -> dict[tuple[str, str], str | None]:
             or (results and not skipped)
             or (skipped and (results[0].get("type") != "pytest.skip" or reason is None))
         ):
-            fail("test outcome report holds a duplicate, unnamed, failed or unrecognized test")
+            raise OwnershipRefusal("report_invalid_case", ("::".join((classname or "", name or "")),))
         outcomes[(classname, name)] = reason
     if not outcomes:
-        fail("test outcome report holds no test")
+        raise OwnershipRefusal("empty_report", ())
     return outcomes
 
 
 def _require_every_native_selector(owners: list[str | None]) -> None:
-    unmatched = sorted(set(NATIVE_STAGE_TESTS) - set(owners))
+    unmatched = tuple(sorted(set(NATIVE_STAGE_TESTS) - set(owners)))
     if unmatched:
-        fail("native stage selector collected no test: " + ", ".join(unmatched))
+        raise OwnershipRefusal("selector_unmatched", unmatched)
 
 
 def check_native_stage_outcomes(report: Path) -> None:
     """Require the native stage to have run exactly its selection, with nothing skipped."""
 
-    outcomes = read_test_outcomes(report)
-    owners = [native_stage_selector(*node) for node in outcomes]
-    if None in owners:
-        fail("native stage ran a test outside its selection")
-    _require_every_native_selector(owners)
-    skipped = sorted("::".join(node) for node, reason in outcomes.items() if reason is not None)
-    if skipped:
-        fail("native stage test did not run: " + ", ".join(skipped))
+    with _test_ownership_refusal_evidence("native-stage"):
+        outcomes = read_test_outcomes(report)
+        owners = {node: native_stage_selector(*node) for node in outcomes}
+        outside = tuple(sorted("::".join(node) for node in outcomes if owners[node] is None))
+        if outside:
+            raise OwnershipRefusal("native_ran_outside_selection", outside)
+        _require_every_native_selector(list(owners.values()))
+        skipped = tuple(
+            sorted("::".join(node) for node, reason in outcomes.items() if reason is not None)
+        )
+        if skipped:
+            raise OwnershipRefusal("native_test_skipped", skipped)
     print(f"test ownership verified: native stage ran {len(outcomes)} tests, 0 skipped", flush=True)
 
 
@@ -1101,23 +1164,28 @@ def check_default_suite_outcomes(report: Path, *, native_stage_ran: bool) -> Non
     first and left its extra installed.
     """
 
-    outcomes = read_test_outcomes(report)
-    owners = {node: native_stage_selector(*node) for node in outcomes}
-    _require_every_native_selector(list(owners.values()))
-    unowned = sorted(
-        "::".join(node)
-        for node, reason in outcomes.items()
-        if native_enabled_skip(reason) and owners[node] is None
-    )
-    if unowned:
-        fail("skipped test runs in no gate stage: " + ", ".join(unowned))
-    duplicated = sorted(
-        "::".join(node)
-        for node, reason in outcomes.items()
-        if reason is None and owners[node] is not None
-    )
-    if duplicated and not native_stage_ran:
-        fail("native stage test also ran in the default suite: " + ", ".join(duplicated))
+    with _test_ownership_refusal_evidence("default-suite"):
+        outcomes = read_test_outcomes(report)
+        owners = {node: native_stage_selector(*node) for node in outcomes}
+        _require_every_native_selector(list(owners.values()))
+        unowned = tuple(
+            sorted(
+                "::".join(node)
+                for node, reason in outcomes.items()
+                if native_enabled_skip(reason) and owners[node] is None
+            )
+        )
+        if unowned:
+            raise OwnershipRefusal("skipped_in_no_stage", unowned)
+        duplicated = tuple(
+            sorted(
+                "::".join(node)
+                for node, reason in outcomes.items()
+                if reason is None and owners[node] is not None
+            )
+        )
+        if duplicated and not native_stage_ran:
+            raise OwnershipRefusal("native_test_ran_in_default", duplicated)
     owned = sum(owner is not None for owner in owners.values())
     skipped = sum(reason is not None for reason in outcomes.values())
     print(
