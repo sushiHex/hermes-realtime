@@ -272,8 +272,102 @@ def test_live_listener_requires_the_retained_owner_and_exact_loopback_port() -> 
         _require_owned_listener(port, os.getpid())
         with pytest.raises(ValueError):
             _require_owned_listener(port, os.getpid() + 1)
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            accepted, _ = listener.accept()
+            with accepted:
+                # The accepted connection shares the port but is not a listener.
+                _require_owned_listener(port, os.getpid())
     with pytest.raises(ValueError):
         _require_owned_listener(port, os.getpid())
+    with socket.socket() as bound_only:
+        bound_only.bind(("127.0.0.1", 0))
+        with pytest.raises(ValueError):
+            _require_owned_listener(bound_only.getsockname()[1], os.getpid())
+
+
+_PORT = 47_123
+_PID = 4_242
+
+
+def _listener_row(
+    address: str = "127.0.0.1",
+    port: int = _PORT,
+    pid: int = _PID,
+    *,
+    state: int = 0,
+    remote_address: int = 0,
+    remote_port: int = 0,
+) -> bytes:
+    import socket
+    import struct
+
+    local_address = int.from_bytes(socket.inet_aton(address), "little")
+    return struct.pack(
+        "<6I", state, local_address, socket.htons(port), remote_address, remote_port, pid
+    )
+
+
+def _listener_table(*rows: bytes, count: int | None = None) -> bytes:
+    import struct
+
+    return struct.pack("<I", len(rows) if count is None else count) + b"".join(rows)
+
+
+@pytest.mark.parametrize("state", [0, 1, 2, 6])
+def test_listener_table_owner_decides_listeners_without_trusting_the_row_state(
+    state: int,
+) -> None:
+    from scripts.equivalence_process import _require_owned_listener_table
+
+    _require_owned_listener_table(
+        _listener_table(
+            _listener_row("0.0.0.0", _PORT + 1, _PID + 7), _listener_row(state=state)
+        ),
+        _PORT,
+        _PID,
+    )
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        _listener_table(),
+        _listener_table(_listener_row(pid=_PID + 1)),
+        _listener_table(_listener_row("0.0.0.0")),
+        _listener_table(_listener_row("192.0.2.10")),
+        _listener_table(_listener_row(), _listener_row("192.0.2.10", pid=_PID + 1)),
+        _listener_table(_listener_row(), _listener_row()),
+        _listener_table(_listener_row(remote_address=0x0100007F)),
+        _listener_table(_listener_row(remote_port=0x5000)),
+    ],
+    ids=[
+        "empty",
+        "wrong_pid",
+        "wildcard_address",
+        "other_interface",
+        "second_listener_elsewhere",
+        "duplicate_row",
+        "remote_address",
+        "remote_port",
+    ],
+)
+def test_listener_table_refuses_anything_but_one_owned_loopback_listener(table: bytes) -> None:
+    from scripts.equivalence_process import _require_owned_listener_table
+
+    with pytest.raises(ValueError, match="not the retained loopback LiveKit process"):
+        _require_owned_listener_table(table, _PORT, _PID)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [b"", b"\x01\x00\x00", _listener_table(_listener_row(), count=2)],
+    ids=["no_count", "short_count", "count_exceeds_rows"],
+)
+def test_listener_table_refuses_a_truncated_table(table: bytes) -> None:
+    from scripts.equivalence_process import _require_owned_listener_table
+
+    with pytest.raises(ValueError, match="truncated"):
+        _require_owned_listener_table(table, _PORT, _PID)
 
 
 def test_server_environment_preserves_windows_system_keys_without_inheriting_host_authority() -> (
