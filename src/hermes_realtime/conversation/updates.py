@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -253,9 +254,14 @@ class ConversationUpdateDirector:
         max_audit_records: int = 256,
         policy_timeout_ms: int = 1000,
         cleanup_timeout_ms: int = 1000,
+        on_latched: Callable[[], None] | None = None,
     ) -> None:
         if type(context) is not ConversationContextStore:
             raise TypeError("context must be an exact ConversationContextStore")
+        if on_latched is not None and not callable(on_latched):
+            raise TypeError("on_latched must be callable or None")
+        # Told once when a failure latches this director; closing it is not a failure.
+        self._on_latched = on_latched
         if type(completions) is not ConversationTaskController:
             raise TypeError(
                 "completions must be an exact ConversationTaskController"
@@ -658,6 +664,8 @@ class ConversationUpdateDirector:
                     self._unresolved.append(_trusted_unresolved(unresolved))
                 self._error = error
                 self._condition.notify_all()
+                if not self._closed and self._on_latched is not None:
+                    self._on_latched()
 
     async def _retain_unresolved(self, unresolved: UnresolvedUpdate) -> None:
         trusted = _trusted_unresolved(unresolved)

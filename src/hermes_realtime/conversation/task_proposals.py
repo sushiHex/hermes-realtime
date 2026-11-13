@@ -15,6 +15,7 @@ from typing import Literal, Protocol
 
 from .work_tools import (
     _UNAVAILABLE_REASON,
+    WORK_CONTROL_UNAVAILABLE_NOTICE,
     WorkCommandAdmission,
     WorkStartResult,
     _validate_exact_text,
@@ -288,8 +289,7 @@ class ConversationTaskProposals:
             try:
                 self._observer("task_state", {
                     "status": "rejected", "taskId": None,
-                    "reason": "Task control is unavailable. "
-                    "Restart the session before trying again.",
+                    "reason": WORK_CONTROL_UNAVAILABLE_NOTICE,
                 })
             finally:
                 self._evidence("automatic_unavailable")
@@ -310,8 +310,7 @@ class ConversationTaskProposals:
         if not result.accepted and result.task_id is None and result.reason == _UNAVAILABLE_REASON:
             try:
                 self._observer("task_state", {"status": "rejected", "taskId": None,
-                    "reason": "Task control is unavailable. "
-                    "Restart the session before trying again."})
+                    "reason": WORK_CONTROL_UNAVAILABLE_NOTICE})
             finally:
                 self._evidence("automatic_unavailable")
         return result

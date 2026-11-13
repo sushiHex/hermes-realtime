@@ -57,6 +57,9 @@ WORK_ROUTING_POLICY = (
 
 _MAX_REASON_CHARS = 1024
 _UNAVAILABLE_REASON = "work control unavailable; restart required"
+# What the user is shown for it. The health below belongs to the host and is not resettable,
+# so the sentence must not promise that restarting a session clears it.
+WORK_CONTROL_UNAVAILABLE_NOTICE = "Task control is unavailable until the host restarts."
 _NO_ACTIVE_REASON = "no active work"
 _CAPACITY_REASON = "background task capacity exhausted"
 _AMBIGUOUS_ACTIVE_REASON = "multiple active tasks; specify task_id"

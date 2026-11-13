@@ -395,6 +395,14 @@ From the host:
   `refusal: malformed`.
 - `[hermes-dispatch-recovery]`: a dispatch got no complete answer and its resend did not settle
   it; `cause` says why.
+- `[host-fatal-exit]`: the host ended itself because something that lives as long as it does
+  can no longer work. `cause` is `task_control` (a task dispatch or its bookkeeping failed in
+  a way only a restart settles), `update_director`, `update_executor`, or `foreground_adapter`
+  (the Codex child died or stopped answering). `input` says whether input was stopped and
+  `flush` whether the saved conversation was written first (`done`, `failed`, `timeout`, or
+  `absent` when none is configured). The host then exits with status 75 without closing its
+  components, so the run record still names any task it left running; the next start stops
+  that task and says so once. Start the host again.
 - `[codex-session-auth]`: the Codex sign-in is unusable (`malformed`) or about to expire
   (`expiring`); run `codex` once.
 - `[codex-tool-refusal]`: natural work tools only; not expected in this profile.

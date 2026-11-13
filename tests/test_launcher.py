@@ -3920,3 +3920,177 @@ async def test_full_host_replacement_worker_rebinds_proposal_authority(
     finally:
         await runtime.close()
         await launcher.close()
+
+
+class _HostFatalProbe:
+    """Record the real host's one fatal-exit owner; only the process exit is replaced."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, harness: _FullHostHarness) -> None:
+        self.exits: list[int] = []
+        self.causes: list[str] = []
+        self.owner: host_launcher_module.HostFatalExit | None = None
+        self.inference_options: dict[str, Any] = {}
+        self.conversation_options: dict[str, Any] = {}
+        events = harness.events
+        probe = self
+        real_owner = host_launcher_module.HostFatalExit
+
+        class RecordingOwner(real_owner):  # type: ignore[misc, valid-type]
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(**kwargs, exit_process=probe._exit)
+                probe.owner = self
+
+            def reporter(self, cause: str) -> Any:
+                probe.causes.append(cause)
+                return super().reporter(cause)
+
+        class RuntimeStub:
+            async def start(self) -> str:
+                events.append("runtime:start")
+                return "http://127.0.0.1:8765/#bootstrap=private"
+
+            async def close_ingress(self) -> None:
+                events.append("ingress:closed")
+
+            async def close(self) -> None:
+                return None
+
+        class ConversationStub:
+            def __init__(self, **kwargs: Any) -> None:
+                probe.conversation_options.update(kwargs)
+
+            async def activate_media(self, **_kwargs: object) -> None:
+                return None
+
+            async def close_binding(self) -> None:
+                events.append("binding:closed")
+
+        class InferenceStub:
+            async def cancel(self, turn_id: str) -> None:
+                del turn_id
+
+            async def close(self) -> None:
+                return None
+
+        def capture_inference(**kwargs: Any) -> InferenceStub:
+            probe.inference_options.update(kwargs)
+            return InferenceStub()
+
+        self._events = events
+        monkeypatch.setattr(host_launcher_module, "HostFatalExit", RecordingOwner)
+        monkeypatch.setattr(
+            host_launcher_module, "BrowserClientRuntime", lambda **_kwargs: RuntimeStub()
+        )
+        monkeypatch.setattr(
+            host_launcher_module, "ReconnectSafeConversationWorker", ConversationStub
+        )
+        monkeypatch.setattr(host_launcher_module, "_build_streaming_inference", capture_inference)
+
+    def _exit(self, status: int) -> None:
+        self._events.append("exit")
+        self.exits.append(status)
+
+
+@pytest.mark.asyncio
+async def test_full_host_ends_itself_when_its_task_controller_latches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_realtime.integration.voice_tail import parse_voice_tail
+
+    path = tmp_path / "voice-tail-v1.json"
+    harness = _FullHostHarness(monkeypatch)
+    probe = _HostFatalProbe(monkeypatch, harness)
+    launcher = harness.build(voice_tail=path)
+
+    await launcher.start()
+    try:
+        owner = probe.owner
+        assert owner is not None and harness.context is not None
+        # One owner, and every host-lifetime holder was handed its own fixed cause.
+        assert probe.causes == [
+            "task_control", "foreground_adapter", "update_director", "update_executor",
+        ]
+        controller = harness.router["surface"]._controller
+        actions = probe.conversation_options["actions"]
+        assert callable(controller._on_latched)
+        assert callable(actions._on_latched) and callable(actions._director._on_latched)
+        assert callable(probe.inference_options["on_latched"])
+        harness.context.record_user_transcript(
+            Transcript(text="Saved before the fault", final=True)
+        )
+        capsys.readouterr()
+        del harness.events[:]
+
+        # The work session was never started here, so the dispatch raises: a real latch.
+        with pytest.raises(RuntimeError):
+            await controller.dispatch(objective="Inspect the build", utterance_id="utterance_1")
+        assert owner._operation is not None
+        await asyncio.wait_for(owner._operation, timeout=5)
+
+        assert probe.exits == [host_launcher_module.HOST_FATAL_EXIT_STATUS]
+        assert owner.cause == "task_control"
+        # Input first, then the saved conversation, then the exit; no component close ran.
+        assert harness.events == ["ingress:closed", "binding:closed", "tail:close", "exit"]
+        lines = [
+            line for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[host-fatal-exit]")
+        ]
+        assert lines == [
+            '[host-fatal-exit] {"cause":"task_control","flush":"done","input":"done",'
+            '"version":1}'
+        ]
+        saved = parse_voice_tail(path.read_bytes(), max_messages=16, max_item_chars=1024)
+        assert saved is not None
+        assert [(row.role, row.text) for row in saved.conversation.messages] == [
+            ("user", "Saved before the fault")
+        ]
+    finally:
+        await launcher.close()
+    assert probe.exits == [host_launcher_module.HOST_FATAL_EXIT_STATUS]
+
+
+@pytest.mark.asyncio
+async def test_full_host_reports_no_fatal_exit_before_it_serves_or_after_it_closes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    harness = _FullHostHarness(monkeypatch)
+    probe = _HostFatalProbe(monkeypatch, harness)
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json")
+    owner = probe.owner
+    assert owner is not None
+
+    # Built but not serving: a failed start is reported by the start.
+    owner.reporter("foreground_adapter")()
+    assert owner._operation is None
+
+    await launcher.start()
+    await launcher.close()
+    # An orderly shutdown owns the exit; a latch tripped by it must not replace it.
+    owner.reporter("task_control")()
+    await asyncio.sleep(0)
+
+    assert owner._operation is None and owner.cause is None
+    assert probe.exits == []
+    assert "actions:closed" in harness.events
+
+
+def test_codex_selection_hands_the_adapter_its_latch_observer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_codex(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    def report() -> None:
+        return None
+
+    monkeypatch.setattr(host_launcher_module, "CodexAppServerStreamingInference", fake_codex)
+    _build_streaming_inference(
+        inference_provider="codex", ollama_base_url="http://127.0.0.1:11434",
+        ollama_model="unused", codex_model="gpt-5.6-terra", codex_effort="low",
+        codex_executable=None, on_latched=report,
+    )
+
+    assert captured["on_latched"] is report

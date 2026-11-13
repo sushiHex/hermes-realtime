@@ -22,7 +22,7 @@ from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID
 from .context import ActiveTaskIdentityError, PrivateRunDisclosureError
 from .task_proposals import ConversationTaskProposals
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
-from .work_tools import WorkCommandAdmission
+from .work_tools import WORK_CONTROL_UNAVAILABLE_NOTICE, WorkCommandAdmission
 
 _COMMAND_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,110}\Z")
 _MAX_OBJECTIVE_CHARS = 1024
@@ -360,7 +360,7 @@ class ConversationTaskCommandRouter:
             raise TypeError("work surface returned the wrong command admission")
         if admission is WorkCommandAdmission.UNAVAILABLE:
             self._publish_invalid(
-                reason="Task control is unavailable. Restart the session before trying again.",
+                reason=WORK_CONTROL_UNAVAILABLE_NOTICE,
                 category="work-control-unavailable",
             )
         if admission is not WorkCommandAdmission.ADMITTED:

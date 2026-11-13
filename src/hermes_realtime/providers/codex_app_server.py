@@ -683,7 +683,15 @@ class CodexAppServerStreamingInference:
         hermes_context: HermesRepresentativeContext | None = None,
         background_tools: Callable[[], tuple[str, ...] | None] | None = None,
         output_style: Callable[[], str] | None = None,
+        on_latched: Callable[[], None] | None = None,
     ) -> None:
+        if on_latched is not None and not callable(on_latched):
+            raise TypeError("on_latched must be callable or None")
+        # Told once when this adapter can serve no further turn: it closed itself after a
+        # failed send or receipt, or a turn found its reader dead. Its own close is not that.
+        self._on_latched = on_latched
+        self._latch_reported = False
+        self._close_requested = False
         if output_style is not None and not callable(output_style):
             raise TypeError("output_style must be callable")
         self._output_style = output_style or (lambda: "default")
@@ -1761,9 +1769,16 @@ class CodexAppServerStreamingInference:
                 and operation.exception() is None
             ):
                 return
+            self._close_requested = True
             if operation is None or operation.done():
                 operation = self._begin_close()
         await asyncio.shield(operation)
+
+    def _report_latch(self) -> None:
+        if self._close_requested or self._latch_reported or self._on_latched is None:
+            return
+        self._latch_reported = True
+        self._on_latched()
 
     def _begin_close(self) -> asyncio.Task[None]:
         """Close the adapter without awaiting it, so a failing sender never waits on itself.
@@ -1775,6 +1790,8 @@ class CodexAppServerStreamingInference:
         """
 
         self._closed = True
+        # Reached without close() only from a failed send or status receipt.
+        self._report_latch()
         operation = self._close_operation
         if operation is None or operation.done():
             operation = asyncio.create_task(self._close_owned(), name="codex-app-server-close")
@@ -1956,6 +1973,7 @@ class CodexAppServerStreamingInference:
                 except asyncio.CancelledError as exc:
                     raise RuntimeError("Codex app-server reader stopped") from exc
                 self._reader_failure_observed = True
+                self._report_latch()
                 raise RuntimeError("Codex app-server reader failed") from reader_error
             future.cancel()
             raise TimeoutError(f"Codex app-server {method} timed out")
