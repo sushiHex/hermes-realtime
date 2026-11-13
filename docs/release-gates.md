@@ -678,7 +678,10 @@ try {
     Start-Sleep -Seconds 1
   }
   if (-not $ready) { throw 'LiveKit did not become ready on loopback' }
-  $listeners = @(Get-NetTCPConnection -LocalPort 7880 -State Listen -ErrorAction Stop)
+  # Keep only rows with a real owner: some Windows builds report closed connections as
+  # Listen with owner 0 (#515).
+  $listeners = @(Get-NetTCPConnection -LocalPort 7880 -State Listen -ErrorAction Stop |
+    Where-Object OwningProcess -ne 0)
   if ($listeners.Count -ne 1 -or $listeners[0].LocalAddress -ne '127.0.0.1' -or
       $listeners[0].OwningProcess -ne $process.Id) {
     throw 'LiveKit signaling listener is not the owned loopback process'
