@@ -96,6 +96,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "cpu-readiness": {
         "scripts/qualification_cpu_readiness.py": 1,
     },
+    "declared-tool-path": {
+        "scripts/release_gate.py": 1,
+    },
     "desktop-mvp-cleanup": {
         "scripts/rehearse_desktop_mvp.py": 1,
     },
@@ -195,6 +198,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     },
     "history-capacity": {
         "web/src/main.ts": 1,
+    },
+    "host-fatal-exit": {
+        "src/hermes_realtime/host_launcher.py": 1,
     },
     "host-speech": {
         "src/hermes_realtime/conversation/streaming.py": 2,
@@ -354,6 +360,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
         "src/hermes_realtime/client/http.py": 1,
         "src/hermes_realtime/client/session.py": 1,
     },
+    "pinned-input": {
+        "scripts/local_livekit.py": 1,
+    },
     "playback-volume-preference": {
         "web/src/playback-volume.ts": 1,
     },
@@ -435,14 +444,23 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "task-proposal-protocol": {
         "web/src/protocol.ts": 1,
     },
+    "task-result-admission": {
+        "src/hermes_realtime/conversation/tasks.py": 1,
+    },
     "task-result-display": {
         "src/hermes_realtime/conversation/result_projection.py": 1,
+    },
+    "task-result-projection": {
+        "src/hermes_realtime/client/projection.py": 1,
     },
     "task-result-refusal": {
         "src/hermes_realtime/conversation/tasks.py": 1,
     },
     "task-start-policy": {
         "src/hermes_realtime/conversation/task_proposals.py": 1,
+    },
+    "test-ownership": {
+        "scripts/release_gate.py": 1,
     },
     "voice-archive": {
         "src/hermes_realtime/companion/archive.py": 1,
@@ -543,6 +561,11 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
             "failure: class-name: type(error).__name__",
         ),
     },
+    "scripts/local_livekit.py": {
+        "pinned-input": (
+            "category: call: verify_upstream(fetch=_download)",
+        ),
+    },
     "scripts/lookup_backend_gateway.py": {
         "lookup-transport-refusal": (
             "callerCategory: call: denial_caller_category()",
@@ -584,6 +607,7 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
     "scripts/preview_cutover.py": {
         "voice-preview": (
             "*: call: _failure_status(error)",
+            "*: call: adopt_state(args.plan, args.source)",
             "*: call: launch_preview(args.active)",
             "*: call: make_speech_receipt(load_plan(args.plan))",
             "*: call: preflight(plan, args.home)",
@@ -609,7 +633,6 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
             "*: call: build_report(rows, fixture_version=args.fixture_version)",
             "codex_effort: attribute: args.codex_effort",
             "inference_provider: attribute: args.inference_provider",
-            "model: attribute: args.model",
             "model_digest: attribute: args.model_digest",
             "source_binding.codex_executable_sha256: attribute: args.codex_executable_sha256",
             "source_binding.probe_sha256: call: harness.digest(Path(__file__))",
@@ -803,8 +826,16 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
             "category: call: take_rehearsal_lock()",
             "notes.missing: call: preflight(args.ollama_model)",
             "outcomes: other: {str(record['step']): record['outcome'] for record in rehearsal.re~",
-            "run_dir: attribute: run_dir.name",
             "stand_in_requests: attribute: rehearsal.stand_in.requests",
+        ),
+    },
+    "scripts/release_gate.py": {
+        "declared-tool-path": (
+            "refusal: bound: refusal",
+        ),
+        "test-ownership": (
+            "refusal: bound: refusal",
+            "tests: bound: tests",
         ),
     },
     "scripts/setup_lookup_backend.py": {
@@ -826,6 +857,19 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
     "src/hermes_realtime/client/http.py": {
         "output-style": (
             "category: subscript: stage[0]",
+        ),
+    },
+    "src/hermes_realtime/client/projection.py": {
+        "task-result-projection": (
+            "kind: argument: kind",
+            "kind: bound: kind",
+            "kind: subscript: key[0]",
+            "limit: name: MAX_COMPLETED_RESULT_CHARS",
+            "limit: name: MAX_LEGACY_RESULT_CHARS",
+            "status: subscript: data['status']",
+            "units: call: measure(text)",
+            "units: name: MAX_COMPLETED_RESULT_CHARS",
+            "units: name: MAX_LEGACY_RESULT_CHARS",
         ),
     },
     "src/hermes_realtime/client/runtime.py": {
@@ -876,6 +920,13 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
             "failure_kind: call: next((label for cls, label in ((ValueError, 'value'), (TypeErro~",
         ),
     },
+    "src/hermes_realtime/conversation/tasks.py": {
+        "task-result-admission": (
+            "category: bound: category",
+            "field: bound: field",
+            "source: attribute: update.payload.status.value",
+        ),
+    },
     "src/hermes_realtime/conversation/work_tools.py": {
         "task-command-refused": (
             "category: attribute: admission.refusal_category",
@@ -892,6 +943,13 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
         ),
     },
     "src/hermes_realtime/host_launcher.py": {
+        "host-fatal-exit": (
+            "cause: attribute: self._cause",
+            "flush: bound: flushed",
+            "flush: other: await self._bounded(self._flush_conversation, self._flush_seconds)",
+            "input: bound: stopped",
+            "input: other: await self._bounded(self._stop_input, self._input_stop_seconds)",
+        ),
         "qualification-checkpoint": (
             "cleanup: other: [stage for stage, _ in cleanup_failures]",
             "host_exit: call: _host_exit_category(host_error)",
@@ -912,7 +970,7 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "src/hermes_realtime/integration/codex_access_credentials.py": {
         "codex-access-credential": (
-            "category: text: str(error)",
+            "category: attribute: error.category",
         ),
     },
     "src/hermes_realtime/integration/evidence_presentation.py": {
@@ -923,26 +981,26 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
     "src/hermes_realtime/integration/voice_archive.py": {
         "voice-archive-send": (
             "cause: class-name: type(error).__name__",
-            "fence: attribute: reply.category",
-            "transient: attribute: reply.category",
+            "fence: call: voice_refusal_label(reply.category)",
+            "transient: call: voice_refusal_label(reply.category)",
         ),
     },
     "src/hermes_realtime/integration/voice_forget.py": {
         "voice-forget-send": (
             "cause: class-name: type(error).__name__",
-            "outcome: attribute: reply.category",
+            "outcome: call: voice_refusal_label(reason)",
         ),
     },
     "src/hermes_realtime/integration/voice_memory.py": {
         "voice-memory-receive": (
             "cause: class-name: type(error).__name__",
-            "refusal: attribute: event.category",
+            "refusal: call: voice_refusal_label(event.category)",
         ),
     },
     "src/hermes_realtime/integration/voice_review.py": {
         "voice-review-send": (
             "cause: class-name: type(error).__name__",
-            "refusal: attribute: reply.category",
+            "refusal: call: voice_refusal_label(reply.category)",
         ),
     },
     "src/hermes_realtime/livekit/adapter.py": {
@@ -1101,58 +1159,18 @@ NEVER_WRITTEN: set[str] = {
 
 # Entries of ``UNPROVEN_VALUES`` that were read in source and are free strings: text that a
 # caller, a peer or another package chooses. (file, marker, entry) -> what the text is.
-# The rest of that table is unread; most of it is numbers and fixed labels the scan cannot
-# follow. An entry leaves both tables in the change that removes the flow.
-_WIRE = "a category string the bridge peer sends, bounded by shape and not by a vocabulary"
+# The rest of that table is not cleared by being absent here: most of it is numbers and fixed
+# labels the scan cannot follow, and some was not read. An entry leaves both tables in the
+# change that removes the flow.
 KNOWN_FREE_STRINGS: dict[tuple[str, str, str], str] = {
-    (
-        "src/hermes_realtime/integration/voice_archive.py",
-        "voice-archive-send",
-        "fence: attribute: reply.category",
-    ): _WIRE,
-    (
-        "src/hermes_realtime/integration/voice_archive.py",
-        "voice-archive-send",
-        "transient: attribute: reply.category",
-    ): _WIRE,
-    (
-        "src/hermes_realtime/integration/voice_forget.py",
-        "voice-forget-send",
-        "outcome: attribute: reply.category",
-    ): _WIRE,
-    (
-        "src/hermes_realtime/integration/voice_memory.py",
-        "voice-memory-receive",
-        "refusal: attribute: event.category",
-    ): _WIRE,
-    (
-        "src/hermes_realtime/integration/voice_review.py",
-        "voice-review-send",
-        "refusal: attribute: reply.category",
-    ): _WIRE,
-    (
-        "src/hermes_realtime/integration/codex_access_credentials.py",
-        "codex-access-credential",
-        "category: text: str(error)",
-    ): "an exception message; every raise site passes a fixed token today",
-    (
-        "scripts/probe_confirmed_natural_work.py",
-        "confirmed-natural-probe",
-        "model: attribute: args.model",
-    ): "a model name from the command line",
-    (
-        "scripts/probe_confirmed_natural_work.py",
-        "confirmed-natural-probe",
-        "inference_provider: attribute: args.inference_provider",
-    ): "a provider name from the command line",
-    (
-        "scripts/rehearse_desktop_mvp.py",
-        "desktop-mvp-rehearsal",
-        "run_dir: attribute: run_dir.name",
-    ): "the name of a directory the caller chooses",
     (
         "scripts/qualify_hermes_continuity.py",
         "hermes-continuity-ready",
         "version: attribute: hermes_cli.__version__",
     ): "a version string from another package",
+    (
+        "scripts/release_gate.py",
+        "declared-tool-path",
+        "refusal: bound: refusal",
+    ): "the class name of any exception that is not the guard's own refusal",
 }
