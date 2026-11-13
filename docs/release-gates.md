@@ -110,6 +110,32 @@ packaged producers verify the wheel digest and every runtime source blob,
 then execute the unpacked pure wheel in an owned process. These packaged
 scenarios do not establish the full installed dependency or physical matrix.
 
+Both jobs that need the LiveKit server first try to restore its release archive
+from the Actions cache, under a key that names the pinned version and the pinned
+archive SHA-256. The cache is transport only. GitHub's
+[dependency caching reference](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
+states that cache contents "are not signed or verified", so the install step
+applies one SHA-256 comparison to the archive whether it was restored or
+downloaded, and fails on a mismatch without downloading a replacement. On a miss
+the step downloads the archive with the same bounded retry as before. The cache
+action saves the archive when the job ends, and only if the job succeeded, which
+includes that comparison. A failure of the cache step falls back to the download
+and does not fail the job. A pull request can read a cache saved by a `main` run
+or by its own earlier runs, not one saved by another pull request, and GitHub
+removes an entry that no run has read for seven days, so the first run after
+either still downloads. Changing the pinned version or digest changes the key.
+The repository's allowed actions include `actions/cache`, pinned here by commit
+like the others.
+
+While the cache answers, the release gates no longer show that the upstream
+release still exists and still matches its pin. The scheduled
+[pinned-inputs workflow](../.github/workflows/pinned-inputs.yml) downloads it
+from upstream once a week without the cache, through
+`python -m scripts.local_livekit verify-upstream`, and prints one
+`[pinned-input]` line whose category is `verified`, `pin_mismatch` or
+`download_unavailable`. It is not a required check and never runs on a pull
+request.
+
 The `native-livekit` job downloads the documented Windows LiveKit 1.13.4
 binary, verifies its SHA-256, starts it on `127.0.0.1` in development mode, and
 then runs the native local LiveKit, browser LiveKit, and local launcher tests.

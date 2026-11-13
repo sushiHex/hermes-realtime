@@ -17,7 +17,6 @@ import aiohttp
 from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
 from hermes_realtime.conversation.streaming import (
-    AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
     ModelOutputRefused,
 )
@@ -26,6 +25,7 @@ from hermes_realtime.conversation.task_proposals import (
     HostTaskProposalRequest,
 )
 from hermes_realtime.conversation.task_status import HostSpeechRequest
+from hermes_realtime.conversation.turn import foreground_turn, turn_routes
 from hermes_realtime.conversation.work_tools import (
     WORK_OBJECTIVE_CONTEXT_POLICY,
     WORK_ROUTING_POLICY,
@@ -384,19 +384,10 @@ class OllamaStreamingInference:
         turn_id: str,
     ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]:
         style = require_output_style(self._output_style())
-        accepted_ack = type(snapshot) is AcceptedStartInferenceRequest
-        accepted_objective: str | None = None
+        turn = foreground_turn(snapshot)
+        accepted_objective = turn.accepted_objective
+        accepted_ack = accepted_objective is not None
         if accepted_ack:
-            snapshot = AcceptedStartInferenceRequest(
-                revision=snapshot.revision, messages=snapshot.messages,
-                active_tasks=snapshot.active_tasks,
-                terminal_task_count=snapshot.terminal_task_count, memory=snapshot.memory,
-                task_id=cast(AcceptedStartInferenceRequest, snapshot).task_id,
-                recent_task_results=snapshot.recent_task_results,
-            )
-            accepted_objective = next(
-                task.objective for task in snapshot.active_tasks if task.task_id == snapshot.task_id
-            )
             snapshot = ConversationContextSnapshot(
                 revision=snapshot.revision, messages=snapshot.messages,
                 active_tasks=snapshot.active_tasks,
@@ -419,14 +410,14 @@ class OllamaStreamingInference:
                 raise RuntimeError("Ollama stream capacity exhausted")
             await self._ensure_context_contract_locked()
             handler = None if accepted_ack else self._work_tool_handler
-            can_start = (
-                handler is not None
-                and type(snapshot) is ConversationInferenceRequest
-                and bool(snapshot.messages)
-                and snapshot.messages[-1].role == "user"
+            # This adapter has no lookup and makes no private-material check.
+            routes = turn_routes(
+                turn, work_bound=handler is not None, private_material=False,
+                lookup_attempted=False, start_requires_admission=True,
             )
+            can_start = routes.start_work
             messages = self._messages(
-                snapshot, output_style=style, task_status_available=can_start,
+                snapshot, output_style=style, task_status_available=routes.task_status,
                 accepted_objective=accepted_objective,
             )
             body: dict[str, object] = {
@@ -995,8 +986,7 @@ class OllamaStreamingInference:
                  "status": item.status, "text": item.text}
                 for item in snapshot.updates
             ]
-        host_indices = [index for index, message in enumerate(snapshot.messages)
-                        if message.source in {"host_task_status", "host_task_proposal"}]
+        host_indices = snapshot.host_speech_message_indices
         if host_indices:
             sections["host_speech_message_indices"] = host_indices
         interrupted_indices = [

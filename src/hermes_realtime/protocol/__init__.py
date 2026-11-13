@@ -15,6 +15,7 @@ from .events import (
     VOICE_REFUSAL_CATEGORIES,
     VOICE_REVIEW_CAPABILITY,
     VOICE_TRANSIENT_REFUSALS,
+    VOICE_UNLISTED_REFUSAL,
     CancelScope,
     ControlCancelAcknowledgedEvent,
     ControlCancelAcknowledgedPayload,
@@ -46,6 +47,7 @@ from .events import (
     WorkTerminalStatus,
     parse_event,
     parse_voice_event,
+    voice_refusal_label,
 )
 
 __all__ = [
@@ -69,6 +71,7 @@ __all__ = [
     "VOICE_INTEGRITY_REFUSALS",
     "VOICE_REFUSAL_CATEGORIES",
     "VOICE_TRANSIENT_REFUSALS",
+    "VOICE_UNLISTED_REFUSAL",
     "CancelScope",
     "ControlCancelAcknowledgedEvent",
     "ControlCancelAcknowledgedPayload",
@@ -94,4 +97,5 @@ __all__ = [
     "WorkTerminalStatus",
     "parse_event",
     "parse_voice_event",
+    "voice_refusal_label",
 ]
