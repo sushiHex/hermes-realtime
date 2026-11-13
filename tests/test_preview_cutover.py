@@ -2177,6 +2177,19 @@ async def test_adopt_refuses_a_source_that_changed_underneath_it(tmp_path, monke
     with pytest.raises(preview_cutover.PreviewRefusal, match="adopt_source_changed"):
         preview_cutover.adopt_state(plan_path, source)
 
+    # The store holds a snapshot the source has moved past, so it stays the adoption's:
+    # no host may start on it, and adopting again from the settled source replaces it.
+    plan = preview_cutover.load_plan(plan_path)
+    assert (plan.state_root / "adoption.private.json").is_file()
+    with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_incomplete"):
+        preview_cutover._require_state_root_available(plan)
+    monkeypatch.setattr(run_record, "write_run_record", write)
+    result = preview_cutover.adopt_state(plan_path, source)
+    assert result["already_adopted"] is False
+    assert result["sha256"] == _sha256(source / "state" / _TAIL)
+    assert (plan.state_root / _TAIL).read_bytes() == (source / "state" / _TAIL).read_bytes()
+    assert not (plan.state_root / "adoption.private.json").exists()
+
 
 def test_adopt_refuses_a_store_that_does_not_hold_what_was_read(tmp_path, monkeypatch):
     import asyncio
