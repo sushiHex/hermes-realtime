@@ -404,16 +404,22 @@ It reads `state\voice-tail-v1.json` and, when present, its forget record from th
 source run, and never modifies that run. It refuses when either host lock of the
 source is held (`adopt_source_held`), when the store's lock is held
 (`state_root_held`), and when the store already holds anything other than this same
-adoption (`state_root_not_empty`). It writes the forget record first and then the
-tail, each through a temporary file, `fsync` and an atomic replace under the
-store's lock, then checks both hashes and that the source did not change.
+adoption (`state_root_not_empty`). Under the store's lock it writes a marker
+(`adoption.private.json`), then the forget record, then the tail, each through a
+temporary file, `fsync` and an atomic replace. It then checks both hashes and that the
+source did not change, and removes the marker.
+
+While the marker is there the store belongs to the adoption: `serve` refuses with
+`state_root_incomplete`, and running `adopt-state` again completes it, from the same
+source or another. Nothing is inferred from which records exist. A host killed
+between writing its forget record and its tail, even on a first run before any tail
+exists, leaves a store the next host opens and completes; no command is needed.
 
 | Killed | Left in the store | Next step |
 | --- | --- | --- |
-| Before any write | Nothing but the lock file | Run it again |
-| During a write | An unfinished temporary | Run it again; the temporary is removed |
-| After the forget record, before the tail | The forget record alone. `serve` refuses with `state_root_incomplete` | Run it again; it completes |
-| After the tail | Everything | Run it again; it reports `already_adopted` |
+| Before the marker | Nothing but the lock file, or an unfinished temporary | Run it again |
+| After the marker, at any later point | The marker, and whatever was written so far | Run it again; it completes and removes the marker |
+| After the marker is removed | The adopted conversation | Nothing. Running it again reports `already_adopted` |
 
 The source run keeps its copy. Do not adopt it into a second `state_root`.
 

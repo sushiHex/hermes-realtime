@@ -1585,7 +1585,10 @@ async def test_a_killed_owner_leaves_a_root_the_next_run_acquires_with_the_tail_
     [
         ("root_is_a_file", "state_root_directory"),
         ("lock_is_a_directory", "state_root_lock_file"),
-        ("deletes_without_tail", "state_root_incomplete"),
+        ("adoption_in_progress", "state_root_incomplete"),
+        ("adoption_in_progress_with_both_records", "state_root_incomplete"),
+        # A host killed between its two writes leaves this, and the next host completes it.
+        ("deletes_without_tail", None),
         ("empty_directory", None),
         ("tail_only", None),
         ("tail_and_deletes", None),
@@ -1600,10 +1603,13 @@ def test_state_root_is_checked_before_a_run_owns_anything(tmp_path, fault, categ
         root.mkdir()
     if fault == "lock_is_a_directory":
         (root / (_TAIL + ".lock")).mkdir()
-    if fault in {"deletes_without_tail", "tail_and_deletes"}:
+    both = fault in {"tail_and_deletes", "adoption_in_progress_with_both_records"}
+    if both or fault == "deletes_without_tail":
         (root / _DELETES).write_text("{}", encoding="utf-8")
-    if fault in {"tail_only", "tail_and_deletes"}:
+    if both or fault == "tail_only":
         (root / _TAIL).write_text("{}", encoding="utf-8")
+    if fault.startswith("adoption_in_progress"):
+        (root / "adoption.private.json").write_bytes(b"")
     before = _tree_snapshot(tmp_path)
 
     if category is None:
@@ -1864,6 +1870,9 @@ async def test_adopt_carries_a_saved_conversation_with_its_forget_record(
         "other_tail",
         "other_tail_same_deletes",
         "other_deletes_without_tail",
+        # Byte-equal to the source's, and still a host's own record: without the marker
+        # nothing in a store is taken for an adoption.
+        "same_deletes_without_tail",
         "deletes_the_source_lacks",
         "same_tail_without_the_source_deletes",
         "same_tail_with_other_deletes",
@@ -1884,7 +1893,7 @@ async def test_adopt_refuses_a_state_root_that_holds_anything_else(tmp_path, occ
     other_deletes = voice_deletes_bytes(VoiceDeletes(pending=(("another", 3),)))
     if occupant in {"other_tail", "other_tail_same_deletes"}:
         await _say(root / _TAIL, "synthetic-newer-conversation", "newer")
-    if occupant == "other_tail_same_deletes":
+    if occupant in {"other_tail_same_deletes", "same_deletes_without_tail"}:
         (root / _DELETES).write_bytes((source / "state" / _DELETES).read_bytes())
     if occupant in {"other_deletes_without_tail", "deletes_the_source_lacks",
                     "same_tail_with_other_deletes"}:
@@ -1912,21 +1921,28 @@ async def test_adopt_refuses_a_state_root_that_holds_anything_else(tmp_path, occ
     assert _tree_snapshot(source) == source_before
 
 
+_ADOPTING = "adoption.private.json"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("record", "killed_at"),
+    ("record", "writes", "inside"),
     [
-        ("pending_forget", "before_any_write"),
-        ("pending_forget", "inside_first_write"),
-        ("pending_forget", "between_writes"),
-        ("pending_forget", "after_last_write"),
-        ("none", "before_any_write"),
-        ("none", "inside_first_write"),
-        ("none", "after_last_write"),
+        ("pending_forget", 0, False),
+        ("pending_forget", 1, False),
+        ("pending_forget", 2, False),
+        ("pending_forget", 3, False),
+        ("pending_forget", 0, True),
+        ("pending_forget", 1, True),
+        ("pending_forget", 2, True),
+        ("none", 0, False),
+        ("none", 1, False),
+        ("none", 2, False),
+        ("none", 1, True),
     ],
 )
 async def test_adopt_killed_at_any_step_is_completed_by_running_it_again(
-    tmp_path, monkeypatch, record, killed_at
+    tmp_path, monkeypatch, record, writes, inside
 ):
     from hermes_realtime.integration import run_record
 
@@ -1934,20 +1950,21 @@ async def test_adopt_killed_at_any_step_is_completed_by_running_it_again(
     plan_path = _state_plan(tmp_path)
     plan = preview_cutover.load_plan(plan_path)
     before = _tree_snapshot(source)
+    # The marker first, the forget record before its tail, the marker's removal last.
+    order = [_ADOPTING, *([_DELETES] if record == "pending_forget" else []), _TAIL]
     write = run_record.write_run_record
     written: list[str] = []
 
     def killed(path, data):
-        if killed_at == "inside_first_write" and not written:
-            # The process died after mkstemp wrote plaintext and before the replace.
-            (path.parent / f".{path.name}.abcd1234.tmp").write_bytes(data)
-            raise KeyboardInterrupt
-        if killed_at == "before_any_write" or (killed_at == "between_writes" and written):
+        if len(written) == writes:
+            if inside:
+                # The process died after mkstemp wrote plaintext and before the replace.
+                (path.parent / f".{path.name}.abcd1234.tmp").write_bytes(data)
             raise KeyboardInterrupt
         write(path, data)
         written.append(path.name)
-        if killed_at == "after_last_write" and path.name == _TAIL:
-            # Written and replaced, but never verified or reported.
+        if len(written) == writes == len(order):
+            # Everything is written and replaced, but never verified or reported.
             raise KeyboardInterrupt
 
     monkeypatch.setattr(run_record, "write_run_record", killed)
@@ -1955,26 +1972,22 @@ async def test_adopt_killed_at_any_step_is_completed_by_running_it_again(
         preview_cutover.adopt_state(plan_path, source)
     monkeypatch.setattr(run_record, "write_run_record", write)
 
+    assert written == order[:writes]
     assert _tree_snapshot(source) == before
     present = {item.name for item in plan.state_root.iterdir()} - {_TAIL + ".lock"}
-    first = _DELETES if record == "pending_forget" else _TAIL
-    if killed_at == "before_any_write":
-        assert present == set()
-    elif killed_at == "inside_first_write":
-        assert present == {f".{first}.abcd1234.tmp"}
-    elif killed_at == "between_writes":
-        # Only one order exists: the forget record never trails its tail.
-        assert present == {_DELETES}
+    assert present == set(order[:writes]) | (
+        {f".{order[writes]}.abcd1234.tmp"} if inside else set()
+    )
+    if writes == 0:
+        preview_cutover._require_state_root_available(plan)
     else:
-        assert present == {_TAIL} | ({_DELETES} if record == "pending_forget" else set())
-    if present == {_DELETES}:
-        # A host must not start on the forget record alone and begin a new conversation.
+        # Whatever else is there, the marker is what keeps a host off a store in adoption.
         with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_incomplete"):
             preview_cutover._require_state_root_available(plan)
     # The lock died with the process, so the same command finishes the same adoption.
     result = preview_cutover.adopt_state(plan_path, source)
 
-    assert result["already_adopted"] is (killed_at == "after_last_write")
+    assert result["already_adopted"] is (writes == len(order))
     assert _tree_snapshot(source) == before
     expected = {_TAIL, _TAIL + ".lock"} | ({_DELETES} if record == "pending_forget" else set())
     assert {item.name for item in plan.state_root.iterdir()} == expected
@@ -1983,6 +1996,108 @@ async def test_adopt_killed_at_any_step_is_completed_by_running_it_again(
     assert await _restored(preview_cutover._conversation_store(plan)) == (
         [_SAID] if record == "none" else []
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writes", [1, 2, 3])
+async def test_an_interrupted_adoption_may_be_restarted_from_another_source(
+    tmp_path, monkeypatch, writes
+):
+    from hermes_realtime.integration import run_record
+
+    abandoned = await _saved_run(tmp_path / "run-a", "pending_forget")
+    chosen = tmp_path / "run-b"
+    (chosen / "state").mkdir(parents=True)
+    await _say(chosen / "state" / _TAIL, "synthetic-other-conversation", "other")
+    plan_path = _state_plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    write = run_record.write_run_record
+    written: list[str] = []
+
+    def killed(path, data):
+        write(path, data)
+        written.append(path.name)
+        if len(written) == writes:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(run_record, "write_run_record", killed)
+    with pytest.raises(KeyboardInterrupt):
+        preview_cutover.adopt_state(plan_path, abandoned)
+    monkeypatch.setattr(run_record, "write_run_record", write)
+    before = (_tree_snapshot(abandoned), _tree_snapshot(chosen))
+
+    # While the marker stands no host has opened the store, so its contents are only this
+    # command's and may be replaced. No file has to be removed by hand to change course.
+    result = preview_cutover.adopt_state(plan_path, chosen)
+
+    assert result["already_adopted"] is False
+    assert (_tree_snapshot(abandoned), _tree_snapshot(chosen)) == before
+    assert {item.name for item in plan.state_root.iterdir()} == {_TAIL, _TAIL + ".lock"}
+    preview_cutover._require_state_root_available(plan)
+    assert await _restored(preview_cutover._conversation_store(plan)) == [
+        "synthetic-other-conversation"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store", ["first_run", "holds_a_conversation"])
+async def test_a_host_killed_between_its_forget_record_and_its_tail_never_strands_the_store(
+    tmp_path, monkeypatch, store
+):
+    import asyncio
+
+    from hermes_realtime.conversation import ConversationContextStore
+    from hermes_realtime.integration.run_record import unlock_run_record
+    from hermes_realtime.integration.voice_tail import VoiceTailWriter
+
+    plan_path = _state_plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    tail = preview_cutover._conversation_store(plan)
+    deletes = plan.state_root / _DELETES
+    if store == "holds_a_conversation":
+        await _say(tail, _SAID)
+    host = VoiceTailWriter(tail, conversation_ids=iter(["first", "second"]).__next__)
+    context = ConversationContextStore(on_change=host.update)
+    await host.open(context)
+    # Let the write a restore itself causes land, so the next write is the forget's.
+    for _ in range(500):
+        if not host._dirty and host._written_version == host._version:
+            break
+        await asyncio.sleep(0.01)
+    # A host that has heard nothing has written no tail: the premise this test exists for.
+    assert tail.exists() is (store == "holds_a_conversation")
+    saved = tail.read_bytes() if tail.exists() else None
+    never = asyncio.Event()
+
+    async def killed_before_the_tail_write(_data):
+        await never.wait()
+
+    monkeypatch.setattr(host, "_write", killed_before_the_tail_write)
+    forget = asyncio.create_task(host.request_forget(context))
+    for _ in range(500):
+        if deletes.exists():
+            break
+        await asyncio.sleep(0.01)
+    # The process is gone: its tasks never resume and the kernel releases its lock.
+    forget.cancel()
+    host._task.cancel()
+    await asyncio.gather(forget, host._task, return_exceptions=True)
+    unlock_run_record(host._owner)
+
+    # The forget record landed and the tail did not, on a first run with no tail at all.
+    assert deletes.is_file()
+    assert (tail.read_bytes() if tail.exists() else None) == saved
+    assert not (plan.state_root / _ADOPTING).exists()
+    # Nothing refuses it, and nothing but a host is needed to complete it.
+    preview_cutover._require_state_root_available(plan)
+    assert await _restored(tail) == []
+    assert tail.is_file()
+    preview_cutover._require_state_root_available(plan)
+    assert await _restored(tail) == []
+    # It is a store in use, not an adoption to finish: adopting into it is refused.
+    source = await _saved_run(tmp_path / "stopped-run")
+    with pytest.raises(preview_cutover.PreviewRefusal, match="state_root_not_empty"):
+        preview_cutover.adopt_state(plan_path, source)
 
 
 @pytest.mark.asyncio

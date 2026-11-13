@@ -1517,6 +1517,9 @@ def _previous_dev_readiness(policy: Any, plan: PreviewPlanV1, category: str) -> 
 _TAIL = "voice-tail-v1.json"
 _DELETES = "voice-tail-v1.deletes.json"
 _HOST_LOCKS = ("hermes-runs-v1.json.lock", _TAIL + ".lock")
+# Present in a state root exactly while adopt_state owns its contents.
+_ADOPTING = "adoption.private.json"
+_ADOPTING_RECORD = b'{"category":"adopting","version":1}'
 _MAX_STATE_ENTRIES = 4096
 # Exactly the names run_record.write_run_record creates beside the three host records.
 _STATE_TEMPORARY = re.compile(
@@ -1582,15 +1585,17 @@ def _require_state_root_available(plan: PreviewPlanV1) -> None:
     This only reads, and it is not what keeps two hosts off one conversation: the host
     itself takes the store's lock when it opens the tail and holds it until it closes.
     """
-    tail = _conversation_store(plan)
+    _conversation_store(plan)
     root = plan.state_root
     if _absent(root):
         return  # Genesis: the first host creates the store.
     require(root.is_dir() and not _is_link(root), "state_root_directory")
     _require_host_locks_free(root, (_TAIL + ".lock",), "state_root_lock_file", "state_root_held")
-    # A host writes a forget record only beside a tail it already wrote. Without its tail
-    # the record is an adoption that was interrupted; running it again completes it.
-    require(_absent(root / _DELETES) or not _absent(tail), "state_root_incomplete")
+    # Only an interrupted adoption refuses, and it says so itself: running it again
+    # completes it. Nothing is inferred from which records exist. A host killed between
+    # its two writes leaves a forget record without a tail, even on a first run, and the
+    # next host opens that store and completes it.
+    require(_absent(root / _ADOPTING), "state_root_incomplete")
 
 
 def _voice_state_runtime(runtime_target: Path) -> tuple[int, int, Any]:
@@ -1638,10 +1643,12 @@ def _read_state_file(path: Path, maximum: int, category: str) -> bytes:
 def adopt_state(plan_path: Path, source: Path) -> dict[str, Any]:
     """Carry one stopped run's saved conversation into an empty state root, once.
 
-    The source run is only read. The forget record is written before the tail, as the host
-    writes them, each through the store's own temporary, fsync and atomic replace, under
-    the store's lock. A kill at any point leaves the source intact and a store that this
-    same command completes when run again; a store holding anything else is refused.
+    The source run is only read. Under the store's lock, a marker is written first and
+    removed last; between the two the store is this command's and ``serve`` refuses it.
+    The forget record is written before the tail, as the host writes them, each through
+    the store's own temporary, fsync and atomic replace. A kill at any point leaves the
+    source intact and a marked store that this command completes when run again. A store
+    without the marker that holds anything but the finished adoption is refused.
     """
     plan = load_plan(plan_path)
     tail = _conversation_store(plan)
@@ -1666,32 +1673,39 @@ def adopt_state(plan_path: Path, source: Path) -> dict[str, Any]:
     owner = run_record.lock_run_record(tail)
     require(owner is not None, "state_root_held")
     try:
-        # Everything is decided before anything is written. What is already there must be
-        # exactly what this adoption writes, in the order it writes it.
-        have_deletes = not _absent(deletes)
-        have_tail = not _absent(tail)
-        if have_deletes:
-            require(
-                deletes_raw is not None
-                and _read_state_file(deletes, deletes_maximum, "state_root_not_empty")
-                == deletes_raw,
-                "state_root_not_empty",
-            )
-        if have_tail:
-            require(
-                have_deletes == (deletes_raw is not None)
-                and _read_state_file(tail, maximum, "state_root_not_empty") == raw,
-                "state_root_not_empty",
-            )
-        # The lock holder may clear what a killed writer, this command included, left.
-        run_record.remove_orphaned_temporaries(tail)
-        run_record.remove_orphaned_temporaries(deletes)
-        if deletes_raw is not None and not have_deletes:
-            run_record.write_run_record(deletes, deletes_raw)
-        if not have_tail:
-            run_record.write_run_record(tail, raw)
+        marker = root / _ADOPTING
         tail_sha256 = hashlib.sha256(raw).hexdigest()
         deletes_sha256 = None if deletes_raw is None else hashlib.sha256(deletes_raw).hexdigest()
+
+        def holds(path: Path, data: bytes | None, maximum_bytes: int) -> bool:
+            if data is None or _absent(path):
+                return data is None and _absent(path)
+            return _read_state_file(path, maximum_bytes, "state_root_not_empty") == data
+
+        adopted = holds(tail, raw, maximum) and holds(deletes, deletes_raw, deletes_maximum)
+        if _absent(marker):
+            # Nothing here is this command's. A host leaves a forget record without a tail
+            # when it is killed between its two writes, and completes it itself; that is a
+            # store in use, like any tail. Only an empty store may be filled, and one that
+            # already holds exactly the finished adoption is left as it is.
+            require(adopted or (_absent(tail) and _absent(deletes)), "state_root_not_empty")
+            if not adopted:
+                run_record.write_run_record(marker, _ADOPTING_RECORD)
+        # From the marker's first write to its removal the store is this command's alone:
+        # serve refuses it, so no host has opened it since it was empty. Whatever an
+        # earlier attempt left, from this source or another, may therefore be replaced.
+        for path in (tail, deletes, marker):
+            run_record.remove_orphaned_temporaries(path)
+        if not adopted:
+            if not holds(tail, raw, maximum):
+                # A tail never stands beside a forget record that is not its own.
+                tail.unlink(missing_ok=True)
+            if deletes_raw is None:
+                deletes.unlink(missing_ok=True)
+            elif not holds(deletes, deletes_raw, deletes_maximum):
+                run_record.write_run_record(deletes, deletes_raw)
+            if _absent(tail):
+                run_record.write_run_record(tail, raw)
         require(
             digest(tail) == tail_sha256
             and (_absent(deletes) if deletes_raw is None else digest(deletes) == deletes_sha256),
@@ -1706,11 +1720,12 @@ def adopt_state(plan_path: Path, source: Path) -> dict[str, Any]:
             ),
             "adopt_source_changed",
         )
+        marker.unlink(missing_ok=True)
     finally:
         run_record.unlock_run_record(owner)
     return {
         "category": "state_adopted",
-        "already_adopted": have_tail,
+        "already_adopted": adopted,
         "bytes": len(raw),
         "sha256": tail_sha256,
         "deletes_bytes": None if deletes_raw is None else len(deletes_raw),
