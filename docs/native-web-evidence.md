@@ -54,8 +54,9 @@ unobserved final gets the disposition an observed final would have had without
 presentation: a no-web or mixed run is delivered `ungrounded`, and a web-only run is
 `refused` with reason `unobserved`, because web-only output reaches the user only
 through the passage-backed presenter. The observer binds the decision to the
-SHA-256 of the exact completed output it reads from the status body, and a row
-retired before that read is kept, source-free, until it. Nothing previously refused
+SHA-256 of the exact completed output it reads from the status body. Any row retired
+before that read while not yet bound to an output, undecided or refused, is kept
+source-free until it, so a refusal still reports its reason. Nothing previously refused
 is ever delivered this way. A final that Hermes builds outside middleware in a
 no-web run (for example an error text) is delivered `ungrounded` and relies on the
 host's ordinary result-envelope checks, as non-web runs already do.

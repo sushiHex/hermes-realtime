@@ -256,7 +256,7 @@ class NativeWebEvidence:
         self.lock = threading.RLock()
         self.rows: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.reports: OrderedDict[str, str] = OrderedDict()
-        # Retired rows whose final answer was never observed, kept (source-free) so the
+        # Retired rows not yet bound to a terminal output, kept (source-free) so the
         # terminal status read can still decide them against the exact output.
         self._unsettled: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._pending = 0
@@ -331,7 +331,8 @@ class NativeWebEvidence:
                 row["closed"] = True
                 self._drop_source_locked(row)
                 del self.rows[run_id]
-                if row["disposition"] is None:
+                if row["output_sha256"] is None:
+                    # Not yet bound to a terminal output: the status read decides it.
                     self._unsettled[run_id] = row
                     while len(self._unsettled) > _MAX_ROWS:
                         self._unsettled.popitem(last=False)

@@ -1113,6 +1113,42 @@ async def test_unobserved_web_only_final_is_refused_not_delivered(
 
 
 @pytest.mark.asyncio
+async def test_retired_refused_row_still_reports_its_reason_at_the_terminal_read() -> None:
+    observer = _observer()
+
+    async def native_run() -> None:
+        def turns() -> None:
+            observer.tool_execution(
+                tool_name="web_search", args={"query": "current report"},
+                next_call=lambda _args: "private malformed body",
+            )
+
+        await asyncio.to_thread(turns)
+
+    task = asyncio.create_task(native_run())
+    observer.adapter = SimpleNamespace(_active_run_tasks={RUN_ID: task})
+    observer._get_session_key = lambda: RUN_ID
+    binding = _RequestBinding(
+        CONTRACT, GENERATION, "Summarize the report.", deadline=time.monotonic() + 120,
+    )
+    assert observer._accepted_row(binding, RUN_ID, False) is not None
+    await task
+    assert observer.rows[RUN_ID]["disposition"] == "refused"
+    # Another run's admission or tool effect retires the finished row before the read.
+    with observer.lock:
+        observer._retire_locked()
+    assert RUN_ID not in observer.rows
+
+    raw = await _terminal_status(
+        observer, {"object": "hermes.run", "run_id": RUN_ID, "status": "completed",
+                   "output": UNOBSERVED_FINAL},
+    )
+
+    assert attestation_outcome(raw, GENERATION, RUN_ID, UNOBSERVED_FINAL) == (
+        "refused", "capture")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retired", [False, True])
 @pytest.mark.parametrize("shape", ["no_web", "mixed"])
 async def test_unobserved_terminal_answer_is_delivered_ungrounded_and_bound(
