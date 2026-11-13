@@ -518,8 +518,8 @@ additional default-off qualification controls. See
 > identity, but they are not a sandbox and do not comprehensively gate every tool or filesystem
 > mutation. A server-side task may mutate state without producing an approval request. The full
 > host therefore requires explicit operator acknowledgement and must be used only with bounded,
-> non-destructive objectives during this human gate. It admits only one active Hermes background
-> task at a time; foreground conversation remains available while that task runs.
+> non-destructive objectives during this human gate. It admits at most eight active Hermes
+> background tasks at a time; foreground conversation remains available while they run.
 
 ### One-time Hermes API setup
 
