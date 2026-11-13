@@ -17,8 +17,8 @@ still inspects export-ignored paths.
 | --- | --- |
 | Pure candidate wheel | Verify the Linux browser build and committed asset parity, then build the candidate wheel and hash-identified offline dependency closure. |
 | Linux null capture | Install that wheel offline and verify the Linux null-capture boundary. |
-| Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates. |
-| Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), and real-browser self-acceptance. |
+| Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates, including the one run of the default Python suite. |
+| Native LiveKit release integration | Verify the same candidate archive, then run the [native stage](#test-ownership-between-the-windows-jobs) against pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), and real-browser self-acceptance. |
 | Packaged capture and spool recovery | Qualify the [packaged revocation race](revoke-race.md), [capacity rollover](capacity-rollover.md), [capture admission overflow](over-budget-turn.md), [spool crash recovery](spool-crash-matrix.md), [synthetic fault matrix](synthetic-fault-matrix.md), [full-purge cleanup](full-purge-cleanup.md), and [owned-close faults](owned-close-faults.md) against the Pure candidate wheel. |
 
 Before an authorized merge, require the reviewed candidate's five PR checks to
@@ -112,12 +112,47 @@ scenarios do not establish the full installed dependency or physical matrix.
 
 The `native-livekit` job downloads the documented Windows LiveKit 1.13.4
 binary, verifies its SHA-256, starts it on `127.0.0.1` in development mode, and
-then runs the native local LiveKit, browser LiveKit, and local launcher tests.
-Those existing native checks now precede the full Python, browser and artifact
-matrix, after source-import and focused provider checks. Executable/hash/PID and
-credential bindings remain required; the later release checks still all run.
-`InsecureKeyLengthWarning` is promoted to an error. This is a required release job rather than an
-ambient local prerequisite.
+then runs the native stage: the native local LiveKit, browser LiveKit, local
+launcher and full-host tests. It runs after the same source capture, archive
+verification, secret scans, lock check, source-import, static and focused provider
+checks as the hermetic job. Executable/hash/PID and credential bindings remain
+required. `InsecureKeyLengthWarning` is promoted to an error. This is a required
+release job rather than an ambient local prerequisite.
+
+### Test ownership between the Windows jobs
+
+The default Python suite runs once per workflow run, in the `release-candidate`
+job. The `native-livekit` job passes `--native-only`: it stops after the native
+stage and does not repeat the default suite, the browser build, or packaging. Both
+jobs verify and materialize the same commit, so those stages have nothing
+different to examine on the second runner.
+
+The native stage owns the tests listed in `NATIVE_STAGE_TESTS` in
+`scripts/release_gate.py`. Most need the owned loopback server. Two parse real
+`requests` and `yaml` objects; the stage installs those packages for them through
+the locked `native-stage` dependency group. Earlier they ran only because the
+LiveKit stage left the `local` extra installed ahead of a second copy of the suite.
+
+Each stage writes a pytest JUnit report beside the materialized candidate and the
+gate reads it before continuing. The two reports partition the collected tests:
+
+| Stage | Refused |
+| --- | --- |
+| Native stage | A selected test that was skipped; a selector that collected nothing; a test outside the selection. |
+| Default suite | A test skipped for a reason only the native environment lifts (the LiveKit opt-in, or a missing import) that the native stage does not select; a native-stage test that also ran here; a selector absent from the collection. |
+
+Each check prints one `test ownership verified:` line with its counts. A unit test
+additionally binds the selection to the set of test files that carry the LiveKit
+opt-in, by equality.
+
+Limits. The native job no longer runs the default suite with the native stage's
+extras and LiveKit variables present. The check recognises a native-enabled skip
+by its reason. A test that depends on the native environment in another way, for
+example by branching on a variable instead of skipping, is not detected by the
+ownership check. Other skips (platform, optional
+tools, operator-run gates) were identical in both jobs and are not owned by
+either stage. A timing-dependent test now has one required run per workflow run,
+not two.
 
 ## Publishing the repository
 
@@ -627,6 +662,8 @@ try {
 ```
 
 Readiness uses at most 30 attempts with a two-second timeout per request. Cleanup
-runs for both gate success and failure. The block exercises the native automated gate; it does not establish the
+runs for both gate success and failure. Without `--native-only` the command above
+runs the native stage and then the whole hermetic gate; add `--native-only` after
+`--require-livekit` to stop after the native stage, as the CI job does. The block exercises the native automated gate; it does not establish the
 separate physical, perceptual, provider-account, or full-host qualification claims.
 Never use these public development credentials outside loopback mode.

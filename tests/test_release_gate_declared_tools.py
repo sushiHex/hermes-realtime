@@ -251,6 +251,10 @@ def _observed_gate(
         "check_static_parity",
     ):
         monkeypatch.setitem(namespace, name, lambda *_args: None)
+    # The observed `run` writes no JUnit report, so the report check has nothing to read.
+    monkeypatch.setitem(
+        namespace, "check_default_suite_outcomes", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setitem(namespace, "clean_environment", lambda: dict(environment))
     monkeypatch.setitem(namespace, "declared_stage_environments", stages)
     monkeypatch.setitem(namespace, "run", observe_run)
