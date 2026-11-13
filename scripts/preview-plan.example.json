@@ -1,6 +1,7 @@
 {
   "version": 1,
   "output": "C:/preview/output",
+  "state_root": "C:/preview/state-root",
   "readiness_policy": "kernel_listeners",
   "realtime": {
     "source": "C:/preview/hermes-realtime",

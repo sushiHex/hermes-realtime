@@ -12,6 +12,7 @@ from scripts.lookup_backend_logs import CappedCapture, CappedProcesses
 def _host_fixture(tmp_path, monkeypatch, fault):
     ports = dict(api=1, companion=2, livekit=3, host=4)
     plan = SimpleNamespace(output=tmp_path, ports=ports, policy_mode='legacy',
+        state_root=tmp_path.parent / (tmp_path.name + '-state'),
         host_options=dict(allow_unsandboxed_tasks=False, natural_work_tools=True,
                           task_start_policy='ordinary', conversation_profile='default'),
         models=dict(foreground='synthetic', foreground_effort='low'),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import importlib
 import json
@@ -408,16 +409,17 @@ def test_cleanup_uses_one_identity_checked_native_handle(
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "expected"),
+    ("kwargs", "last_error", "expected"),
     [
-        ({}, 42),
-        ({"wait": 0}, None),
-        ({"wait": -1}, None),
-        ({"times": False}, None),
-        ({"opened": False}, None),
+        ({}, 0, 42),
+        ({"wait": 0}, 0, None),
+        # ERROR_INVALID_PARAMETER: no process has this identifier.
+        ({"opened": False}, 87, None),
     ],
 )
-def test_started_at_uses_the_same_zero_time_handle_liveness(monkeypatch, kwargs, expected):
+def test_started_at_uses_the_same_zero_time_handle_liveness(
+    monkeypatch, kwargs, last_error, expected
+):
     kernel = _Kernel(**kwargs)
 
     def open_process(*args):
@@ -425,9 +427,70 @@ def test_started_at_uses_the_same_zero_time_handle_liveness(monkeypatch, kwargs,
 
     kernel.OpenProcess = open_process
     monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kw: kernel, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error, raising=False)
     assert rehearsal.started_at(101) == expected
     assert kernel.access == 0x00101000
     assert kernel.closed == ([55] if kernel.opened else [])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "last_error"),
+    [
+        ({"opened": False}, 5),  # ERROR_ACCESS_DENIED: it exists and may be running.
+        ({"opened": False}, 0),
+        ({"opened": False}, 8),
+        ({"opened": False}, True),  # Never the integer 87 by coercion.
+        ({"wait": -1}, 0),  # WAIT_FAILED as a signed return.
+        ({"wait": 0xFFFFFFFF}, 0),
+        ({"wait": 0x80}, 0),
+        ({"times": False}, 0),
+    ],
+)
+def test_started_at_never_reads_an_unobservable_process_as_not_running(
+    monkeypatch, kwargs, last_error
+):
+    kernel = _Kernel(**kwargs)
+
+    def open_process(*args):
+        return kernel.open(*args)
+
+    kernel.OpenProcess = open_process
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kw: kernel, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error, raising=False)
+    with pytest.raises(rehearsal.ProcessUnobservable):
+        rehearsal.started_at(101)
+    assert kernel.closed == ([55] if kernel.opened else [])
+
+
+def test_owner_bookkeeping_leaves_an_unobservable_process_to_native_settlement(
+    tmp_path, monkeypatch
+):
+    owner = rehearsal.Processes(tmp_path)
+    owner.seen[101] = ("private.exe", 42)
+
+    def unobservable(_pid):
+        raise rehearsal.ProcessUnobservable("synthetic")
+
+    monkeypatch.setattr(rehearsal, "started_at", unobservable)
+    monkeypatch.setattr(
+        rehearsal, "process_table", lambda: {101: (99, "private.exe"), 102: (101, "child.exe")}
+    )
+    owner.roots["host"] = SimpleNamespace(pid=101)
+    # Neither claimed as the same running process nor newly recorded: survivors() classifies
+    # it through _cleanup_process_state, where it counts as unknown.
+    assert owner.alive() == []
+    owner.observe()
+    assert owner.seen == {101: ("private.exe", 42)}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows process handles")
+def test_started_at_distinguishes_a_missing_pid_from_one_it_cannot_open():
+    table = rehearsal.process_table()
+    missing = next(pid for pid in range(400000, 800000, 4) if pid not in table)
+    assert rehearsal.started_at(missing) is None
+    # The System process is always running, and opens only for an elevated caller.
+    with contextlib.suppress(rehearsal.ProcessUnobservable):
+        assert type(rehearsal.started_at(4)) is int
 
 
 @pytest.mark.parametrize(

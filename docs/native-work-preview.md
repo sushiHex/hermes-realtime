@@ -229,13 +229,6 @@ described in [native web evidence](native-web-evidence.md).
 
 ### Support limits
 
-- **First launch.** `finalize` is the only command that writes `active.private.json`,
-  and it requires `--previous`: an earlier preview run directory with its stop records
-  and a saved `state\voice-tail-v1.json`. No maintained command creates that first
-  directory, so a machine with no earlier preview run cannot reach `launch` through
-  this procedure. The [manual full-host composition](local-livekit.md#full-loopback-host-and-constrained-desktop-human-gate)
-  can run a first session, but it is not source and wheel bound, and its state is not
-  a `--previous` directory.
 - **Clean-machine walkthrough.** These steps were checked against the source. Nobody
   has yet followed them end to end on a clean machine with real installs
   ([#295](https://github.com/sushiHex/hermes-realtime/issues/295)).
@@ -275,7 +268,8 @@ isolated runtime with `uv pip install --no-deps --link-mode copy --target ...` s
 it owns its files rather than sharing cache hard links. Git and the existing
 interpreter environment remain trusted DEV prerequisites.
 
-The plan has these required top-level keys: `version`, `output`, `realtime`,
+The plan has these required top-level keys: `version`, `output`, `state_root`
+(see [conversation state](#conversation-state)), `realtime`,
 `hermes`, `profile_mode`, `native_status`, `speech_assets`, `ports`, `models`,
 `speech`, `executables`, and `host_options`. The optional `readiness_policy` is
 `kernel_listeners` by default, or explicitly `dev_owned_services`. `speech_assets` has `receipt`,
@@ -342,10 +336,10 @@ run's.
 & $previewPython -I -B scripts/preview_cutover.py make-speech-receipt `
   --plan "<preview-root>\plan.json"
 & $previewPython -I -B scripts/preview_cutover.py prepare --plan "<preview-root>\plan.json"
-# After the previous owner reports a clean normal stop:
+# Complete the staged profile and bind the launch. A first run needs nothing else.
+# Optionally add: --previous "<previous-output>" to record that the earlier run stopped.
 & $previewPython -I -B scripts/preview_cutover.py finalize `
-  --prepared "<output>\prepared.private.json" `
-  --previous "<previous-output>"
+  --prepared "<output>\prepared.private.json"
 # Launch independently of the calling terminal or agent controller:
 & $previewPython -I -B scripts/preview_cutover.py launch --active "<output>\active.private.json"
 # Later, request graceful stop and wait for cleanup settlement:
@@ -365,7 +359,82 @@ owner then writes
 [acceptance procedure](native-preview-acceptance.md) lists what to observe and record
 from there.
 
-`prepare` and its `preflight` are offline. `finalize` refuses unless the prior
+### Conversation state
+
+The saved conversation lives in the plan's `state_root`, not in a run directory. It
+holds the voice tail (`voice-tail-v1.json`), its forget record
+(`voice-tail-v1.deletes.json`) and their lock file. Every run whose plan names the
+same `state_root` continues the same conversation; nothing is copied between runs,
+and nothing in a run directory is needed to restore it. An absent or empty
+`state_root` is a first run.
+
+The host takes the store's lock when it opens the tail and holds it until it closes.
+Windows releases the lock when the process ends, however it ends, so the next run
+acquires the store after a clean stop, a `refused` stop receipt or a crash alike. A
+second host on a held store fails to start. `serve` also probes the lock before it
+owns anything and refuses with `state_root_held`; that probe is a courtesy, and the
+host's own lock is what keeps two hosts off one conversation. The next host removes
+any temporary a killed writer left in the store.
+
+`state_root` is an absolute path on a local fixed disk. A UNC or device path, a
+path equal to, inside or around the plan's `output`, and a volume that is not a
+fixed disk (`state_root_not_local`) are refused. Two things cannot be detected and
+are the operator's to avoid:
+
+- **Two state roots are two conversations.** Use one `state_root` in every plan.
+  Copying or restoring the directory by hand forks or rolls back the conversation.
+- **Do not put it in a synced folder** (a cloud-drive client, a backup agent that
+  replaces files). The lock and the atomic replace are not dependable there.
+
+The Hermes run record (`hermes-runs-v1.json`) stays in each run's own `state/`.
+Each run stages a fresh Hermes home, so a record that outlived the run would replay
+a pending entry against a home that has no idempotency record of it.
+
+#### Adopting a conversation saved by an earlier version
+
+Earlier versions kept the tail in each run directory. To carry one stopped run's
+conversation into an empty `state_root`, once:
+
+```powershell
+& $previewPython -I -B scripts/preview_cutover.py adopt-state `
+  --plan "<preview-root>\plan.json" --source "<previous-output>"
+```
+
+It reads `state\voice-tail-v1.json` and, when present, its forget record from the
+source run, and never modifies that run. It refuses when either host lock of the
+source is held (`adopt_source_held`), when the store's lock is held
+(`state_root_held`), and when the store already holds anything other than this same
+adoption (`state_root_not_empty`). Under the store's lock it writes a marker
+(`adoption.private.json`), then the forget record, then the tail, each through a
+temporary file, `fsync` and an atomic replace. It then checks both hashes and that the
+source did not change, and removes the marker.
+
+While the marker is there the store belongs to the adoption: `serve` refuses with
+`state_root_incomplete`, and running `adopt-state` again completes it, from the same
+source or another. Nothing is inferred from which records exist. A host killed
+between writing its forget record and its tail, even on a first run before any tail
+exists, leaves a store the next host opens and completes; no command is needed.
+
+| Killed | Left in the store | Next step |
+| --- | --- | --- |
+| Before the marker | Nothing but the lock file, or an unfinished temporary | Run it again |
+| After the marker, at any later point | The marker, and whatever was written so far | Run it again; it completes and removes the marker |
+| After the marker is removed | The adopted conversation | Nothing. Running it again reports `already_adopted` |
+
+The source run keeps its copy. Do not adopt it into a second `state_root`.
+
+Adopt before the first launch on a new `state_root`. Once a host has started there
+the store is no longer empty, and adoption refuses. `finalize --previous` guards
+this for the run it is given: when that run still holds a tail in its own `state/`
+and the store has none, it refuses with `previous_conversation_not_adopted`.
+
+### Previous-run evidence
+
+`prepare` and its `preflight` are offline. `finalize` completes the staged profile
+and binds the launch. `--previous <run directory>` is optional and carries no
+conversation: it only records in the handoff that the named run was verified
+stopped. Without it the handoff says `no_previous_handoff`. With it, `finalize`
+refuses unless the prior
 run has a settled stop receipt, no owned survivors/listeners, and an empty task
 journal. A prior run whose owner died before writing any receipt is accepted as
 `abandoned_stop_verified` only when every recorded PID, including the supervisor's,
@@ -373,10 +442,25 @@ is dead, no port of its hash-bound plan or the new plan is listening, neither ho
 lock file is held, and its task journal is empty or absent. The host writes that
 journal before its first Hermes dispatch, so absence means nothing was submitted.
 A receipt that is present but not a settled regular file is refused as before, and
-one that appears during the checks is refused as `previous_receipt_appeared`. Either
-way, `finalize` carries the voice tail together with its forget record
-(`voice-tail-v1.deletes.json`) when one exists, so a forgotten conversation stays
-retired. `finalize` only reads the prior run. `launch` probes the bound host interpreter and starts its verified base Python
+one that appears during the checks is refused as `previous_receipt_appeared`. An
+abandoned run pairs readiness policy as a clean stop does: a prior run whose plan
+selected `dev_owned_services` is refused as `previous_readiness_policy` unless the
+new plan selects it too. `finalize` only reads the prior run. A run that cannot
+pass these checks does not strand the conversation: finalize without `--previous`.
+
+A recorded process counts as dead only when Windows reports that no process has its
+identifier, or its handle is signaled. One that cannot be opened or observed, for
+example a reused identifier now owned by a process the operator account may not
+open, is refused as `previous_process_unobservable`, and one still running as
+`previous_process_alive`. Process start times are not recorded.
+
+The handoff reports `previous_stop.state_temporaries`: how many temporaries a
+killed host writer left beside the host records in the prior run's `state/`. It is a
+count only; the files are not read, copied or removed. They can hold task request
+text, and in a run of an earlier version conversation text, until that directory is
+deleted.
+
+`launch` probes the bound host interpreter and starts its verified base Python
 with CPython's standard virtual-environment launcher variable. This preserves
 the same virtual environment without the Windows venv redirector's extra Job.
 It uses the existing windowless Windows Job breakaway flags, NUL input and
