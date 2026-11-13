@@ -128,8 +128,12 @@ Ownership is a lock, not a PID. A host-wide fault exits the host and restart rec
   tasks stopped, never resumed; the kill-on-close Job; terminal by default inside ordered
   check chains; the forget guarantee; voice history surviving a crash
   ([ADR 0003](0003-hermes-owned-conversation-continuity.md)).
-- **First step:** [#496](https://github.com/sushiHex/hermes-realtime/issues/496): the owner
-  takes a lock (stricter only), then the plan names a stable root and `finalize` stops copying.
+- **First step:** [#496](https://github.com/sushiHex/hermes-realtime/issues/496): the plan
+  names a required stable root, `finalize` stops copying, and `--previous` becomes optional
+  evidence. No new lock is needed for this: the host already takes the tail's lock at open and
+  refuses a second holder (`integration/voice_tail.py:1319-1322`), releases it at close
+  (`:1485`), and the kernel releases it on death. An owner-level lock is a later step, when
+  PID files stop being authority.
 - **Deletes:** `_copy_voice_tail`, the deletes copy, the `saved_voice_*` refusal categories,
   `--previous` as a source of state, and PID files as authority.
 
@@ -220,7 +224,8 @@ Each blocks a move. A recommendation is not a decision.
 4. Should ADR 0004 be amended so the saved tail records each row's source and time, in a new
    tail version that still reads the old ones? **Recommend yes**, after acceptance.
 5. Should the run record stay per run until the Hermes home persists, so that the state root
-   first holds only the tail and its deletes record? **Recommend yes.**
+   first holds only the tail and its deletes record? **Recommend yes.** Move 3's first step
+   is being built on this answer and would have to change if the owner decides otherwise.
 6. Should Hermes-side state (archive, companion store, memory) persist across preview runs?
    **Recommend yes**, after acceptance; ADR 0003's purpose depends on it.
 7. May the owner restart the host child in place after a host-wide latch?
