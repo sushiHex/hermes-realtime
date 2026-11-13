@@ -407,7 +407,9 @@ source is held (`adopt_source_held`), when the store's lock is held
 adoption (`state_root_not_empty`). Under the store's lock it writes a marker
 (`adoption.private.json`), then the forget record, then the tail, each through a
 temporary file, `fsync` and an atomic replace. It then checks both hashes and that the
-source did not change, and removes the marker.
+source did not change, and removes the marker. Its status line reports only
+`state_adopted`, `already_adopted` and `deletes_carried` (whether a forget record was
+carried). It prints no digest and no size of the conversation.
 
 While the marker is there the store belongs to the adoption: `serve` refuses with
 `state_root_incomplete`, and running `adopt-state` again completes it, from the same
