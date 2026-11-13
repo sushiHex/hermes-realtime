@@ -301,6 +301,36 @@ async def test_nontransient_memory_refusal_clears_snapshot(category: str) -> Non
 
 
 @pytest.mark.asyncio
+async def test_an_unlisted_memory_refusal_never_reaches_the_marker(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    context = ConversationContextStore()
+    changes = _observe(context)
+    link = MemoryLink()
+
+    async def connect() -> MemoryLink:
+        return link
+
+    receiver = VoiceMemoryReceiver(context, connect, binding=lambda: ("conversation_1", 0))
+    receiver.start()
+    try:
+        await asyncio.wait_for(link.started.wait(), 1)
+        await link.events.put(_snapshot(1, "Current preference."))
+        assert await asyncio.wait_for(changes.get(), 1) is not None
+        await link.events.put(VoiceMemoryRefusedEvent(
+            protocol_version="0.3", type="voice_memory_refused",
+            conversation_id="conversation_1", generation=0, category="sentinel_private",
+        ))
+        # Handling is unchanged: an unlisted category still clears the snapshot.
+        assert await asyncio.wait_for(changes.get(), 1) is None
+    finally:
+        await receiver.close()
+    output = capsys.readouterr().out
+    assert "sentinel_private" not in output
+    assert '[voice-memory-receive] {"refusal":"unlisted","version":1}' in output.splitlines()
+
+
+@pytest.mark.asyncio
 async def test_receiver_clears_before_transport_reconnect_and_rebinds_once() -> None:
     context = ConversationContextStore()
     changes = _observe(context)
