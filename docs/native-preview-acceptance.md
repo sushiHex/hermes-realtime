@@ -262,12 +262,52 @@ receipt to continue.
 
 Stop only through the `stop` command. Do not end processes by name.
 
+## Operator contingency: the host stops answering
+
+This is not a pass/fail step. It applies at any point in steps 3 to 11. Two faults leave
+the host process running while it can no longer converse
+([#531](https://github.com/sushiHex/hermes-realtime/issues/531)).
+
+**Recognise it.** The assistant stops answering, with nothing spoken and no error shown,
+after one of these:
+
+- a task start that ends in an error with an unknown outcome. The page shows one task
+  card with status `uncertain`, and the host prints one
+  `[task-command-settlement]` line whose JSON has `kind` `start` and `category`
+  `acknowledgment-uncertain`. The next ordinary turn then fails silently;
+- a foreground failure after the Codex app-server child dies. The next turn prints one
+  `[codex-send-bound]` line whose JSON has an `outcome` of `send_failed`, and every
+  later turn fails with no line.
+
+The page's advice to restart the session, and a browser reconnect, do not clear either
+fault. Only a new host does.
+
+**Recover.** Extract the markers, then stop the host and start it again through the
+maintained commands in the preview guide's
+[Commands](native-work-preview.md#commands) section. Press **Connect** and continue
+from the step that was interrupted. The restart restores the saved conversation. A task
+that was active is stopped, not resumed.
+
+**Record.** The occurrence is a `failed` outcome for the step in progress. Record only:
+
+- the step number;
+- the marker line or lines, with their categories and outcome;
+- whether the conversation was recalled after the restart, yes or no;
+- the dispatch count before and after the restart.
+
+Do not record transcripts, audio, objective text or paths.
+
+The planned fix is tracked in [#531](https://github.com/sushiHex/hermes-realtime/issues/531)
+and the proposed [ADR 0008](https://github.com/sushiHex/hermes-realtime/pull/529): a
+host-wide latch ends the host and leaves one evidence line.
+
 ## Not covered
 
 These are outside the procedure today. Leave them `not_run` and name the reason.
 
 | Not covered | Why |
 | --- | --- |
+| Recovery of a host that is running but cannot converse, after a task-start error or a dead foreground child | There is no automatic recovery. Use the [operator contingency](#operator-contingency-the-host-stops-answering); it counts as a failure of the step in progress. Tracked in [#531](https://github.com/sushiHex/hermes-realtime/issues/531). |
 | Approval prompts, and what an approval card shows after Hermes times out, is cancelled or receives a late answer | The card states are tracked in [#291](https://github.com/sushiHex/hermes-realtime/issues/291) and are not implemented. |
 | Handoff from a run whose owner died, from an older run, or from a run already handed off | `finalize` accepts an abandoned run only when no work was recorded, and nothing ties `--previous` to the newest unconsumed run. Hardening is tracked in [#496](https://github.com/sushiHex/hermes-realtime/issues/496). |
 | Abrupt owner or host death while a task is active | The run record is then not empty and `finalize` refuses it. The preview has no maintained recovery command for that state. |
