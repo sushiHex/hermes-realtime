@@ -1,9 +1,11 @@
 """The one shared LiveKit server: its path, its pins, its verification and its command."""
 
 import hashlib
+import http.client
 import io
 import re
 import subprocess
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -250,6 +252,58 @@ def test_the_path_command_prints_only_a_verified_server(
     path.write_bytes(executable)
     assert local_livekit.main(["path"]) == 0
     assert capsys.readouterr().out == f"{path}\n"
+
+
+def _unreachable(url: str) -> bytes:
+    raise urllib.error.HTTPError(url, 504, "private response text", None, None)
+
+
+def _truncated(url: str) -> bytes:
+    raise http.client.IncompleteRead(b"partial")
+
+
+@pytest.mark.parametrize(
+    ("fetch", "category", "status"),
+    [
+        (None, "verified", 0),
+        (lambda url: _archive(sidecar=b"replaced upstream\n"), "pin_mismatch", 1),
+        (lambda url: _archive(executable=b"another server\n"), "pin_mismatch", 1),
+        (lambda url: b"not an archive", "pin_mismatch", 1),
+        (_unreachable, "download_unavailable", 1),
+        (_truncated, "download_unavailable", 1),
+    ],
+)
+def test_the_upstream_check_fetches_the_pinned_release_and_reports_one_category(
+    tmp_path: Path,
+    release: tuple[bytes, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fetch: object,
+    category: str,
+    status: int,
+) -> None:
+    archive, _ = release
+    fetched: list[str] = []
+
+    def record(url: str) -> bytes:
+        fetched.append(url)
+        return archive if fetch is None else fetch(url)
+
+    # No installed copy and no cache may answer for upstream.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(local_livekit, "_download", record)
+
+    assert local_livekit.main(["verify-upstream"]) == status
+
+    assert fetched == [local_livekit.ARCHIVE_URL]
+    output = capsys.readouterr()
+    assert output.out == (
+        '[pinned-input] {"version": 1, "input": "livekit-archive", "category": "'
+        + category
+        + '"}\n'
+    )
+    assert output.err == ""
+    assert not (tmp_path / "hermes-realtime").exists()
 
 
 class _Launched:

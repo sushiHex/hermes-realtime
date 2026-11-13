@@ -37,7 +37,7 @@ def test_explicit_codex_preparation_binds_executable_without_launch(monkeypatch,
     report = json.loads(output.split("[confirmed-natural-probe] ")[1])
     assert report["status"] == "prepared_only"
     assert report["inference_provider"] == "codex"
-    assert report["model"] == "gpt-5.6-terra"
+    assert "model" not in report and "gpt-5.6-terra" not in output
     assert report["model_digest"] is None
     assert report["codex_effort"] == "low"
     assert report["source_binding"]["codex_executable_sha256"] == arguments[-3]
@@ -134,18 +134,23 @@ def test_codex_executable_drift_refused_after_preparation(monkeypatch, tmp_path,
     assert '"status": "attempt_failed"' in capsys.readouterr().out
 
 
-def test_namespaced_ollama_model_remains_an_explicit_configuration(monkeypatch, tmp_path, capsys):
+def test_namespaced_ollama_model_is_accepted_but_never_printed(monkeypatch, tmp_path, capsys):
+    # A namespace or tag is free text the operator chose; the digest names the weights.
     bind_synthetic_source(monkeypatch)
     assert probe.main([
         "--source-head", "a" * 40, "--source-tree", "b" * 40,
-        "--inference-provider", "ollama", "--model", "library/phi4-mini:latest",
+        "--inference-provider", "ollama", "--model", "sentinelprivate/phi4-mini:sentineltag",
         "--model-digest", "c" * 64, "--base-url", "http://127.0.0.1:1",
         "--private-receipt", str(tmp_path / "receipt"),
     ]) == 0
-    report = json.loads(capsys.readouterr().out.split("[confirmed-natural-probe] ")[1])
-    assert report["model"] == "library/phi4-mini:latest"
+    output = capsys.readouterr().out
+    assert "sentinel" not in output
+    report = json.loads(output.split("[confirmed-natural-probe] ")[1])
+    assert report["status"] == "prepared_only"
+    assert "model" not in report
     assert report["model_digest"] == "c" * 64
     assert report["inference_provider"] == "ollama"
+    assert report["codex_effort"] is None
 
 
 @pytest.mark.parametrize("flag,value", [

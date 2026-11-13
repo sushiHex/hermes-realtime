@@ -392,6 +392,7 @@ def test_public_gate_has_no_private_history_baseline(
             "livekit_executable": None,
             "livekit_executable_sha256": None,
             "livekit_pid": None,
+            "declared_tool_path": False,
         },
     )
 

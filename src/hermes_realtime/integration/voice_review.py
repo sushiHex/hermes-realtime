@@ -18,6 +18,7 @@ from hermes_realtime.protocol import (
     VoiceReviewAckEvent,
     VoiceReviewEvent,
     VoiceReviewRefusedEvent,
+    voice_refusal_label,
 )
 
 _MARKER = "[voice-review-send] "
@@ -202,7 +203,7 @@ class VoiceReviewSender:
                     if self._last_refusal != reply.category:
                         _marker(
                             {
-                                "refusal": reply.category,
+                                "refusal": voice_refusal_label(reply.category),
                                 "closing": int(request.closing),
                                 "version": 1,
                             }

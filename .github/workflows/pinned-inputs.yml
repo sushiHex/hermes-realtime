@@ -1,0 +1,33 @@
+name: pinned-inputs
+
+# The release gates restore the pinned LiveKit archive from a cache, so they no longer
+# show that the upstream release is still downloadable and still matches its pin. This
+# does, once a week, without the cache. It is not a merge gate.
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  livekit-archive:
+    name: Pinned LiveKit archive cold fetch
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+      # v10.1.0
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        with:
+          version: "0.11.28"
+          enable-cache: false
+      - name: Download and verify the pinned LiveKit archive from upstream
+        shell: pwsh
+        run: uv run --frozen --group dev python -m scripts.local_livekit verify-upstream

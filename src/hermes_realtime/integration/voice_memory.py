@@ -18,6 +18,7 @@ from hermes_realtime.protocol import (
     VoiceMemoryEvent,
     VoiceMemoryRefusedEvent,
     VoiceMemorySnapshotEvent,
+    voice_refusal_label,
 )
 
 _MARKER = "[voice-memory-receive] "
@@ -185,7 +186,9 @@ class VoiceMemoryReceiver:
                         if type(event) is VoiceMemoryRefusedEvent:
                             if event.category not in _RETAINING_REFUSALS:
                                 self._context.set_memory(None)
-                            _marker({"refusal": event.category, "version": 1})
+                            _marker(
+                                {"refusal": voice_refusal_label(event.category), "version": 1}
+                            )
                             continue
                         assert type(event) is VoiceMemorySnapshotEvent
                         if revision is not None and event.revision < revision:
