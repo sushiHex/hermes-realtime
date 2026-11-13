@@ -53,6 +53,13 @@ class _Run:
         self.serving = False  # true once the owner has said ready
         self.roots: dict[str, _FakeProcess] = {}
         self.port_stays_open = False
+        self.snapshots = 0
+        self.snapshots_at_ready = 0
+        self.snapshots_while_first_host_lived = 0
+        self.idle_ticks = 0  # owner polls the first host lives through before it exits
+        self.late_children: dict[int, int] = {}  # started after the last tree sample
+        self.grandchildren: dict[int, tuple[int, int]] = {}  # pid -> (parent, start)
+        self.ends_early: set[int] = set()  # ends just before the host does
         self.actions: list[str] = []
         self.lines: list[dict[str, Any]] = []
         self.hosts: list[_FakeProcess] = []
@@ -107,6 +114,9 @@ class _Run:
                 for child, when in run.children.items():
                     run.state["table"][child] = (pid, "child")
                     run.started[child] = when
+                for grandchild, (parent, when) in run.grandchildren.items():
+                    run.state["table"][grandchild] = (parent, "grandchild")
+                    run.started[grandchild] = when
                 return process
 
             def stop_all(self, _containment: Any) -> None:
@@ -124,6 +134,7 @@ class _Run:
                 return set(run.state["table"]) - run.outside_job
 
         def process_table() -> dict[int, tuple[int, str]]:
+            run.snapshots += 1
             return dict(run.state["table"])
 
         def tick(_seconds: float) -> None:
@@ -140,6 +151,7 @@ class _Run:
             run.lines.append(dict(event))
             if event.get("category") == "ready":
                 run.serving = True
+                run.snapshots_at_ready = run.snapshots
             if event.get("category") == "host_restart":
                 run.actions.append("line:" + event["outcome"])
 
@@ -168,7 +180,18 @@ class _Run:
         host = self.hosts[-1]
         if host.returncode is not None:
             return
+        if self.idle_ticks > 0:
+            self.idle_ticks -= 1
+            return
         if len(self.hosts) <= len(self.exits):
+            if len(self.hosts) == 1:
+                self.snapshots_while_first_host_lived = self.snapshots - self.snapshots_at_ready
+            for child, when in self.late_children.items():
+                self.state["table"][child] = (host.pid, "child")
+                self.started[child] = when
+            for gone in self.ends_early:
+                self.state["table"].pop(gone, None)
+                self.started.pop(gone, None)
             # It ends itself: the process and its listener go, its children stay.
             host.returncode = host.exit_code = self.exits[len(self.hosts) - 1]
             self.state["table"].pop(host.pid, None)
@@ -313,6 +336,7 @@ def test_only_the_same_process_inside_the_job_is_ever_ended(run: _Run) -> None:
     def reuse_a_pid() -> None:
         # 41902 ended by itself and its number now names an unrelated process.
         run.started[41902] = 999
+        run.state["table"][41902] = (1, "unrelated")
 
     run.after_exit = reuse_a_pid
 
@@ -372,6 +396,187 @@ def test_a_successor_that_fails_to_become_ready_ends_the_run(run: _Run) -> None:
     ]
     assert run.receipt["failure_category"] == "host_exited_during_start"
     assert run.receipt["host_restarts"] == 0
+
+
+def test_a_long_session_samples_the_process_table_on_a_slow_cadence_not_every_poll(
+    run: _Run,
+) -> None:
+    run.exits = [HOST_FATAL_EXIT_STATUS]
+    run.idle_ticks = 400  # two hundred seconds of owner polls at the real interval
+
+    assert run.serve() == 0
+
+    # Four hundred polls with the host alive took one sample between them.
+    assert run.snapshots_while_first_host_lived == 1
+    assert run.receipt["host_restarts"] == 1
+
+
+def test_a_child_started_after_the_last_sample_is_still_ended(run: _Run) -> None:
+    run.exits = [HOST_FATAL_EXIT_STATUS]
+    run.idle_ticks = 5
+    run.late_children = {41950: 5}
+
+    assert run.serve() == 0
+
+    assert [action for action in run.actions if action.startswith("kill:")] == ["kill:41950"]
+    assert run.receipt["host_restarts"] == 1
+
+
+def test_a_grandchild_whose_parent_ended_before_the_host_is_still_ended(run: _Run) -> None:
+    run.exits = [HOST_FATAL_EXIT_STATUS]
+    run.idle_ticks = 3
+    run.children = {41900: 7}
+    run.grandchildren = {41901: (41900, 8)}
+    run.ends_early = {41900}
+
+    assert run.serve() == 0
+
+    # Nothing leads from the exited host to 41901 any more; only the earlier sample does.
+    assert [action for action in run.actions if action.startswith("kill:")] == ["kill:41901"]
+
+
+def test_a_host_with_more_children_than_the_bound_is_not_restarted(run: _Run) -> None:
+    run.exits = [HOST_FATAL_EXIT_STATUS]
+    run.children = {42000 + index: 1 for index in range(preview_cutover._HOST_TREE_LIMIT + 1)}
+
+    assert run.serve() == 1
+
+    assert not any(action.startswith("kill:") for action in run.actions)
+    assert run.state["spawned"].count("host") == 1
+    assert run.restart_lines == [
+        {"category": "host_restart", "outcome": "refused", "restarts": 0, "remaining": 3}
+    ]
+    assert run.receipt["failure_category"] == "host_restart_tree_unbounded"
+
+
+class _World:
+    """A process table and a clock for the tree tracker alone."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import scripts.rehearse_desktop_mvp as owner
+
+        self.table: dict[int, tuple[int, str]] = {}
+        self.started: dict[int, int] = {}
+        self.snapshots = 0
+        self.now = 100.0
+
+        def process_table() -> dict[int, tuple[int, str]]:
+            self.snapshots += 1
+            return dict(self.table)
+
+        monkeypatch.setattr(owner, "process_table", process_table)
+        monkeypatch.setattr(owner, "_observed_start", lambda pid: self.started.get(pid))
+        monkeypatch.setattr(
+            preview_cutover, "time", types.SimpleNamespace(monotonic=lambda: self.now)
+        )
+
+    def run(self, pid: int, parent: int, started: int = 1) -> None:
+        self.table[pid] = (parent, "image")
+        self.started[pid] = started
+
+    def end(self, pid: int) -> None:
+        del self.table[pid]
+        del self.started[pid]
+
+
+def test_the_host_tree_is_sampled_at_most_once_per_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World(monkeypatch)
+    world.run(10, 1)
+    world.run(11, 10)
+    tree = preview_cutover._HostTree()
+    interval = preview_cutover._HOST_TREE_SAMPLE_SECONDS
+
+    for _ in range(100):
+        tree.sample(10)
+        world.now += interval / 101
+    assert world.snapshots == 1 and tree.seen == {11: 1}
+
+    world.now += interval
+    tree.sample(10)
+    assert world.snapshots == 2
+    # An exit is sampled at once, whatever the cadence says.
+    tree.sample(10, force=True)
+    assert world.snapshots == 3
+    assert interval >= 5.0
+
+
+def test_the_host_tree_forgets_what_ended_and_keeps_what_lost_its_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World(monkeypatch)
+    world.run(10, 1)
+    world.run(11, 10)
+    world.run(12, 11)
+    world.run(13, 10)
+    world.run(14, 10)
+    tree = preview_cutover._HostTree()
+    tree.sample(10, force=True)
+    assert tree.seen == {11: 1, 12: 1, 13: 1, 14: 1}
+
+    world.end(13)  # ended: forgotten
+    world.end(11)  # ended, leaving 12 alive with no path back to the host: kept
+    world.started[14] = 99  # ended, and its number now names another process: forgotten
+    world.table[14] = (1, "unrelated")
+    tree.sample(10, force=True)
+
+    assert tree.seen == {12: 1}
+
+
+def test_the_final_sample_finds_children_of_a_host_that_has_already_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World(monkeypatch)
+    world.run(21, 10)
+    world.run(22, 21)
+    world.run(30, 1)
+    tree = preview_cutover._HostTree()
+
+    tree.sample(10, force=True)
+
+    assert tree.seen == {21: 1, 22: 1}
+
+
+def test_the_host_tree_is_bounded_and_says_so_instead_of_growing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World(monkeypatch)
+    world.run(10, 1)
+    world.run(11, 10)
+    tree = preview_cutover._HostTree()
+    tree.sample(10, force=True)
+    for index in range(preview_cutover._HOST_TREE_LIMIT):
+        world.run(1000 + index, 10)
+
+    tree.sample(10, force=True)
+
+    assert tree.unbounded is True
+    assert tree.seen == {11: 1}
+    assert preview_cutover._HOST_TREE_LIMIT == 64
+
+
+def test_settling_ends_nothing_whose_number_was_reused_after_the_last_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import scripts.rehearse_desktop_mvp as owner
+
+    killed: list[int] = []
+    started = {50: 1, 51: 2, 52: 3}
+    monkeypatch.setattr(owner, "_observed_start", lambda pid: started.get(pid))
+    monkeypatch.setattr(owner, "_kill_tree", lambda pid: (killed.append(pid), started.pop(pid)))
+    monkeypatch.setattr(preview_cutover, "_endpoint_snapshot", lambda _plan, ports: {})
+    plan = types.SimpleNamespace(
+        ports={"host": 1}, state_root=tmp_path / "store", output=tmp_path,
+    )
+    # 51 is not in this Job; 52 was that process when sampled and is another one now.
+    started[52] = 99
+
+    preview_cutover._settle_exited_host(
+        plan, {50: 1, 51: 2, 52: 3}, lambda: {50, 52},  # type: ignore[arg-type]
+    )
+
+    assert killed == [50]
 
 
 def test_capped_processes_respawn_only_replaces_a_root_that_has_exited(
@@ -450,7 +655,9 @@ def test_settling_ends_a_real_process_an_exited_host_left_behind(tmp_path: Path)
             assert time.monotonic() < deadline and parent.poll() is None
             time.sleep(0.05)
         child_pid = int(child_file.read_text(encoding="ascii"))
-        tree = preview_cutover._host_tree(parent.pid)
+        watching = preview_cutover._HostTree()
+        watching.sample(parent.pid, force=True)
+        tree = dict(watching.seen)
         assert child_pid in tree
 
         go.write_text("", encoding="ascii")

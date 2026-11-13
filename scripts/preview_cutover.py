@@ -2434,13 +2434,58 @@ _HOST_RESTART_BUDGET = 3
 _HOST_RESTART_SETTLE_SECONDS = 15.0
 
 
-def _host_tree(host_pid: int) -> dict[int, int]:
-    """Every process now below the live host, with when it started."""
-    from scripts import rehearse_desktop_mvp as owner
+# One sample is a snapshot of every process on the machine: about 26 ms with some 900
+# processes where this was measured. Taken at every half-second poll that would be about
+# five percent of one core beside realtime speech; at this cadence it is about half a
+# percent. The set of processes below a host changes rarely.
+_HOST_TREE_SAMPLE_SECONDS = 5.0
+# A host runs a handful of processes below it. More than this is not a tree this owner
+# will end on its own judgement, so the restart is refused instead.
+_HOST_TREE_LIMIT = 64
 
-    below = owner.descendants(owner.process_table(), {host_pid}) - {host_pid}
-    started = {pid: owner._observed_start(pid) for pid in below}
-    return {pid: when for pid, when in started.items() if when is not None}
+
+class _HostTree:
+    """What runs below one host, remembered only so that it can be ended after the host.
+
+    Sampled on its own slow cadence while the host lives, and once more when it has exited:
+    its direct children still name it as their parent then, so a child started after the
+    last sample is found too. What is not found is a process whose own parent ended before
+    any sample saw it. The host port and the two host locks are the backstop for that.
+
+    A process seen earlier is kept only while it is still that same running process. One
+    that ended is forgotten. One whose parent ended stays, because it can no longer be
+    reached from the host and is exactly what must not be left behind.
+    """
+
+    def __init__(self) -> None:
+        self.seen: dict[int, int] = {}
+        self.unbounded = False
+        self._due = 0.0
+
+    def sample(self, host_pid: int, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now < self._due:
+            return
+        self._due = now + _HOST_TREE_SAMPLE_SECONDS
+        from scripts import rehearse_desktop_mvp as owner
+
+        table = owner.process_table()
+        below: set[int] = set()
+        frontier = {host_pid}
+        while frontier:
+            frontier = {
+                pid for pid, (parent, _) in table.items() if parent in frontier
+            } - below - {host_pid}
+            below |= frontier
+        current = {pid: owner._observed_start(pid) for pid in below}
+        merged = {pid: when for pid, when in current.items() if when is not None}
+        for pid, when in self.seen.items():
+            if pid not in below and pid in table and owner._observed_start(pid) == when:
+                merged[pid] = when
+        if len(merged) > _HOST_TREE_LIMIT:
+            self.unbounded = True
+            return
+        self.seen = merged
 
 
 def _settle_exited_host(
@@ -2497,16 +2542,14 @@ def _supervise_owned_children(
     so its successor settles the same run record and tells the user what was stopped.
     Each replacement leaves one line, whatever its outcome, and the budget is final.
     """
-    left_running: dict[int, int] = {}
+    tree = _HostTree()
     while not stop_requested():
         current = roots()
         exited = {name for name, process in current.items() if process.poll() is not None}
         if not exited:
             host = current.get("host")
             if host is not None and reserved_status is not None:
-                # While it lives, remember what runs below it: once it has exited, its
-                # children no longer hang off anything this owner can name.
-                left_running.update(_host_tree(host.pid))
+                tree.sample(host.pid)
             time.sleep(_STOP_POLL_SECONDS)
             continue
         status = current["host"].poll() if exited == {"host"} else None
@@ -2519,8 +2562,10 @@ def _supervise_owned_children(
             if len(restarts) >= budget:
                 outcome = "budget_spent"
                 raise PreviewRefusal("host_restart_budget_spent")
-            restart_host(left_running)
-            left_running = {}
+            tree.sample(current["host"].pid, force=True)
+            require(not tree.unbounded, "host_restart_tree_unbounded")
+            restart_host(tree.seen)
+            tree = _HostTree()
             outcome = "restarted"
             restarts.append(outcome)
         finally:
