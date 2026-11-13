@@ -33,17 +33,39 @@ plugin setting. This contract and `lookup_policy` cannot both be selected.
    run and SHA-256 of the raw published output before projecting voice/detail.
    It uses the existing Runs event consumer; there is no second SSE subscription.
 
-Attestation version 1 has exactly these fields: `version`, `contract`,
-`generation`, `run_id`, `disposition`, `output_sha256`, `input_sha256`,
+Attestation version 2 has exactly these fields: `version`, `contract`,
+`generation`, `run_id`, `disposition`, `reason`, `output_sha256`, `input_sha256`,
 `input_bytes`, `catalog_sha256`, `catalog_count`, `passage_count`,
 `truncated_count`, and `missing_count`. It contains no source text or URLs.
+Version 1 (no `reason`) is no longer accepted.
 
-| Disposition | Meaning |
-| --- | --- |
-| `presented` | The bounded passage-backed formatter produced the published output. |
-| `no_web` | No web tool was observed; ordinary native output is preserved. |
-| `mixed_ungrounded` | Web and other effect tools were used; ordinary output is preserved without a grounding claim. |
-| `refused` | Evidence capture or presentation could not establish this contract; the host withholds the result. |
+| Disposition | `reason` | Meaning |
+| --- | --- | --- |
+| `presented` | `null` | The bounded passage-backed formatter produced the published output. |
+| `no_web` | `null` | No web tool was observed; ordinary native output is preserved. |
+| `mixed_ungrounded` | `null` | Web and other effect tools were used; ordinary output is preserved without a grounding claim. |
+| `ungrounded` | `unobserved` | No middleware call observed the final answer; ordinary output is preserved without a grounding claim. |
+| `refused` | one refusal reason | Evidence capture or presentation could not establish this contract; the host withholds the result. |
+
+`ungrounded` is decided at the terminal status read. Hermes's turn-budget summary
+(`handle_max_iterations`) makes its final model call outside LLM middleware, so the
+observer never sees that answer; any other unobserved call path lands here too. The
+observer binds the decision to the SHA-256 of the exact completed output it reads
+from the status body, and a row retired before that read is kept, source-free, until
+it. Nothing previously refused is ever delivered this way.
+
+Refusal reasons form a closed set: `binding` (task, run or presentation ownership
+mismatch), `capture` (a web result could not be read), `closed` (stopped, cancelled
+or unloaded), `deadline`, `final_response` (the observed final answer was not a
+complete stop), `input_bound`, `insufficient` (no usable passage), `internal`,
+`presentation_failed`, `route` (formatter route does not match the native route),
+`source_changed`, and `unobserved` (a completed status with no bindable output). The
+first reason of a refusal is the one reported. The plugin's content-free
+`[web-evidence]` line carries the same `category` and `reason`; the host's
+`[hermes-web-evidence]` line carries `reason` too, or `attestation` when the
+attestation is missing or unbound. The host speaks and shows a fixed notice per
+reason, and says "Please try again" only for `deadline`, `presentation_failed`
+and `source_changed`.
 
 Tool discovery metadata does not make a run mixed. Attempted, failed or malformed
 web retrieval cannot be classified as `no_web`. Missing, evicted, malformed,

@@ -7,8 +7,8 @@ import sys
 import threading
 import time
 import types
-from types import SimpleNamespace
-from typing import Any
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from aiohttp import web
@@ -23,6 +23,8 @@ from hermes_realtime.integration.web_evidence_contract import (
     CONTRACT,
     CONTRACT_HEADER,
     GENERATION_HEADER,
+    REFUSED_REASONS,
+    attestation_outcome,
     attestation_valid,
 )
 
@@ -447,7 +449,9 @@ async def test_malformed_observation_preserves_native_result_and_refuses_groundi
     assert returned is raw
     assert calls == 1
     assert observer.rows[RUN_ID]["disposition"] == "refused"
-    assert capsys.readouterr().out == '[web-evidence] {"category":"refused","count":1}\n'
+    assert capsys.readouterr().out == (
+        '[web-evidence] {"category":"refused","count":1,"reason":"capture"}\n'
+    )
 
 
 @pytest.mark.asyncio
@@ -1005,6 +1009,236 @@ async def test_terminal_get_uses_cached_attestation_after_row_retirement() -> No
         assert response.headers["X-Web-Evidence-Attestation"] == cached
     finally:
         await client.close()
+
+
+def _tool_call_response() -> Any:
+    call = SimpleNamespace(id="call_1", type="function",
+                           function=SimpleNamespace(name="web_search", arguments="{}"))
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="tool_calls",
+                message=SimpleNamespace(content=None, refusal=None, tool_calls=[call]),
+            )
+        ]
+    )
+
+
+async def _terminal_status(observer: NativeWebEvidence, body: dict[str, Any]) -> Any:
+    adapter = SimpleNamespace(_check_auth=lambda _request: None)
+    app = web.Application()
+
+    async def native_status(_request: web.Request) -> web.Response:
+        return web.json_response(body)
+
+    app.router.add_get(f"/v1/runs/{RUN_ID}", native_status)
+    observer.install(app, adapter)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get(f"/v1/runs/{RUN_ID}")
+        assert response.status == 200
+        return response.headers.get("X-Web-Evidence-Attestation")
+    finally:
+        await client.close()
+
+
+async def _budget_spent_run(observer: NativeWebEvidence) -> None:
+    """Live shape: every observed model turn calls a tool; the final answer is unobserved."""
+
+    async def native_run() -> None:
+        def turns() -> None:
+            observer.tool_execution(
+                tool_name="web_search",
+                args={"query": "current report"},
+                next_call=lambda _args: _search_result(),
+            )
+            tool_turn = _tool_call_response()
+            assert observer.llm_execution(
+                request={"model": "test"}, provider="test", base_url="https://example.com",
+                model="test", api_mode="chat_completions", next_call=lambda _request: tool_turn,
+            ) is tool_turn
+            # Hermes's turn-budget summary call does not pass through LLM middleware.
+
+        await asyncio.to_thread(turns)
+
+    task = asyncio.create_task(native_run())
+    observer.adapter = SimpleNamespace(_active_run_tasks={RUN_ID: task})
+    observer._get_session_key = lambda: RUN_ID
+    binding = _RequestBinding(
+        CONTRACT, GENERATION, "Summarize the report.", deadline=time.monotonic() + 120,
+    )
+    assert observer._accepted_row(binding, RUN_ID, False) is not None
+    await task
+
+
+UNOBSERVED_FINAL = "Here is what I found so far about the report."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retired", [False, True])
+async def test_unobserved_terminal_answer_is_delivered_ungrounded_and_bound(
+    retired: bool, capsys: Any
+) -> None:
+    presentation = _Presentation()
+    observer = _observer(presentation)
+    await _budget_spent_run(observer)
+    if retired:
+        with observer.lock:
+            observer._retire_locked()
+        assert RUN_ID not in observer.rows
+
+    raw = await _terminal_status(
+        observer, {"object": "hermes.run", "run_id": RUN_ID, "status": "completed",
+                   "output": UNOBSERVED_FINAL},
+    )
+
+    assert presentation.calls == 0
+    assert attestation_valid(raw, GENERATION, RUN_ID, UNOBSERVED_FINAL)
+    report = json.loads(raw)
+    assert report["disposition"] == "ungrounded"
+    assert report["reason"] == "unobserved"
+    assert report["catalog_count"] == report["passage_count"] == 0
+    assert not attestation_valid(raw, GENERATION, RUN_ID, UNOBSERVED_FINAL + " ")
+    assert capsys.readouterr().out == (
+        '[web-evidence] {"category":"ungrounded","count":1,"reason":"unobserved"}\n'
+    )
+
+
+def _final_turn(observer: NativeWebEvidence, response: Any) -> Any:
+    return observer.llm_execution(
+        request={"model": "test"}, provider="test", base_url="https://example.com",
+        model="test", api_mode="chat_completions", next_call=lambda _request: response,
+    )
+
+
+def _web_turn(observer: NativeWebEvidence, raw: str | None = None) -> None:
+    observer.tool_execution(
+        tool_name="web_search", args={"query": "current report"},
+        next_call=lambda _args: _search_result() if raw is None else raw,
+    )
+
+
+class _RefusalScenario:
+    """Drive one real refusal path; ``status`` is the completed terminal output."""
+
+    def __init__(self, monkeypatch: Any) -> None:
+        self.monkeypatch = monkeypatch
+        self.presentation = _Presentation()
+        self.observer = _observer(self.presentation)
+        self.foreign: asyncio.Task[Any] | None = None
+
+    async def run(self, reason: str) -> str | None:
+        observer = self.observer
+        task = asyncio.current_task()
+        assert task is not None
+        _bind_run(observer, task)
+        row = observer.rows[RUN_ID]
+        if reason == "capture":
+            _web_turn(observer, "private malformed body")
+        elif reason == "binding":
+            self.foreign = asyncio.create_task(asyncio.sleep(60))
+            observer.adapter._active_run_tasks[RUN_ID] = self.foreign
+            _web_turn(observer)
+            observer.adapter._active_run_tasks[RUN_ID] = task
+        elif reason == "closed":
+            row["cancelled"] = True
+            _web_turn(observer)
+        elif reason == "unobserved":
+            _web_turn(observer)
+            return None
+        elif reason == "insufficient":
+            # A known extract failure seeds the requested URL with no passage.
+            observer.tool_execution(
+                tool_name="web_extract", args={"urls": [URL]},
+                next_call=lambda _args: json.dumps({"success": False, "error": "backend"}),
+            )
+            returned = await asyncio.to_thread(_final_turn, observer, _final_response())
+            return cast(str, returned.choices[0].message.content)
+        else:
+            _web_turn(observer)
+            response = _final_response()
+            if reason == "deadline":
+                row["deadline"] = 0.0
+            elif reason == "final_response":
+                response.choices[0].finish_reason = "length"
+            elif reason == "input_bound":
+                import hermes_realtime.integration.native_web_evidence as module
+
+                self.monkeypatch.setattr(module, "_MAX_INPUT_BYTES", 8)
+            elif reason == "internal":
+                import hermes_realtime.integration.native_web_evidence as module
+
+                def broken(*_args: Any) -> str:
+                    raise RuntimeError("synthetic")
+
+                self.monkeypatch.setattr(module, "presentation_input", broken)
+            elif reason == "presentation_failed":
+                async def failed(*_args: Any) -> Any:
+                    raise ValueError("fixed-test-provider-failure")
+
+                self.presentation.complete = failed  # type: ignore[method-assign]
+            elif reason == "route":
+                def wrong_route(_kw: dict[str, Any]) -> None:
+                    raise ValueError("presentation-route")
+
+                self.presentation.validate_route = wrong_route  # type: ignore[method-assign]
+            elif reason == "source_changed":
+                original = self.presentation.complete
+
+                async def changing(*args: Any) -> Any:
+                    row["passages"] = MappingProxyType(dict(row["passages"]))
+                    return await original(*args)
+
+                self.presentation.complete = changing  # type: ignore[method-assign]
+            returned = await asyncio.to_thread(_final_turn, observer, response)
+            return cast(str, returned.choices[0].message.content)
+        return cast(str, (await asyncio.to_thread(_final_turn, observer, _final_response()))
+                    .choices[0].message.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", sorted(REFUSED_REASONS))
+async def test_each_refusal_reason_reaches_attestation_and_marker(
+    reason: str, monkeypatch: Any, capsys: Any
+) -> None:
+    _install_fake_openai_models(monkeypatch)
+    scenario = _RefusalScenario(monkeypatch)
+    try:
+        published = await scenario.run(reason)
+        if reason == "unobserved":
+            # A completed terminal whose output the observer cannot bind.
+            raw = await _terminal_status(
+                scenario.observer,
+                {"object": "hermes.run", "run_id": RUN_ID, "status": "completed",
+                 "output": None},
+            )
+            assert raw is not None
+            assert attestation_outcome(raw, GENERATION, RUN_ID, "anything") is None
+            report = json.loads(raw)
+        else:
+            assert published == '{"error": "policy_refused"}'
+            raw = scenario.observer.reports[RUN_ID]
+            assert attestation_outcome(raw, GENERATION, RUN_ID, published) == ("refused", reason)
+            report = json.loads(raw)
+        assert report["disposition"] == "refused"
+        assert report["reason"] == reason
+        markers = [line for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[web-evidence] ")]
+        assert markers == [
+            "[web-evidence] " + json.dumps(
+                {"category": "refused", "count": 1, "reason": reason}, separators=(",", ":"))
+        ]
+    finally:
+        if scenario.foreign is not None:
+            scenario.foreign.cancel()
+            await asyncio.gather(scenario.foreign, return_exceptions=True)
+
+
+def test_refusal_reason_table_is_closed_over_the_contract() -> None:
+    from hermes_realtime.integration.native_web_evidence import _REASONS
+
+    assert set(_REASONS.values()) <= REFUSED_REASONS
 
 
 @pytest.mark.asyncio

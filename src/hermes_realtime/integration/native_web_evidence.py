@@ -35,12 +35,15 @@ from .evidence_presentation import (
 from .presentation_transport import Presentation, cancel_presentation
 from .web_evidence_contract import (
     ATTESTATION_HEADER,
+    ATTESTATION_VERSION,
     CONTRACT,
     CONTRACT_HEADER,
     GENERATION_HEADER,
     READY_PATH,
+    REFUSED_REASONS,
     REPORT_MAX_BYTES,
     RUN_HEADER,
+    UNGROUNDED_REASONS,
     valid_generation,
 )
 
@@ -52,6 +55,41 @@ _MAX_URL_BYTES = 8192
 _MAX_INPUT_BYTES = 16_384
 _METADATA_TOOLS = frozenset({"tool_search", "tool_describe"})
 _WEB_TOOLS = frozenset({"web_search", "web_extract"})
+_REASONLESS = frozenset({"presented", "no_web", "mixed_ungrounded"})
+# Fixed error categories raised in this package -> refusal reason. Unlisted errors take
+# the default of the stage that raised them.
+_REASONS = MappingProxyType({
+    "native-final-response": "final_response",
+    "native-result-bound": "capture",
+    "presentation-deadline": "deadline",
+    "presentation-input-bound": "input_bound",
+    "presentation-model": "route",
+    "presentation-ownership": "binding",
+    "presentation-route": "route",
+    "web-evidence-binding": "binding",
+    "web-evidence-catalog-bound": "input_bound",
+    "web-evidence-closed": "closed",
+    "web-evidence-deadline": "deadline",
+    "web-evidence-input-bound": "input_bound",
+    "web-evidence-insufficient": "insufficient",
+    "web-evidence-late-result": "binding",
+    "web-evidence-passage-count": "input_bound",
+    "web-evidence-publish-closed": "closed",
+    "web-evidence-run-id": "binding",
+    "web-evidence-session-unavailable": "binding",
+    "web-evidence-source-changed": "source_changed",
+    "web-evidence-task-binding": "binding",
+    "web-evidence-task-map": "binding",
+    "web-evidence-task-missing": "binding",
+})
+
+
+def _reason(error: BaseException, default: str) -> str:
+    if isinstance(error, asyncio.CancelledError):
+        return "closed"
+    category = error.args[0] if type(error) is ValueError and error.args else None
+    reason = _REASONS.get(category, default) if type(category) is str else default
+    return reason if reason in REFUSED_REASONS else "internal"
 
 
 @dataclass(slots=True)
@@ -218,6 +256,9 @@ class NativeWebEvidence:
         self.lock = threading.RLock()
         self.rows: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.reports: OrderedDict[str, str] = OrderedDict()
+        # Retired rows whose final answer was never observed, kept (source-free) so the
+        # terminal status read can still decide them against the exact output.
+        self._unsettled: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._pending = 0
         self.adapter: Any = None
         self._get_session_key: Callable[[], str] | None = None
@@ -275,6 +316,7 @@ class NativeWebEvidence:
             "truncated_count": 0,
             "missing_count": 0,
             "disposition": None,
+            "reason": None,
             "input_sha256": None,
             "input_bytes": 0,
             "catalog_sha256": None,
@@ -289,6 +331,10 @@ class NativeWebEvidence:
                 row["closed"] = True
                 self._drop_source_locked(row)
                 del self.rows[run_id]
+                if row["disposition"] is None:
+                    self._unsettled[run_id] = row
+                    while len(self._unsettled) > _MAX_ROWS:
+                        self._unsettled.popitem(last=False)
 
     def _row_for_effect(self) -> tuple[str, dict[str, Any] | None]:
         run_id = self._get_run_id()
@@ -303,11 +349,11 @@ class NativeWebEvidence:
             task = self._task_for_run(run_id)
             if row["native_task"] is not task:
                 row["invalid"] = True
-                row["disposition"] = "refused"
+                self._refused_locked(row, "binding")
                 raise ValueError("web-evidence-binding")
             if row["cancelled"] or row["closed"]:
                 row["invalid"] = True
-                row["disposition"] = "refused"
+                self._refused_locked(row, "closed")
                 raise ValueError("web-evidence-closed")
             return run_id, row
 
@@ -347,7 +393,7 @@ class NativeWebEvidence:
                 ):
                     return existing
                 existing["invalid"] = True
-                existing["disposition"] = "refused"
+                self._refused_locked(existing, "binding")
                 return None
             if replayed:
                 raw = self.reports.get(run_id)
@@ -373,18 +419,34 @@ class NativeWebEvidence:
             self.rows[run_id] = row
             return row
 
-    def _refuse(self, run_id: str, row: dict[str, Any] | None) -> None:
-        emit = False
+    @staticmethod
+    def _refused_locked(row: dict[str, Any], reason: str) -> None:
+        """Refuse ``row``; the first reason of a refusal is the one reported."""
+        if row.get("disposition") != "refused" or row.get("reason") is None:
+            row["reason"] = reason
+        row["disposition"] = "refused"
+
+    def _refuse(self, run_id: str, row: dict[str, Any] | None, reason: str) -> None:
+        emit: str | None = None
         try:
             with self.lock:
                 if row is not None and self.rows.get(run_id) is row:
-                    emit = not row.get("refusal_logged", False)
-                    row["refusal_logged"] = True
                     row["invalid"] = True
-                    row["disposition"] = "refused"
+                    self._refused_locked(row, reason)
+                    if not row.get("refusal_logged", False):
+                        emit = row["reason"]
+                    row["refusal_logged"] = True
         finally:
-            if emit:
-                print('[web-evidence] {"category":"refused","count":1}', flush=True)
+            if emit is not None:
+                self._marker("refused", emit)
+
+    @staticmethod
+    def _marker(category: str, reason: str) -> None:
+        print("[web-evidence] " + json.dumps(
+            {"category": category, "count": 1,
+             "reason": reason if reason in REFUSED_REASONS | UNGROUNDED_REASONS else "internal"},
+            separators=(",", ":"), sort_keys=True,
+        ), flush=True)
 
     def _observe_result(
         self, run_id: str, row: dict[str, Any], tool: str, args: object, result: object
@@ -446,8 +508,8 @@ class NativeWebEvidence:
                 row["passage_count"] = sum(len(values) for values in row["passages"].values())
                 if row["passage_count"] > 2048:
                     raise ValueError("web-evidence-passage-count")
-        except BaseException:
-            self._refuse(run_id, row)
+        except BaseException as error:
+            self._refuse(run_id, row, _reason(error, "capture"))
 
     def tool_execution(self, **kw: Any) -> Any:
         """Wrap the native effect exactly once and retain its original result."""
@@ -468,14 +530,14 @@ class NativeWebEvidence:
             if row is not None and tool in _WEB_TOOLS:
                 with self.lock:
                     row["web_seen"] = True
-        except BaseException:
+        except BaseException as error:
             run_id, row = "", None
             try:
                 run_id = self._get_run_id()
                 refused_row = self.rows.get(run_id)
             except BaseException:
                 refused_row = None
-            self._refuse(run_id, refused_row)
+            self._refuse(run_id, refused_row, _reason(error, "binding"))
         try:
             result = next_call(args)
         except BaseException:
@@ -503,7 +565,7 @@ class NativeWebEvidence:
             raise RuntimeError("native LLM execution middleware payload invalid")
         try:
             run_id, row = self.scope()
-        except BaseException:
+        except BaseException as error:
             try:
                 run_id = self._get_run_id()
                 row = self.rows.get(run_id)
@@ -511,13 +573,13 @@ class NativeWebEvidence:
                 row = None
             if row is None:
                 return next_call(request)
-            self._refuse(run_id, row)
+            self._refuse(run_id, row, _reason(error, "binding"))
         if row is None:
             return next_call(request)
         try:
             self.presentation.validate_route(kw)
-        except BaseException:
-            self._refuse(run_id, row)
+        except BaseException as error:
+            self._refuse(run_id, row, _reason(error, "route"))
         result = next_call(request)
         if inspect.isawaitable(result):
             return self._finish_after_await(run_id, row, result, kw)
@@ -536,6 +598,7 @@ class NativeWebEvidence:
     async def _finish_response(
         self, run_id: str, row: dict[str, Any], response: Any, kw: dict[str, Any]
     ) -> Any:
+        stage = "internal"
         try:
             api_mode = kw.get("api_mode", "chat_completions")
             if _has_tool_calls(response, api_mode):
@@ -592,9 +655,11 @@ class NativeWebEvidence:
                 "wire_requests": 0,
                 "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             }
+            stage = "presentation_failed"
             formatted = await self.presentation.complete(self, run_id, row, source_input, evidence)
             rendered = render_presentation_response(
                 formatted, catalog, api_mode, evidence, passages=passages)
+            stage = "internal"
             with self.lock:
                 self._assert_current(run_id, row, enforce_deadline=True)
                 if row["urls"] != set(catalog) or row["passages"] is not passages:
@@ -617,10 +682,10 @@ class NativeWebEvidence:
                 self._drop_source_locked(row)
                 return published
         except asyncio.CancelledError:
-            self._refuse(run_id, row)
+            self._refuse(run_id, row, "closed")
             raise
-        except BaseException:
-            self._refuse(run_id, row)
+        except BaseException as error:
+            self._refuse(run_id, row, _reason(error, stage))
             refusal = self._refusal_response(response, kw.get("api_mode", "chat_completions"))
             try:
                 text = _terminal_text(refusal, kw.get("api_mode", "chat_completions"))
@@ -666,21 +731,32 @@ class NativeWebEvidence:
             or row["cancelled"]
             or row["closed"]
             or row["invalid"]
-            or (enforce_deadline and time.monotonic() >= row["deadline"])
         ):
             raise ValueError("web-evidence-publish-closed")
+        if enforce_deadline and time.monotonic() >= row["deadline"]:
+            raise ValueError("web-evidence-deadline")
 
     def _report(self, run_id: str, row: dict[str, Any]) -> str:
         disposition = row.get("disposition")
-        if disposition not in {"presented", "no_web", "mixed_ungrounded"}:
+        reason = row.get("reason")
+        if disposition in _REASONLESS:
+            reason = None
+        elif disposition == "ungrounded" and reason in UNGROUNDED_REASONS:
+            pass
+        elif disposition is None:
+            disposition, reason = "refused", "unobserved"
+        else:
             disposition = "refused"
+            if reason not in REFUSED_REASONS:
+                reason = "internal"
         presented = disposition == "presented"
         body = {
-            "version": 1,
+            "version": ATTESTATION_VERSION,
             "contract": CONTRACT,
             "generation": row["generation"],
             "run_id": run_id,
             "disposition": disposition,
+            "reason": reason,
             "output_sha256": row.get("output_sha256"),
             "input_sha256": row.get("input_sha256") if presented else None,
             "input_bytes": row.get("input_bytes", 0) if presented else 0,
@@ -695,11 +771,42 @@ class NativeWebEvidence:
             raise ValueError("web-evidence-report-bound")
         return raw
 
-    def _finish_report(self, run_id: str, row: dict[str, Any]) -> str:
+    def _finish_report(self, run_id: str, status: object, output: object) -> str | None:
+        """Decide the run at its terminal status read; nothing is left undecided here.
+
+        A row whose final answer no middleware call observed (Hermes's turn-budget summary
+        today, any other unobserved model call tomorrow) and that nothing refused is
+        delivered as ``ungrounded``: no sources claimed, bound to the exact completed
+        output, as ``no_web`` and ``mixed_ungrounded`` deliver ordinary output.
+        """
+        marker: str | None = None
         with self.lock:
-            if self.rows.get(run_id) is not row:
-                raise ValueError("web-evidence-row-retired")
-            return self._store_report_locked(run_id, row)
+            row = self.rows.get(run_id)
+            if row is None:
+                row = self._unsettled.pop(run_id, None)
+                if row is None:
+                    return self.reports.get(run_id)
+            if status == "completed":
+                if row["disposition"] is None:
+                    row["closed"] = True
+                    self._drop_source_locked(row)
+                    if type(output) is str and not row.get("presentation_active"):
+                        row["disposition"] = "ungrounded"
+                        row["reason"] = "unobserved"
+                        marker = "ungrounded"
+                    else:
+                        self._refused_locked(row, "unobserved")
+                        marker = "refused"
+                if (type(output) is str and row["output_sha256"] is None
+                        and row["disposition"] in {"ungrounded", "refused"}):
+                    # Bind the decision to this exact terminal output.
+                    row["output_sha256"] = hashlib.sha256(output.encode("utf-8")).hexdigest()
+            report = self._store_report_locked(run_id, row)
+        if marker == "ungrounded":
+            self._marker("ungrounded", "unobserved")
+        elif marker == "refused":
+            self._marker("refused", "unobserved")
+        return report
 
     def _store_report_locked(self, run_id: str, row: dict[str, Any]) -> str:
         report = self._report(run_id, row)
@@ -720,8 +827,12 @@ class NativeWebEvidence:
             row = self.rows.get(run_id)
             if row is not None:
                 row["cancelled"] = row["closed"] = True
-                row["disposition"] = "refused"
+                self._refused_locked(row, "closed")
                 cancel_presentation(self, row)
+            row = self._unsettled.get(run_id)
+            if row is not None:
+                row["cancelled"] = True
+                self._refused_locked(row, "closed")
 
     def close(self) -> None:
         """Close new observer work and cancel only owned presentation tasks."""
@@ -729,8 +840,11 @@ class NativeWebEvidence:
             self._closed = True
             for row in self.rows.values():
                 row["cancelled"] = row["closed"] = True
-                row["disposition"] = "refused"
+                self._refused_locked(row, "closed")
                 cancel_presentation(self, row)
+            for row in self._unsettled.values():
+                row["cancelled"] = True
+                self._refused_locked(row, "closed")
 
     def install(self, app: web.Application, adapter: Any) -> None:
         authorize = getattr(adapter, "_check_auth", None)
@@ -820,11 +934,10 @@ class NativeWebEvidence:
                 try:
                     status = json.loads(getattr(response, "body", b""))
                     if status.get("status") in {"completed", "failed", "cancelled", "interrupted"}:
+                        report = self._finish_report(
+                            run_id, status.get("status"), status.get("output"))
                         with self.lock:
                             row = self.rows.get(run_id)
-                            report = self.reports.get(run_id)
-                        if row is not None:
-                            report = self._finish_report(run_id, row)
                         if report is not None:
                             response.headers[ATTESTATION_HEADER] = report
                         if row is not None:
