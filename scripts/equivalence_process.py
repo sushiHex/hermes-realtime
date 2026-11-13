@@ -9,6 +9,7 @@ import os
 import secrets
 import shutil
 import socket
+import struct
 import sys
 import tempfile
 import time
@@ -50,6 +51,39 @@ def _require_ack(frame: Any, nonce: str, sequence: int) -> None:
     )
 
 
+# GetExtendedTcpTable(AF_INET, TCP_TABLE_OWNER_PID_LISTENER) returns MIB_TCPTABLE_OWNER_PID:
+# a DWORD count, then MIB_TCPROW_OWNER_PID rows of six DWORDs (dwState, dwLocalAddr,
+# dwLocalPort, dwRemoteAddr, dwRemotePort, dwOwningPid).
+_AF_INET = 2
+_TCP_TABLE_OWNER_PID_LISTENER = 3
+_TCP_ROW_OWNER_PID = struct.Struct("<6I")
+
+
+def _require_owned_listener_table(table: bytes, port: int, pid: int) -> None:
+    """Require exactly one kernel-published listener on ``port``: 127.0.0.1, owned by ``pid``.
+
+    The kernel decides which endpoints are listeners by publishing them in the listener
+    table, so ``dwState`` is not consulted; some Windows builds report it as 0 for a held
+    listening socket.
+    """
+    _require(type(port) is int and 1 <= port <= 65535, "invalid signaling port")
+    _require(type(table) is bytes, "TCP owner table is not bytes")
+    count = int.from_bytes(table[:4], "little")
+    end = 4 + count * _TCP_ROW_OWNER_PID.size
+    _require(end <= len(table), "TCP owner table is truncated")
+    listeners = []
+    for _state, local_address, local_port, remote_address, remote_port, owner in (
+        _TCP_ROW_OWNER_PID.iter_unpack(table[4:end])
+    ):
+        if socket.ntohs(local_port & 0xFFFF) == port:
+            address = socket.inet_ntoa(local_address.to_bytes(4, "little"))
+            listeners.append((address, remote_address, remote_port, owner))
+    _require(
+        listeners == [("127.0.0.1", 0, 0, pid)],
+        "signaling listener is not the retained loopback LiveKit process",
+    )
+
+
 def _require_owned_listener(port: int, pid: int) -> None:
     """Match the selected signaling socket to an already retained Job member."""
     _require(type(port) is int and 1 <= port <= 65535, "invalid signaling port")
@@ -64,28 +98,20 @@ def _require_owned_listener(port: int, pid: int) -> None:
     ]
     api.GetExtendedTcpTable.restype = ctypes.c_uint32
     size = ctypes.c_uint32()
+    table_class = _TCP_TABLE_OWNER_PID_LISTENER
     _require(
-        api.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 5, 0) == 122,
+        api.GetExtendedTcpTable(None, ctypes.byref(size), False, _AF_INET, table_class, 0) == 122,
         "TCP owner table size is unavailable",
     )
     _require(4 <= size.value <= 8 * 1024 * 1024, "TCP owner table exceeds its bound")
-    buffer = (ctypes.c_byte * size.value)()
+    capacity = size.value
+    buffer = (ctypes.c_byte * capacity)()
     _require(
-        api.GetExtendedTcpTable(buffer, ctypes.byref(size), False, 2, 5, 0) == 0,
+        api.GetExtendedTcpTable(buffer, ctypes.byref(size), False, _AF_INET, table_class, 0) == 0,
         "TCP owner table changed or failed",
     )
-    values = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_uint32))
-    count = int(values[0])
-    _require(4 + count * 24 <= size.value, "TCP owner table is truncated")
-    listeners = []
-    for index in range(count):
-        row = tuple(int(values[1 + index * 6 + offset]) for offset in range(6))
-        if row[0] == 2 and socket.ntohs(row[2] & 0xFFFF) == port:
-            listeners.append((socket.inet_ntoa(row[1].to_bytes(4, "little")), row[5]))
-    _require(
-        listeners == [("127.0.0.1", pid)],
-        "signaling listener is not the retained loopback LiveKit process",
-    )
+    _require(4 <= size.value <= capacity, "TCP owner table exceeds its bound")
+    _require_owned_listener_table(ctypes.string_at(buffer, size.value), port, pid)
 
 
 def _read_frame(fd: int, deadline: float) -> Any:
