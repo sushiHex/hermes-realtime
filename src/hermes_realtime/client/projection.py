@@ -12,6 +12,10 @@ from types import MappingProxyType
 from typing import cast
 
 from hermes_realtime.evidence.models import ProjectionReservation
+from hermes_realtime.protocol.identifiers import METRIC_LABEL as _METRIC_LABEL
+from hermes_realtime.protocol.identifiers import PRIVATE_HANDLE as _PRIVATE_HANDLE
+from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID
+from hermes_realtime.protocol.identifiers import TURN_ID as _TURN_ID
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
     MAX_LEGACY_RESULT_CHARS,
@@ -59,12 +63,6 @@ _EVENT_KINDS = frozenset(
     }
 )
 _KEY = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}\Z")
-_TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}\Z")
-_TURN_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}\Z")
-_METRIC_LABEL = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
-_PRIVATE_HANDLE = re.compile(
-    r"(?:deleg_[A-Za-z0-9_-]*|run_[A-Za-z0-9_-]{8,}|subagent_[A-Za-z0-9_-]+)"
-)
 
 PublicValue = str | int | bool | None
 

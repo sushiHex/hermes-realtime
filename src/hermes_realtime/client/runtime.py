@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import re
 import ssl
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -28,6 +27,7 @@ from hermes_realtime.production_observation import (
     CloseStageV1,
     _ProductionObservationRecorderV1,
 )
+from hermes_realtime.protocol.identifiers import WORKER_IDENTITY
 from hermes_realtime.search_egress import SearchEgressAuthority
 
 from .bootstrap import (
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 class BrowserClientRuntime:
     """Compose one browser HTTP surface around one conversation worker."""
 
-    _WORKER_IDENTITY = re.compile(r"worker_[A-Za-z0-9_-]{8,64}\Z")
+    _WORKER_IDENTITY = WORKER_IDENTITY
 
     def __init__(
         self,

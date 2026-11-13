@@ -27,6 +27,7 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedPayload,
     WorkTerminalStatus,
 )
+from hermes_realtime.protocol.identifiers import MAX_IDENTIFIER_CHARS as _MAX_IDENTIFIER_CHARS
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
     MAX_LEGACY_RESULT_CHARS,
@@ -35,7 +36,6 @@ from hermes_realtime.result_limits import (
 
 from .bridge import BridgeProtocolError
 
-_MAX_IDENTIFIER_CHARS = 128
 _MAX_TEXT_CHARS = 1024
 _MAX_SEQUENCE = (1 << 63) - 1
 

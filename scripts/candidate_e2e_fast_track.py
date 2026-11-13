@@ -120,6 +120,7 @@ def run_fast_track(
     *,
     git_executable: Path | None,
     require_livekit: bool = False,
+    native_only: bool = False,
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
     livekit_pid: int | None = None,
@@ -141,6 +142,7 @@ def run_fast_track(
             root,
             git_executable=pin.path,
             livekit=require_livekit,
+            native_only=native_only,
             livekit_executable=livekit_executable,
             livekit_executable_sha256=livekit_executable_sha256,
             livekit_pid=livekit_pid,
@@ -216,6 +218,7 @@ def main() -> None:
     parser.add_argument("--candidate", type=Path, default=Path.cwd())
     parser.add_argument("--git-executable", type=Path)
     parser.add_argument("--require-livekit", action="store_true")
+    parser.add_argument("--native-only", action="store_true")
     parser.add_argument("--livekit-executable", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--livekit-executable-sha256", help=argparse.SUPPRESS)
     parser.add_argument("--livekit-pid", type=int, help=argparse.SUPPRESS)
@@ -236,15 +239,22 @@ def main() -> None:
             parser.error("--livekit-pid must be positive")
     elif any(value is not None for value in ownership):
         parser.error("LiveKit ownership arguments require --require-livekit")
+    if arguments.native_only and not arguments.require_livekit:
+        parser.error("--native-only requires --require-livekit")
     run_fast_track(
         arguments.candidate,
         git_executable=arguments.git_executable,
         require_livekit=arguments.require_livekit,
+        native_only=arguments.native_only,
         livekit_executable=arguments.livekit_executable,
         livekit_executable_sha256=arguments.livekit_executable_sha256,
         livekit_pid=arguments.livekit_pid,
     )
-    print("candidate E2E fast track passed")
+    print(
+        release_gate.NATIVE_ONLY_PASSED
+        if arguments.native_only
+        else "candidate E2E fast track passed"
+    )
 
 
 if __name__ == "__main__":

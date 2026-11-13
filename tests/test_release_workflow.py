@@ -31,7 +31,9 @@ def _gate_test_commands(source: str) -> list[tuple[str, set[str]]]:
     commands: list[tuple[str, set[str]]] = []
     for node in ast.walk(ast.parse(source)):
         if not (
-            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "run"
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("run", "run_native_stage", "run_default_suite")
         ):
             continue
         literal_args = {
@@ -126,9 +128,11 @@ def test_native_release_gate_runs_the_synthetic_full_host_audio_tracer() -> None
     livekit_block = script.split("def check_livekit(", maxsplit=1)[1].split(
         "def run_script_mypy(", maxsplit=1
     )[0]
+    selection = script.split("NATIVE_STAGE_TESTS = (", maxsplit=1)[1].split("\n)\n", maxsplit=1)[0]
 
+    assert livekit_block.count("*NATIVE_STAGE_TESTS,") == 1
     assert (
-        livekit_block.count('"tests/integration/test_qualification_full_host_synthetic_audio.py"')
+        selection.count('"tests/integration/test_qualification_full_host_synthetic_audio.py"')
         == 1
     )
 
@@ -356,6 +360,11 @@ def test_windows_release_jobs_run_the_candidate_e2e_fast_track() -> None:
     assert "--candidate $env:GITHUB_WORKSPACE" in hermetic_job
     assert "--candidate $env:GITHUB_WORKSPACE" in native_job
     assert "--require-livekit" in native_job
+    # The hermetic job is the one that runs the default suite, browser build and
+    # packaging; the native job stops after the stage that needs the native server.
+    assert native_job.count("--require-livekit --native-only") == 1
+    assert "--native-only" not in hermetic_job
+    assert "--require-livekit" not in hermetic_job
     assert "--livekit-executable $env:LIVEKIT_SERVER" in native_job
     assert "--livekit-executable-sha256 $env:LIVEKIT_SERVER_SHA256" in native_job
     assert "--livekit-pid $process.Id" in native_job

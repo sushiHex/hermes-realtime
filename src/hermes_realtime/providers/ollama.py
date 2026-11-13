@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from typing import Protocol, cast
@@ -28,6 +27,7 @@ from hermes_realtime.conversation.work_tools import (
     WORK_OBJECTIVE_CONTEXT_POLICY,
     WORK_ROUTING_POLICY,
 )
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN as _PRIVATE_AUTHORITY
 from hermes_realtime.providers._call_imitation import contains_tool_call_imitation
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
 from hermes_realtime.providers._work_claims import has_background_work_claim
@@ -65,7 +65,6 @@ _MAX_WORK_DECISION_BYTES = 65_536  # Retained decision JSON has a separate UTF-8
 _MAX_WORK_RESPONSE_BYTES = _MAX_RESPONSE_LINE_BYTES
 _MAX_WORK_RESPONSE_CHUNKS = 1024
 _MAX_WORK_REPLY_CHARS = 65_536
-_PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 # Model-output refusals that fail only the turn (#470). Any category not listed,
 # including private_authority and transport, protocol or bound checks, stays terminal.
 _TURN_REFUSAL_CATEGORIES = frozenset({

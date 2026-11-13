@@ -42,6 +42,7 @@ from hermes_realtime.conversation.work_tools import (
     WORK_ROUTING_POLICY,
     WorkStartResult,
 )
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN as _PRIVATE_AUTHORITY
 from hermes_realtime.providers._call_imitation import contains_tool_call_imitation
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
 from hermes_realtime.providers._work_claims import has_background_work_claim
@@ -186,7 +187,6 @@ _OVERSIZED_TOOL_RESULT = {
     "state": "rejected",
     "reason": "work control returned an oversized result",
 }
-_PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 _KNOWLEDGE_LOOKUP_CLAIM = re.compile(
     r"\b(?:lookup|search)(?:\s+results?)?\s+"
     r"(?:timed\s+out|failed|did\s+not|didn't)\b|"

@@ -65,6 +65,11 @@ speech-verification = [
 
 [dependency-groups]
 build = ["hatchling==1.27.0"]
+# The two native-stage tests that parse real `requests` and `yaml` objects.
+native-stage = [
+  "pyyaml>=6,<7",
+  "requests>=2.32,<3",
+]
 qualification-hermes = [
   "concurrent-log-handler==0.9.29",
   "cryptography==48.0.1",

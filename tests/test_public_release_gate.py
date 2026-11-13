@@ -52,6 +52,7 @@ def test_materialized_gate_forwards_native_git_selection_only_to_full_pytest(
         "--durations=0",
         "--durations-min=0.005",
         *expected,
+        f"--junitxml={tmp_path.parent / 'default-suite-test-outcomes.xml'}",
     )
     assert all("--native-git-executable" not in command for command in commands[:-1])
     provider_command = next(
@@ -389,6 +390,7 @@ def test_public_gate_has_no_private_history_baseline(
         "candidate",
         {
             "livekit": False,
+            "native_only": False,
             "livekit_executable": None,
             "livekit_executable_sha256": None,
             "livekit_pid": None,
