@@ -14,6 +14,7 @@ from hermes_realtime.evidence.models import (
     parse_evidence_revoke_request,
 )
 from hermes_realtime.protocol.identifiers import WORKER_IDENTITY
+from hermes_realtime.protocol.limits import utf16_units
 from hermes_realtime.result_limits import (
     LEGACY_RESULT_NOTICE,
     MAX_LEGACY_RESULT_CHARS,
@@ -662,7 +663,7 @@ class BrowserBootstrapApplication:
                     and event.kind == "task_result"
                     and data.get("status") == "completed"
                     and type(text) is str
-                    and len(text.encode("utf-16-le")) // 2 > MAX_LEGACY_RESULT_CHARS
+                    and utf16_units(text) > MAX_LEGACY_RESULT_CHARS
                 ):
                     data["text"] = LEGACY_RESULT_NOTICE
                 public_events.append(

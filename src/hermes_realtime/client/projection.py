@@ -16,6 +16,7 @@ from hermes_realtime.protocol.identifiers import METRIC_LABEL as _METRIC_LABEL
 from hermes_realtime.protocol.identifiers import PRIVATE_HANDLE as _PRIVATE_HANDLE
 from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID
 from hermes_realtime.protocol.identifiers import TURN_ID as _TURN_ID
+from hermes_realtime.protocol.limits import utf16_units
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
     MAX_LEGACY_RESULT_CHARS,
@@ -427,10 +428,13 @@ class BrowserEventProjection:
                 if status == "completed"
                 else MAX_LEGACY_RESULT_CHARS
             )
+            # A completed result is bounded in Unicode scalars. The browser bounds every other
+            # result with String.length, so those are counted in UTF-16 code units.
+            measure = len if status == "completed" else utf16_units
             if (
                 type(text) is not str
                 or not text.strip()
-                or len(text) > text_limit
+                or measure(text) > text_limit
                 or (status == "completed" and not has_valid_result_unicode(text))
             ):
                 raise ValueError("task result text is invalid")
