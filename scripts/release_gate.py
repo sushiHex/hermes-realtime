@@ -10,17 +10,19 @@ ambient worktree directories from affecting a release artifact.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.request
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import NoReturn
 
@@ -177,6 +179,239 @@ def clean_environment() -> dict[str, str]:
         environment.pop(name, None)
     environment["UV_NO_CONFIG"] = "1"
     return environment
+
+
+# Issue #279: the local declared-tool mode rebuilds each stage's PATH from the
+# exact executables that stage declares. Hosted Windows runners provide no
+# Codex or Ollama, so a local run that can still reach one cannot reproduce
+# hosted discovery. Explicit injection in tests remains the primary guarantee.
+NPX = "npx.cmd" if os.name == "nt" else "npx"
+PYTHON_STAGE_TOOLS = ("uv", "git")  # plus the Python 3.11 interpreter uv selects
+WEB_STAGE_TOOLS = ("node", NPM, NPX)  # npx ships beside npm in every Node install
+GUARDED_TOOLS = ("uv", "git", "python", "node", NPM, NPX, "codex", "ollama")
+DECLARED_TOOL_STAGES = frozenset({"setup", "uv", "web"})
+DECLARED_TOOL_REFUSALS = frozenset(
+    {
+        "undeclared_tool",
+        "reresolve_mismatch",
+        "unguarded_declared",
+        "not_installed",
+        "python_selection",
+        "python_reselection",
+        "system_directory",
+        "unsupported_platform",
+        "shell_internal_git",
+    }
+)
+
+
+class DeclaredToolRefusal(RuntimeError):
+    """A declared-tool guard rejection with a fixed category."""
+
+    def __init__(self, refusal: str, tool: str | None, message: str) -> None:
+        if type(refusal) is not str or refusal not in DECLARED_TOOL_REFUSALS:
+            raise ValueError("unknown declared-tool refusal category")
+        super().__init__(message)
+        self.refusal = refusal
+        self.tool = tool
+
+
+class _DeclaredToolStage:
+    def __init__(self) -> None:
+        self.name = "setup"
+
+
+@contextlib.contextmanager
+def _declared_tool_refusal_evidence() -> Iterator[_DeclaredToolStage]:
+    """Emit one bounded marker line when the guard refuses: categories, never paths."""
+    stage = _DeclaredToolStage()
+    record: dict[str, str | None] | None = None
+    try:
+        yield stage
+    except BaseException as error:
+        if type(error) is DeclaredToolRefusal:
+            refusal, tool = error.refusal, error.tool
+        else:
+            refusal, tool = type(error).__name__, None
+        record = {
+            "stage": stage.name if stage.name in DECLARED_TOOL_STAGES else "setup",
+            "refusal": refusal,
+            "tool": tool if type(tool) is str and tool in GUARDED_TOOLS else None,
+        }
+        raise
+    finally:
+        if record is not None:
+            print("[declared-tool-path] " + json.dumps(record), file=sys.stderr, flush=True)
+
+
+def resolve_on_path(name: str, path: str) -> Path | None:
+    """Resolve like a PATHEXT shell search, without the implicit current directory.
+
+    Implemented directly: ``shutil.which`` differs across supported Pythons in
+    current-directory and PATHEXT handling.
+    """
+    if type(name) is not str or type(path) is not str:
+        raise TypeError("tool name and PATH must be strings")
+    candidates: tuple[str, ...] = (name,)
+    if os.name == "nt":
+        extensions = [
+            extension
+            for extension in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep)
+            if extension
+        ]
+        if not any(name.upper().endswith(extension.upper()) for extension in extensions):
+            candidates = tuple(name + extension for extension in extensions)
+    for directory in path.split(os.pathsep):
+        if not directory:
+            continue
+        for candidate in candidates:
+            found = os.path.join(directory, candidate)
+            if os.path.isfile(found) and os.access(found, os.X_OK):
+                return Path(os.path.normcase(os.path.abspath(found)))
+    return None
+
+
+def trusted_system_directories() -> tuple[str, ...]:
+    if os.name != "nt":
+        raise DeclaredToolRefusal(
+            "unsupported_platform", None, "declared-tool PATH mode is only supported on Windows"
+        )
+    import ctypes
+    from ctypes import wintypes
+
+    function = ctypes.WinDLL("kernel32", use_last_error=True).GetSystemDirectoryW
+    function.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    function.restype = wintypes.UINT
+    buffer = ctypes.create_unicode_buffer(32768)
+    size = int(function(buffer, len(buffer)))
+    if not size or size >= len(buffer):
+        raise DeclaredToolRefusal(
+            "system_directory", None, "could not resolve the trusted Windows system directory"
+        )
+    system = Path(buffer.value)
+    # Windows' default system PATH.
+    return tuple(
+        str(directory)
+        for directory in (system, system / "Wbem", system / "WindowsPowerShell" / "v1.0")
+    )
+
+
+def declared_tool_environment(
+    base: dict[str, str],
+    tools: dict[str, Path],
+    *,
+    system_directories: tuple[str, ...],
+) -> dict[str, str]:
+    """Rebuild PATH from exact tool directories; refuse any guarded leak."""
+    for name, executable in tools.items():
+        if type(name) is not str or type(executable) is not type(Path()):
+            raise TypeError("declared tools must map names to exact paths")
+        if name not in GUARDED_TOOLS:
+            raise DeclaredToolRefusal(
+                "unguarded_declared", name, f"declared tool is not guarded: {name}"
+            )
+    directories = dict.fromkeys(str(executable.parent) for executable in tools.values())
+    environment = base | {"PATH": os.pathsep.join((*directories, *system_directories))}
+    # A directory is not a tool: re-resolve every guarded name in the built
+    # environment, so a shared directory cannot leak an undeclared tool.
+    for name in GUARDED_TOOLS:
+        resolved = resolve_on_path(name, environment["PATH"])
+        if name not in tools:
+            if resolved is not None:
+                raise DeclaredToolRefusal(
+                    "undeclared_tool", name, f"declared-tool PATH exposes undeclared tool: {name}"
+                )
+        elif resolved != Path(os.path.normcase(os.path.abspath(tools[name]))):
+            raise DeclaredToolRefusal(
+                "reresolve_mismatch",
+                name,
+                f"declared tool does not re-resolve to its exact executable: {name}",
+            )
+    return environment
+
+
+def uv_selected_python(uv: Path, environment: dict[str, str], cwd: Path) -> Path:
+    """Return the system Python 3.11 that uv's own ``--python 3.11`` discovery selects."""
+    completed = subprocess.run(
+        (str(uv), "python", "find", "--no-project", "--system", "3.11"),
+        cwd=cwd, env=environment, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, timeout=60, check=False,
+    )
+    if completed.returncode != 0 or len(completed.stdout.splitlines()) != 1:
+        raise DeclaredToolRefusal(
+            "python_selection", "python", "uv could not select a Python 3.11 interpreter"
+        )
+    return Path(os.path.normcase(os.path.abspath(completed.stdout.strip())))
+
+
+def is_shell_internal_git(git: Path) -> bool:
+    """Whether ``git`` is Git for Windows' ``mingw64``/``usr`` binary beside its ``cmd`` launcher.
+
+    Hosted runners launch the ``cmd\\git.exe`` launcher, which supplies Git's own
+    runtime directories to its children. The shell-internal binary alone does not:
+    a local clone crashes under a declared PATH.
+    """
+    if type(git) is not type(Path()):
+        raise TypeError("git must be an exact path")
+    directory = git.parent
+    return (
+        git.name.lower() == "git.exe"
+        and directory.name.lower() == "bin"
+        and directory.parent.name.lower() in {"mingw64", "usr"}
+        and (directory.parent.parent / "cmd" / "git.exe").is_file()
+    )
+
+
+def declared_stage_environments(
+    environment: dict[str, str], root: Path
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Bind the uv stages and the browser stages to their own declared tools."""
+    path = environment.get("PATH", "")
+    # Hosted runners have no user Git config (signing, hooks, aliases). System
+    # Git config stays, because hosted Git for Windows ships one too.
+    hosted = environment | {"GIT_CONFIG_GLOBAL": os.devnull}
+
+    def resolve(names: tuple[str, ...]) -> dict[str, Path]:
+        tools: dict[str, Path] = {}
+        for name in names:
+            resolved = resolve_on_path(name, path)
+            if resolved is None:
+                raise DeclaredToolRefusal(
+                    "not_installed", name, f"declared tool is not installed: {name}"
+                )
+            tools[name] = resolved
+        return tools
+
+    with _declared_tool_refusal_evidence() as stage:
+        system = trusted_system_directories()
+        stage.name = "uv"
+        python_tools = resolve(PYTHON_STAGE_TOOLS)
+        if is_shell_internal_git(python_tools["git"]):
+            raise DeclaredToolRefusal(
+                "shell_internal_git",
+                "git",
+                "declared git is Git for Windows' shell-internal binary; launch the gate from "
+                "PowerShell or cmd so Git\\cmd\\git.exe resolves",
+            )
+        stage.name = "web"
+        web_tools = resolve(WEB_STAGE_TOOLS)
+        stage.name = "uv"
+        python_tools["python"] = uv_selected_python(python_tools["uv"], environment, root)
+        python_environment = declared_tool_environment(
+            hosted, python_tools, system_directories=system
+        )
+        if (
+            uv_selected_python(python_tools["uv"], python_environment, root)
+            != python_tools["python"]
+        ):
+            raise DeclaredToolRefusal(
+                "python_reselection",
+                "python",
+                "declared-tool PATH: uv no longer selects the declared Python 3.11",
+            )
+        stage.name = "web"
+        web_environment = declared_tool_environment(hosted, web_tools, system_directories=system)
+    return python_environment, web_environment
 
 
 def clean_git_selection_environment() -> dict[str, str]:
@@ -896,10 +1131,14 @@ def gate_materialized_candidate(
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
     livekit_pid: int | None = None,
+    declared_tool_path: bool = False,
 ) -> None:
     """Qualify one already-materialized disposable candidate source tree."""
 
     environment = clean_environment()
+    web_environment = environment
+    if declared_tool_path:
+        environment, web_environment = declared_stage_environments(environment, root)
     workspace = root.parent
     reject_ambient_paths(root)
     scan_for_secrets(root)
@@ -996,9 +1235,9 @@ def gate_materialized_candidate(
         cwd=root,
         env=environment,
     )
-    run(NPM, "ci", "--ignore-scripts", cwd=root / "web", env=environment)
-    run(NPM, "test", *VITEST_DURATIONS, cwd=root / "web", env=environment)
-    run(NPM, "run", "build", cwd=root / "web", env=environment)
+    run(NPM, "ci", "--ignore-scripts", cwd=root / "web", env=web_environment)
+    run(NPM, "test", *VITEST_DURATIONS, cwd=root / "web", env=web_environment)
+    run(NPM, "run", "build", cwd=root / "web", env=web_environment)
     check_static_parity(root, packaged_static)
     validate_disclosure_manifest(root / "src")
     artifacts = root / "release-artifacts"
@@ -1020,6 +1259,7 @@ def gate(
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
     livekit_pid: int | None = None,
+    declared_tool_path: bool = False,
 ) -> None:
     # Resolved once, printed, then archived, so the named revision is the
     # archived revision by construction rather than by two reads agreeing.
@@ -1038,6 +1278,7 @@ def gate(
             livekit_executable=livekit_executable,
             livekit_executable_sha256=livekit_executable_sha256,
             livekit_pid=livekit_pid,
+            declared_tool_path=declared_tool_path,
         )
     print("release gate passed")
 
@@ -1162,6 +1403,11 @@ def main() -> None:
     parser.add_argument("--livekit-executable-sha256", help=argparse.SUPPRESS)
     parser.add_argument("--livekit-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument(
+        "--declared-tool-path",
+        action="store_true",
+        help="local check: run each stage with PATH rebuilt from its exact declared tools",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="run adversarial release-gate checks without building",
@@ -1192,6 +1438,7 @@ def main() -> None:
         livekit_executable=arguments.livekit_executable,
         livekit_executable_sha256=arguments.livekit_executable_sha256,
         livekit_pid=arguments.livekit_pid,
+        declared_tool_path=arguments.declared_tool_path,
     )
 
 
