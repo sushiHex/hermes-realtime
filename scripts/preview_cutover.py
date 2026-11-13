@@ -1286,6 +1286,17 @@ def stage_preflight_profile(plan: PreviewPlanV1) -> Path:
     return profile
 
 
+def _memory_provider_config_inspection(plan: PreviewPlanV1, profile: Path) -> str | None:
+    """The staged config's memory-provider category; configuration only, never a readback."""
+    if plan.policy_mode != "native":
+        return None
+    from scripts.native_work_profile import memory_provider_inspection
+
+    return memory_provider_inspection(
+        _profile_config(_read(profile / "config.yaml", _JSON_LIMIT))
+    )
+
+
 def run_preflight(plan_path: Path, home: Path) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
@@ -1322,7 +1333,7 @@ def prepare(plan_path: Path) -> dict[str, Any]:
         completed = run_preflight(staged_plan_path, profile)
         status = parse_preflight_result(completed)
     except ValueError as error:
-        status = _failure_status(error) if type(error) is PreviewRefusal else {
+        status = _failure_status(error) if _is_category_refusal(error) else {
             "category": "refused",
             "failure_kind": "RuntimeError",
             "failure_category": (
@@ -1365,6 +1376,7 @@ def prepare(plan_path: Path) -> dict[str, Any]:
         ),
         "output": str(plan.output),
         "policy_mode": plan.policy_mode,
+        "memory_provider_config_inspection": _memory_provider_config_inspection(plan, profile),
         "profile_complete": False,
         "preflight": "accepted",
     }
@@ -2576,9 +2588,15 @@ def stop_preview(output: Path, timeout: float = 180.0) -> dict[str, Any]:
     raise TimeoutError("stop_timeout")
 
 
-def _failure_status(error: BaseException) -> dict[str, str]:
+def _is_category_refusal(error: BaseException) -> bool:
+    """Only these exact types carry a fixed category that is safe to retain verbatim."""
+    from scripts.native_work_profile import NativeProfileRefusal
     from scripts.preview_readiness import PreviewReadinessRefusal
 
+    return type(error) in (PreviewRefusal, PreviewReadinessRefusal, NativeProfileRefusal)
+
+
+def _failure_status(error: BaseException) -> dict[str, str]:
     known = {
         "ValueError",
         "RuntimeError",
@@ -2588,11 +2606,11 @@ def _failure_status(error: BaseException) -> dict[str, str]:
         "ImportError",
         "PermissionError",
     }
-    kind = ("ValueError" if type(error) in (PreviewRefusal, PreviewReadinessRefusal)
-            else type(error).__name__)
+    refusal = _is_category_refusal(error)
+    kind = "ValueError" if refusal else type(error).__name__
     kind = kind if kind in known else "other"
     category = "preflight_failed"
-    if (type(error) in (PreviewRefusal, PreviewReadinessRefusal) and len(error.args) == 1
+    if (refusal and len(error.args) == 1
             and type(error.args[0]) is str and _LABEL.fullmatch(error.args[0])):
         category = error.args[0]
     return {"category": "refused", "failure_kind": kind, "failure_category": category}

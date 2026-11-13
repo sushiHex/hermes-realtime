@@ -19,6 +19,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Desktop MVP setup and diagnostic session | [Desktop MVP](desktop-mvp-diagnostic.md) |
 | Parameterized native-work voice preview | [Native work preview](native-work-preview.md) |
 | Host, browser, and media composition | [Local LiveKit and full-host setup](local-livekit.md) |
+| Operator acceptance steps for the current native preview profile | [Native preview acceptance procedure](native-preview-acceptance.md) |
 | Frozen desktop candidate and operator acceptance | [Desktop MVP acceptance](desktop-mvp-acceptance.md) |
 | Hermes dispatch, approvals, and cancellation | [Hermes bridge and API integration](hermes-bridge.md) |
 | Dependency upgrades, security assessment, and serial landing | [Dependency maintenance](dependency-maintenance.md) |

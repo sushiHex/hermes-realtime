@@ -37,6 +37,32 @@ def web_evidence_selected(config: dict[str, Any]) -> bool:
     return selected
 
 
+class NativeProfileRefusal(ValueError):
+    """A fixed, content-free category the preview retains as refusal evidence."""
+
+
+def memory_provider_inspection(config: dict[str, Any]) -> str:
+    """Refuse an external memory provider; report the config-only result by category.
+
+    At the pinned Hermes revision ``memory.provider`` alone selects the external
+    provider, and its empty-string default means built-in only. This inspects the
+    profile configuration; it is not a readback of a running gateway's memory state.
+    """
+    if "memory" not in config:
+        return "absent"
+    memory = config["memory"]
+    if type(memory) is not dict:
+        raise NativeProfileRefusal("memory_provider_refused")
+    if "provider" not in memory:
+        return "absent"
+    provider = memory["provider"]
+    if type(provider) is not str:
+        raise NativeProfileRefusal("memory_provider_refused")
+    if provider:
+        raise NativeProfileRefusal("memory_provider_selected")
+    return "builtin"
+
+
 def _server_config(server: StatusServer) -> dict[str, Any]:
     if (
         not server.command.is_absolute()
@@ -96,6 +122,7 @@ def validate_native_work_profile(config: dict[str, Any], server: StatusServer) -
     ):
         raise ValueError("native plugin capability refused")
     web_evidence_selected(config)
+    memory_provider_inspection(config)
     return {
         "version": 1,
         "mode": "native-work/v1",
