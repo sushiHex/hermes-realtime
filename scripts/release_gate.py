@@ -510,6 +510,68 @@ def _resolved_commit_oid(source: Path, revision: str, *, label: str) -> str:
     return resolved.stdout[:-1].decode("ascii")
 
 
+BASELINE_REFUSALS = frozenset(
+    {"malformed", "unresolved", "is_candidate", "not_ancestor", "merge_requires_baseline"}
+)
+
+
+class BaselineRefusal(RuntimeError):
+    """A candidate-baseline guard rejection with a fixed category."""
+
+    def __init__(self, category: str, message: str) -> None:
+        if type(category) is not str or category not in BASELINE_REFUSALS:
+            raise ValueError("unknown baseline refusal category")
+        super().__init__(message)
+        self.category = category
+
+
+def candidate_diff_binding(source: Path, baseline: str | None, *, revision: str) -> str:
+    """Return the gate's canonical diff binding for one resolved candidate.
+
+    A root or single-parent candidate has no baseline to choose, so omission is
+    exact. A merge candidate has several, and the gate never picks one: the
+    caller names it by full commit OID or the gate refuses. An explicit baseline
+    is taken literally; nothing here resolves a ref, a prefix, or a tag.
+    """
+
+    category: str | None = None
+    try:
+        if baseline is not None:
+            if type(baseline) is not str or re.fullmatch(r"[0-9a-f]{40}", baseline) is None:
+                raise BaselineRefusal(
+                    "malformed", "baseline must be a full lowercase Git commit OID"
+                )
+            # A full OID can still name a missing object, a tree, or an annotated
+            # tag that peels to some other commit. Only self-resolution is exact.
+            resolved = subprocess.run(
+                ("git", "rev-parse", "--verify", f"{baseline}^{{commit}}"),
+                cwd=source,
+                env=clean_git_environment(),
+                capture_output=True,
+            )
+            if resolved.returncode != 0 or resolved.stdout != baseline.encode("ascii") + b"\n":
+                raise BaselineRefusal(
+                    "unresolved", "baseline must be the exact OID of an existing commit"
+                )
+            if baseline == revision:
+                raise BaselineRefusal(
+                    "is_candidate", "baseline commit must differ from candidate HEAD"
+                )
+        return canonical_candidate_diff_sha256(source, baseline, revision=revision)
+    except BaselineRefusal as error:
+        category = error.category
+        raise
+    finally:
+        if category is not None:
+            print(
+                "[release-gate-baseline] "
+                + json.dumps(
+                    {"version": 1, "category": category, "explicit": baseline is not None}
+                ),
+                flush=True,
+            )
+
+
 def canonical_candidate_diff_sha256(
     source: Path, baseline_commit: str | None, *, revision: str = "HEAD"
 ) -> str:
@@ -568,7 +630,10 @@ def canonical_candidate_diff_sha256(
             ).stdout
             return hashlib.sha256(diff).hexdigest()
         if len(parents) != 2 or parents[0] != head_oid:
-            fail("a merge candidate requires an explicit baseline commit")
+            raise BaselineRefusal(
+                "merge_requires_baseline",
+                "a merge candidate requires an explicit baseline commit",
+            )
         baseline_commit = parents[1]
 
     baseline_oid = _resolved_commit_oid(source, baseline_commit, label="baseline commit")
@@ -579,7 +644,9 @@ def canonical_candidate_diff_sha256(
         capture_output=True,
     )
     if ancestry.returncode != 0:
-        fail("baseline commit must be an ancestor of candidate HEAD")
+        raise BaselineRefusal(
+            "not_ancestor", "baseline commit must be an ancestor of candidate HEAD"
+        )
     diff = subprocess.run(
         (
             "git",
@@ -1478,6 +1545,7 @@ def gate(
     livekit: bool,
     *,
     native_only: bool = False,
+    baseline: str | None = None,
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
     livekit_pid: int | None = None,
@@ -1487,7 +1555,7 @@ def gate(
     # archived revision by construction rather than by two reads agreeing.
     revision = _resolved_commit_oid(source, "HEAD", label="candidate HEAD")
     print(f"archived revision: {revision}", flush=True)
-    diff_sha256 = canonical_candidate_diff_sha256(source, None, revision=revision)
+    diff_sha256 = candidate_diff_binding(source, baseline, revision=revision)
     print(f"canonical candidate diff SHA-256: {diff_sha256}", flush=True)
     with tempfile.TemporaryDirectory(prefix="hermes-realtime-release-") as temporary:
         root = Path(temporary) / "candidate"
@@ -1608,6 +1676,81 @@ def self_test() -> None:
             lambda: reject_ambient_paths(root / "ambient-candidate"),
             "fresh candidate unexpectedly contains ambient path: web/tmp",
         )
+
+        # Issue #324: a merge candidate has more than one possible baseline. The
+        # gate must refuse to choose one, and must bind exactly the one it is given.
+        import contextlib
+        import io
+
+        history = root / "history"
+        history.mkdir()
+
+        def history_git(*arguments: str) -> str:
+            return subprocess.run(
+                ("git", *arguments),
+                cwd=history,
+                check=True,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+            ).stdout.strip()
+
+        def history_commit(name: str) -> str:
+            (history / name).write_text(f"{name}\n", encoding="utf-8")
+            history_git("add", name)
+            history_git("commit", "-qm", name)
+            return history_git("rev-parse", "HEAD")
+
+        history_git("init", "-q")
+        history_git("config", "user.email", "release-gate-test@example.invalid")
+        history_git("config", "user.name", "release-gate-test")
+        history_commit("fork")
+        target_branch = history_git("rev-parse", "--abbrev-ref", "HEAD")
+        history_git("checkout", "-q", "-b", "topic")
+        topic = history_commit("topic")
+        history_git("checkout", "-q", target_branch)
+        target = history_commit("target")
+        history_git("checkout", "-q", "topic")
+        history_git("merge", "-q", "--no-ff", "--no-edit", target_branch)
+        merge = history_git("rev-parse", "HEAD")
+        tree = history_git("rev-parse", f"{merge}^{{tree}}")
+        # The same tree as one single-parent commit on each parent: the binding a
+        # named baseline must reproduce, and a commit outside the merge's history.
+        linear = {
+            parent: history_git("commit-tree", tree, "-p", parent, "-m", "linear")
+            for parent in (topic, target)
+        }
+        refused: tuple[tuple[str | None, str], ...] = (
+            (None, "a merge candidate requires an explicit baseline commit"),
+            (target[:12], "baseline must be a full lowercase Git commit OID"),
+            (tree, "baseline must be the exact OID of an existing commit"),
+            (merge, "baseline commit must differ from candidate HEAD"),
+            (linear[target], "baseline commit must be an ancestor of candidate HEAD"),
+        )
+        markers = io.StringIO()
+        with contextlib.redirect_stdout(markers):
+            for baseline, expected in refused:
+                expect_failure(
+                    lambda baseline=baseline: print(
+                        candidate_diff_binding(history, baseline, revision=merge)
+                    ),
+                    expected,
+                )
+        if markers.getvalue().count("[release-gate-baseline] ") != len(refused) or len(
+            markers.getvalue().splitlines()
+        ) != len(refused):
+            fail("self-test baseline refusals did not each emit exactly one marker")
+        bindings = {
+            parent: candidate_diff_binding(history, parent, revision=merge)
+            for parent in (topic, target)
+        }
+        for parent in (topic, target):
+            if bindings[parent] != canonical_candidate_diff_sha256(
+                history, None, revision=linear[parent]
+            ):
+                fail("self-test merge baseline binding differs from its single-parent equivalent")
+        if bindings[topic] == bindings[target]:
+            fail("self-test merge baselines did not produce distinct bindings")
     print("release gate self-test passed")
 
 
@@ -1618,6 +1761,13 @@ def main() -> None:
         type=Path,
         default=Path.cwd(),
         help="Git checkout whose HEAD is the candidate",
+    )
+    parser.add_argument(
+        "--baseline",
+        help=(
+            "full commit OID the candidate diff is bound to; required for a merge "
+            "candidate, never inferred from a ref or a merge parent"
+        ),
     )
     parser.add_argument(
         "--require-livekit", action="store_true", help="run native local LiveKit integration tests"
@@ -1666,6 +1816,7 @@ def main() -> None:
         arguments.candidate.resolve(),
         arguments.require_livekit,
         native_only=arguments.native_only,
+        baseline=arguments.baseline,
         livekit_executable=arguments.livekit_executable,
         livekit_executable_sha256=arguments.livekit_executable_sha256,
         livekit_pid=arguments.livekit_pid,
