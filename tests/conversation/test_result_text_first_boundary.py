@@ -52,6 +52,8 @@ from hermes_realtime.protocol import (
     WorkTerminalStatus,
 )
 from hermes_realtime.protocol.identifiers import PRIVATE_HANDLE, PRIVATE_RUN_TOKEN
+from hermes_realtime.protocol.limits import utf16_units
+from hermes_realtime.result_limits import MAX_LEGACY_RESULT_CHARS
 from hermes_realtime.speech import DeliveredSpeechLedger, Transcript
 from tests.conversation.test_actions import Playback, RecordingInference, Synthesizer
 from tests.conversation.test_tasks import TaskSessionStub
@@ -340,6 +342,35 @@ async def test_unusable_result_text_becomes_a_fixed_notice_and_stays_local(
         {"category": category, "field": field_name, "source": status, "version": 1}
     ]
     assert "xxxx" not in output and "yyyy" not in output and "deleg_a" not in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+async def test_admission_then_unit_shortening_compose_for_an_astral_reason_with_a_token(
+    capsys: pytest.CaptureFixture[str], status: str
+) -> None:
+    """Admission first, in code points, on the text as reported; then the legacy shortening,
+    in UTF-16 code units, on what is shown. The reason is within the admission bound and
+    twice the unit bound, so it is admitted with its token replaced and then shortened."""
+    astral = "\U0001F600"
+    reason = "see deleg_a1b2 " + astral * 900
+    assert len(reason) == 915 and utf16_units(reason) == 1815
+    async with _stack() as stack:
+        first = await stack.finish_task(status, reason)
+        second = await stack.finish_task(status, "Plain outcome.")
+
+        assert stack.latched == []
+        shown = stack.results()[first][1]
+        assert shown == "see private reference " + astral * 499 + "..."
+        assert utf16_units(shown) == 1023 <= MAX_LEGACY_RESULT_CHARS
+        assert stack.results()[second] == (status, "Plain outcome.")
+
+    output = capsys.readouterr().out
+    assert _admission_lines(output) == [
+        {"category": "private_token", "field": "reason", "source": status, "version": 1}
+    ]
+    # Shortened by the producer, so the projection's unit refusal never fires.
+    assert "[task-result-projection]" not in output
 
 
 @pytest.mark.asyncio

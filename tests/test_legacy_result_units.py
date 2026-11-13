@@ -82,7 +82,7 @@ def test_projection_refuses_a_noncompleted_result_over_the_unit_bound(status: st
 
 @pytest.mark.parametrize(
     "text",
-    ["", "x", ASTRAL, "x" + ASTRAL, "\ud800", "😀", "a\ud800" + ASTRAL, "￿\U00010000"],
+    ["", "x", ASTRAL, "x" + ASTRAL, "\ud800", "\U0001f600", "a\ud800" + ASTRAL, "\uffff\U00010000"],
 )
 def test_unit_count_is_the_javascript_string_length(text: str) -> None:
     assert utf16_units(text) == _javascript_length(text)

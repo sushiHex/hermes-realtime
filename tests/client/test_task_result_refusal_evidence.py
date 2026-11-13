@@ -107,7 +107,7 @@ async def test_the_host_producer_never_reaches_the_refusal(
     """Seeded reasons across the reason bound: every one is published within the unit bound."""
     generator = random.Random(526)
     # run_12345678 is replaced by a longer phrase before the text is bounded.
-    alphabet = ("x", " ", ASTRAL, "é", "￿", "\U0010ffff", ".", " run_12345678 ")
+    alphabet = ("x", " ", ASTRAL, "\u00e9", "\uffff", "\U0010ffff", ".", " run_12345678 ")
     reasons = [ASTRAL * 1024, "x" * 1024, (ASTRAL + " ") * 512, "x" + ASTRAL * 1023]
     for _ in range(400):
         length = generator.choice((1, 2, 511, 512, 513, 1000, 1023, 1024))
