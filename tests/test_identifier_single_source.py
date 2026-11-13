@@ -36,8 +36,8 @@ _KNOWN_LITERALS = {
         "a Hermes custom provider name that shares the metric label shape",
     (
         "src/hermes_realtime/conversation/result_projection.py",
-        r"\b(?:task_|run_|deleg_)[A-Za-z0-9_.:-]+",
-    ): "a speech scrub that also replaces public task ids; not a privacy rule",
+        r"(?:\b(?:task_|run_|deleg_)[A-Za-z0-9_.:-]+|",
+    ): "the speech scrub of machine tokens; its run-token half is the owner's pattern",
     ("scripts/rehearse_desktop_mvp.py", r"\b(?:run|deleg)_[A-Za-z0-9]"):
         "a rehearsal leak count with its own, weaker, word-boundary rule",
 }

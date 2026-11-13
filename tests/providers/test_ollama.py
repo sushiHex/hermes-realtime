@@ -20,6 +20,7 @@ from hermes_realtime.conversation import (
 )
 from hermes_realtime.conversation.output_style import OUTPUT_STYLES, OutputStyleSelection
 from hermes_realtime.conversation.streaming import ConversationPromptUpdate
+from hermes_realtime.conversation.turn import ForegroundTurn
 from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.providers import OllamaStreamingInference
 from tests.support.ollama_metadata import supported_ollama_metadata
@@ -123,8 +124,7 @@ def test_ollama_renders_memory_as_separate_untrusted_context() -> None:
         memory=BuiltinMemorySnapshot(memory="Prefers concise replies.", user="Ari"),
     )
 
-    copied = OllamaStreamingInference._trusted_snapshot(snapshot)
-    messages = OllamaStreamingInference._messages(copied)
+    messages = OllamaStreamingInference._messages(ForegroundTurn(snapshot))
 
     assert len(messages) == 4
     assert messages[1:] == [
@@ -1021,7 +1021,7 @@ def test_reference_kinds_equal_every_section_actually_sent() -> None:
         memory=None,
         updates=(),
     )
-    messages = OllamaStreamingInference._messages(request)
+    messages = OllamaStreamingInference._messages(ForegroundTurn(request))
     sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
 
     assert "host_speech_message_indices" in sections
