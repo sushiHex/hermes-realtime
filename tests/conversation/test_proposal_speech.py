@@ -144,4 +144,9 @@ async def test_automatic_requires_clean_current_user_terminal_stream_and_emits_n
     else:
         await loop.respond("turn_automatic", Transcript(text="Inspect release", final=True))
     assert len(surface.calls) == (1 if mode == "valid" else 0)
-    assert synth.texts == [] and not proposals.has_pending
+    # No readback ever; the valid selection's synthetic refusal gets only the fixed
+    # host sentence for an unaccepted start (#353).
+    assert synth.texts == (
+        ["No new background task is running for that request."] if mode == "valid" else []
+    )
+    assert not proposals.has_pending
