@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
@@ -31,6 +32,10 @@ from hermes_realtime.conversation.result_projection import (
 from hermes_realtime.integration import run_record
 from hermes_realtime.integration import web_evidence_contract as web_contract
 from hermes_realtime.integration.run_record import PendingRun
+from hermes_realtime.integration.web_evidence_contract import (
+    REFUSED_REASONS,
+    UNGROUNDED_REASONS,
+)
 from hermes_realtime.protocol import (
     CancelScope,
     ControlCancelAcknowledgedEvent,
@@ -54,6 +59,25 @@ from hermes_realtime.result_limits import (
 logger = logging.getLogger(__name__)
 
 _LOOKUP_POLICY = "ordinary-lookup/v1"
+# Spoken and shown when a web-evidence run is withheld. "Please try again" only where a
+# retry can change the cause; keys are exactly the contract's refusal reasons.
+_WEB_UNVERIFIED_NOTICE = "The task result could not be verified, so it was withheld."
+_WEB_REFUSAL_NOTICES = MappingProxyType({
+    "binding": "The task result could not be matched to this task, so it was withheld.",
+    "capture": "A web result could not be read, so the task result was withheld.",
+    "closed": "The task was stopped before its result could be checked.",
+    "deadline": "Presenting the web sources took too long. Please try again.",
+    "final_response": "The task's final answer was incomplete, so it was withheld.",
+    "input_bound": "The web sources were too large to present, so the result was withheld.",
+    "insufficient": "The web search did not find enough source text to support an answer.",
+    "internal": "The task result could not be checked, so it was withheld.",
+    "presentation_failed": "The web sources could not be presented. Please try again.",
+    "route": "The web presentation model does not match the task's model, "
+             "so the result was withheld.",
+    "source_changed": "The web sources changed while being presented. Please try again.",
+    "unobserved": "The task's answer could not be checked against its web sources, "
+                  "so it was withheld.",
+})
 _LOOKUP_GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _RUN_ID_EXACT = re.compile(r"run_[a-fA-F0-9]{16,64}\Z")
 _RUN_ID_DISCLOSURE = re.compile(r"run_[A-Za-z0-9][A-Za-z0-9_-]{15,127}")
@@ -1417,10 +1441,16 @@ class HermesApiTaskSession:
             )
 
     @staticmethod
-    def _web_refusal(category: str) -> None:
+    def _web_refusal(category: str, reason: str | None = None) -> None:
         with contextlib.suppress(OSError, ValueError):
             print("[hermes-web-evidence] " + json.dumps(
-                {"category": category, "version": 1}, separators=(",", ":"), sort_keys=True
+                {"category": category, "version": 1} if reason is None else {
+                    "category": category,
+                    "reason": reason
+                    if reason in REFUSED_REASONS or reason in UNGROUNDED_REASONS
+                    else "attestation",
+                    "version": 1,
+                }, separators=(",", ":"), sort_keys=True
             ), flush=True)
 
     @staticmethod
@@ -1456,7 +1486,10 @@ class HermesApiTaskSession:
                 and headers.get(web_contract.RUN_HEADER.lower()) == run_id)
 
     async def _web_completion(self, authority: _RunAuthority) -> dict[str, Any]:
-        """No-web/mixed preserve ordinary output, without a factual-grounding claim."""
+        """No-web, mixed and ungrounded preserve ordinary output without a grounding claim.
+
+        A refused run is withheld with the notice for its attested reason.
+        """
         headers: dict[str, str] = {}
         status, body = await self._request_json(
             "GET", f"/v1/runs/{quote(authority.api_run_id, safe='')}",
@@ -1471,14 +1504,24 @@ class HermesApiTaskSession:
         if terminal["event"] != "run.completed":
             return terminal
         assert authority.web_evidence_generation is not None
-        if web_contract.attestation_valid(
+        outcome = web_contract.attestation_outcome(
             headers.get(web_contract.ATTESTATION_HEADER.lower()),
             authority.web_evidence_generation, authority.api_run_id, terminal.get("output"),
-        ):
+        )
+        if outcome is None:
+            self._web_refusal("completion", "attestation")
+            return {"event": "run.failed", "run_id": authority.api_run_id,
+                    "error": _WEB_UNVERIFIED_NOTICE}
+        disposition, reason = outcome
+        if disposition != "refused":
+            if disposition == "ungrounded":
+                # Delivered without a grounding claim; say why, content-free.
+                self._web_refusal("ungrounded", reason)
             return terminal
-        self._web_refusal("completion")
+        assert reason is not None
+        self._web_refusal("completion", reason)
         return {"event": "run.failed", "run_id": authority.api_run_id,
-                "error": "The task did not return a verified presentation. Please try again."}
+                "error": _WEB_REFUSAL_NOTICES[reason]}
 
     async def _lookup_readiness(self) -> str:
         status, body = await self._request_json("GET", "/lookup-policy/ready")

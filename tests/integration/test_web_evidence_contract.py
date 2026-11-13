@@ -23,11 +23,11 @@ RUN = "run_0123456789abcdef"
 OUTPUT = "<voice>Synthetic.</voice><detail>Synthetic.</detail>"
 
 
-def report(disposition="presented"):
+def report(disposition="presented", reason=None):
     shown = disposition == "presented"
     return {
-        "version": 1, "contract": CONTRACT, "generation": GENERATION, "run_id": RUN,
-        "disposition": disposition,
+        "version": 2, "contract": CONTRACT, "generation": GENERATION, "run_id": RUN,
+        "disposition": disposition, "reason": reason,
         "output_sha256": hashlib.sha256(OUTPUT.encode()).hexdigest(),
         "input_sha256": "b" * 64 if shown else None,
         "input_bytes": 1024 if shown else 0,
@@ -47,18 +47,39 @@ def test_web_contract_is_explicit_and_separate_from_lookup():
                         web_evidence_contract=CONTRACT, lookup_policy="ordinary-lookup/v1")
 
 
-@pytest.mark.parametrize("disposition", ["presented", "no_web", "mixed_ungrounded"])
-def test_exact_output_and_explicit_disposition_are_required(disposition):
-    from hermes_realtime.integration.web_evidence_contract import attestation_valid
+@pytest.mark.parametrize("disposition,reason", [
+    ("presented", None), ("no_web", None), ("mixed_ungrounded", None),
+    ("ungrounded", "unobserved"),
+])
+def test_exact_output_and_explicit_disposition_are_required(disposition, reason):
+    from hermes_realtime.integration.web_evidence_contract import (
+        attestation_outcome,
+        attestation_valid,
+    )
 
-    raw = json.dumps(report(disposition))
+    raw = json.dumps(report(disposition, reason))
     assert attestation_valid(raw, GENERATION, RUN, OUTPUT)
+    assert attestation_outcome(raw, GENERATION, RUN, OUTPUT) == (disposition, reason)
     assert not attestation_valid(raw, GENERATION, RUN, OUTPUT + " changed")
     assert not attestation_valid(raw, GENERATION, RUN, OUTPUT + " ")
 
 
+def test_every_refusal_reason_is_reported_but_never_publishes():
+    from hermes_realtime.integration.web_evidence_contract import (
+        REFUSED_REASONS,
+        attestation_outcome,
+        attestation_valid,
+    )
+
+    for reason in REFUSED_REASONS:
+        raw = json.dumps(report("refused", reason))
+        assert attestation_outcome(raw, GENERATION, RUN, OUTPUT) == ("refused", reason)
+        assert not attestation_valid(raw, GENERATION, RUN, OUTPUT)
+        assert attestation_outcome(raw, GENERATION, RUN, OUTPUT + " ") is None
+
+
 @pytest.mark.parametrize("change", [
-    {"version": True}, {"contract": "unknown"}, {"generation": "d" * 32},
+    {"version": True}, {"version": 1}, {"contract": "unknown"}, {"generation": "d" * 32},
     {"run_id": "run_ffffffffffffffff"}, {"disposition": "refused"},
     {"disposition": "mixed"}, {"output_sha256": "e" * 64},
     {"input_bytes": 16385}, {"input_bytes": True}, {"input_sha256": None},
@@ -66,11 +87,30 @@ def test_exact_output_and_explicit_disposition_are_required(disposition):
     {"missing_count": 2}, {"extra": None},
     {"disposition": []},
     {"disposition": {}}, {"catalog_count": 0}, {"passage_count": 0}, {"missing_count": 1},
+    {"reason": "unobserved"}, {"disposition": "ungrounded"},
+    {"disposition": "ungrounded", "reason": "insufficient"},
+    {"disposition": "refused", "reason": "unknown"},
+    {"disposition": "refused", "reason": ["closed"]},
 ])
 def test_malformed_or_unbound_attestation_cannot_publish(change):
     from hermes_realtime.integration.web_evidence_contract import attestation_valid
 
     assert not attestation_valid(json.dumps(report() | change), GENERATION, RUN, OUTPUT)
+
+
+@pytest.mark.parametrize("change", [
+    {"disposition": "no_web", "reason": "unobserved"},
+    {"disposition": "mixed_ungrounded", "reason": "closed"},
+    {"disposition": "ungrounded"},
+    {"disposition": "refused"},
+    {"disposition": "refused", "reason": "attestation"},
+    {"version": 1},
+])
+def test_reason_is_closed_set_per_disposition(change):
+    from hermes_realtime.integration.web_evidence_contract import attestation_outcome
+
+    base = report("no_web")
+    assert attestation_outcome(json.dumps(base | change), GENERATION, RUN, OUTPUT) is None
 
 
 def test_duplicate_or_oversized_report_and_nonweb_grounding_claim_are_refused():
@@ -143,6 +183,8 @@ class WebHermes(_LookupHermes):
     async def state(self, request):
         disposition = self.fault if self.fault in {"no_web", "mixed_ungrounded"} else "presented"
         value = report(disposition)
+        if self.fault == "ungrounded":
+            value = report("ungrounded", "unobserved")
         if self.fault == "hash":
             value["output_sha256"] = "0" * 64
         if self.fault == "status-generation":
@@ -150,7 +192,7 @@ class WebHermes(_LookupHermes):
         if self.fault == "status-run":
             value["run_id"] = "run_ffffffffffffffff"
         if self.fault == "refused":
-            value["disposition"] = "refused"
+            value = report("refused", "insufficient")
         headers = {"X-Web-Evidence-Attestation": json.dumps(value)}
         if self.fault == "status-missing":
             headers.clear()
@@ -182,7 +224,7 @@ class WebHermes(_LookupHermes):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", [
-    "healthy", "no_web", "mixed_ungrounded", "ordinary", "fallback", "cancelled",
+    "healthy", "no_web", "mixed_ungrounded", "ungrounded", "ordinary", "fallback", "cancelled",
     "ready", "ack-missing", "ack-generation", "ack-duplicate",
     "hash", "status-generation", "status-run", "status-missing", "status-duplicate", "refused",
 ])
@@ -207,7 +249,8 @@ async def test_host_gates_completed_native_output_on_exact_attestation(fault, ca
             update = await asyncio.wait_for(session.next_update(), 3)
             if fault == "cancelled":
                 assert update.payload.status is WorkTerminalStatus.INTERRUPTED
-            elif fault in {"healthy", "no_web", "mixed_ungrounded", "ordinary", "fallback"}:
+            elif fault in {"healthy", "no_web", "mixed_ungrounded", "ungrounded", "ordinary",
+                           "fallback"}:
                 assert update.payload.status is WorkTerminalStatus.COMPLETED
                 expected = (
                     "<voice>Unverified stream result</voice>"
@@ -218,7 +261,9 @@ async def test_host_gates_completed_native_output_on_exact_attestation(fault, ca
                 assert update.payload.status is WorkTerminalStatus.FAILED
                 assert update.payload.summary is None
                 assert update.payload.reason == (
-                    "The task did not return a verified presentation. Please try again."
+                    "The web search did not find enough source text to support an answer."
+                    if fault == "refused" else
+                    "The task result could not be verified, so it was withheld."
                 )
         assert hermes.ready_calls == int(fault != "ordinary")
         if hermes.posts:
@@ -329,6 +374,116 @@ async def test_unknown_native_terminal_never_releases_host_authority(status, bod
     with pytest.raises(RuntimeError, match="authority"):
         await session._web_completion(authority)
     assert authority.terminal is False
+
+
+async def _host_terminal(raw, body, run_id, generation=GENERATION):
+    session = api_module.HermesApiTaskSession(config=HermesApiConfig(
+        base_url="http://127.0.0.1:8642", bearer="x" * 32), session_id="session_api_1")
+
+    async def request(method, path, *, response_headers=None, **kwargs):
+        if raw is not None:
+            response_headers["x-web-evidence-attestation"] = raw
+        return 200, body
+
+    session._request_json = request
+    authority = api_module._RunAuthority(task_id="task_synthetic", api_run_id=run_id,
+        protocol_run_id="deleg_synthetic", web_evidence_generation=generation)
+    return await session._web_completion(authority)
+
+
+@pytest.mark.asyncio
+async def test_turn_budget_final_answer_reaches_the_user_from_the_real_companion(capsys):
+    from tests.test_native_web_evidence import GENERATION as COMPANION_GENERATION
+    from tests.test_native_web_evidence import (
+        RUN_ID,
+        UNOBSERVED_FINAL,
+        _budget_spent_run,
+        _observer,
+        _terminal_status,
+    )
+
+    observer = _observer()
+    await _budget_spent_run(observer)
+    body = {"object": "hermes.run", "run_id": RUN_ID, "status": "completed",
+            "output": UNOBSERVED_FINAL}
+    raw = await _terminal_status(observer, body)
+
+    terminal = await _host_terminal(raw, body, RUN_ID, COMPANION_GENERATION)
+
+    assert terminal == {"event": "run.completed", "run_id": RUN_ID, "output": UNOBSERVED_FINAL}
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        '[hermes-web-evidence] {"category":"ungrounded","reason":"unobserved","version":1}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_only_turn_budget_final_is_withheld_with_a_truthful_notice(capsys):
+    from tests.test_native_web_evidence import GENERATION as COMPANION_GENERATION
+    from tests.test_native_web_evidence import (
+        RUN_ID,
+        UNOBSERVED_FINAL,
+        _budget_spent_run,
+        _observer,
+        _terminal_status,
+    )
+
+    observer = _observer()
+    await _budget_spent_run(observer, "web_only")
+    body = {"object": "hermes.run", "run_id": RUN_ID, "status": "completed",
+            "output": UNOBSERVED_FINAL}
+    raw = await _terminal_status(observer, body)
+
+    terminal = await _host_terminal(raw, body, RUN_ID, COMPANION_GENERATION)
+
+    assert terminal == {"event": "run.failed", "run_id": RUN_ID, "error": (
+        "The task's answer could not be checked against its web sources, so it was withheld."
+    )}
+    assert "try again" not in terminal["error"].lower()
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        '[hermes-web-evidence] {"category":"completion","reason":"unobserved","version":1}'
+    )
+
+
+_RETRYABLE = {"deadline", "presentation_failed", "source_changed"}
+
+
+def test_every_refusal_reason_has_exactly_one_notice():
+    from hermes_realtime.integration.web_evidence_contract import REFUSED_REASONS
+
+    assert set(api_module._WEB_REFUSAL_NOTICES) == REFUSED_REASONS
+    assert "try again" not in api_module._WEB_UNVERIFIED_NOTICE.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", sorted([
+    "binding", "capture", "closed", "deadline", "final_response", "input_bound",
+    "insufficient", "internal", "presentation_failed", "route", "source_changed",
+    "unobserved",
+]))
+async def test_host_speaks_the_attested_refusal_reason(reason, capsys):
+    body = {"object": "hermes.run", "run_id": RUN, "status": "completed", "output": OUTPUT}
+    terminal = await _host_terminal(json.dumps(report("refused", reason)), body, RUN)
+
+    assert terminal["event"] == "run.failed"
+    assert terminal["error"] == api_module._WEB_REFUSAL_NOTICES[reason]
+    assert ("try again" in terminal["error"].lower()) is (reason in _RETRYABLE)
+    assert capsys.readouterr().out == (
+        "[hermes-web-evidence] " + json.dumps(
+            {"category": "completion", "reason": reason, "version": 1}, separators=(",", ":"))
+        + "\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unbound_attestation_is_withheld_without_a_retry_prompt(capsys):
+    body = {"object": "hermes.run", "run_id": RUN, "status": "completed", "output": OUTPUT}
+    terminal = await _host_terminal(None, body, RUN)
+
+    assert terminal == {"event": "run.failed", "run_id": RUN,
+                        "error": "The task result could not be verified, so it was withheld."}
+    assert capsys.readouterr().out == (
+        '[hermes-web-evidence] {"category":"completion","reason":"attestation","version":1}\n'
+    )
 
 
 @pytest.mark.parametrize("selection", ["", True, 1, "unknown"])
