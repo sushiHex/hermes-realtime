@@ -66,33 +66,45 @@ case it must also be an existing directory (`scripts/native_work_profile.py`).
 
 **Realtime source, wheel and runtime target.** `realtime.source` must be the checkout
 whose `scripts/preview_cutover.py` you run, with `HEAD` at `realtime.revision`
-(`git rev-parse HEAD`) and `realtime.tree` (`git rev-parse "HEAD^{tree}"`). The
+(`git rev-parse HEAD`) and `realtime.tree` (`git rev-parse "HEAD^{tree}"`). Clone
+with history, not `--depth 1`: the source check also reads the parent commit. The
 checkout must be completely clean, untracked files included: keep the plan, the
 output directory and every other working file outside it (`dist/` is ignored, so the
-built wheel may stay there). `realtime.wheel_sha256` is the SHA-256 of the wheel built
-from that commit, and `realtime.record_sha256` is the SHA-256 of
-`hermes_realtime-<version>.dist-info\RECORD` inside `realtime.runtime_target` after the
-`--no-deps` install described below. The runtime target may hold only that install:
-run everything that imports from it with `-B`, because a bytecode cache there is an
-unexpected file and refuses preparation.
+built wheel may stay there). Build the wheel with `uv build --wheel`.
+`realtime.wheel_sha256` is the SHA-256 of that wheel, and `realtime.record_sha256` is
+the SHA-256 of `hermes_realtime-<version>.dist-info\RECORD` inside
+`realtime.runtime_target` after the `--no-deps` install described under
+[Plan reference](#plan-reference); `Get-FileHash -Algorithm SHA256` gives both, in
+upper case, so lower-case them. The runtime target may hold only that install. A
+bytecode cache there is an unexpected file and refuses preparation: leave
+`UV_COMPILE_BYTECODE` unset when installing, and run everything that imports from the
+target with `-B`.
 
 **Hermes source and profile.** `hermes.source` must be at `hermes.revision` with no
-modified or untracked Python files. `hermes.profile_source` is a directory that may
-contain only `config.yaml`, `.env`, `SOUL.md`, `skills`, `hooks` and `plugins`, without
-links, within 4096 files and 64 MiB. Its `.env` is required and is copied unread into
-the staged profile by `finalize`. It must hold one `API_SERVER_KEY` of at least 32
-random characters, `HERMES_REALTIME_COMPANION_PORT` equal to the plan's
-`ports.companion`, and a `HERMES_REALTIME_COMPANION_TOKEN` of 24 to 512 random
-characters; generate them as the
+modified or untracked Python files. Keep no `.env` in that checkout: the gateway reads
+one there for any key the profile's `.env` lacks. `hermes.profile_source` is a curated
+directory, not a live Hermes home. It may contain only `config.yaml`, `.env`,
+`SOUL.md`, `skills`, `hooks` and `plugins`, without links, within 4096 files and
+64 MiB. `finalize` refuses any other entry, including a Hermes `auth.json`, so a
+provider sign-in stored there cannot be carried: supply the background model's
+credential through `.env` or the `key_cmd` route. `prepare` reads only `config.yaml`;
+the other entries and the required `.env` are checked at `finalize`, so an accepted
+`prepare` does not show that the profile source is acceptable.
+
+The `.env` is copied unread into the staged profile by `finalize`. It must hold one
+`API_SERVER_KEY` of at least 32 random characters, `HERMES_REALTIME_COMPANION_PORT`
+equal to the plan's `ports.companion`, and a `HERMES_REALTIME_COMPANION_TOKEN` of 24 to
+512 random characters. Generate the secrets as the
 [diagnostic guide](desktop-mvp-diagnostic.md#5-configure-hermes_homeenv) describes and
-never reuse personal credentials. The owner passes the API host and port from the plan
-in the gateway's environment; whether a different `API_SERVER_PORT` in `.env` would
-override that has not been checked, so omit it or keep it equal to `ports.api`.
+never reuse personal credentials. Do not copy that guide's `API_SERVER_HOST` and
+`API_SERVER_PORT` lines: Hermes lets `.env` override the host and port the owner
+passes from the plan, and the preview then waits for a gateway that listens elsewhere.
 
 **LiveKit and ports.** `executables.livekit` must be the shared verified server that
 `uv run python -m scripts.local_livekit path` prints
-([pinned development server](local-livekit.md#pinned-development-server)); another copy
-is refused at launch. The owner starts its own LiveKit process on `ports.livekit`. All
+([pinned development server](local-livekit.md#pinned-development-server)); the owner
+refuses another copy as `livekit_path_binding` after `launch`. The owner starts its
+own LiveKit process on `ports.livekit`. All
 four owned ports must be free at launch, so stop a development LiveKit server on the
 same port or choose another port. `output` must not exist yet and its parent directory
 must.
@@ -117,8 +129,11 @@ package's own catalog, and also tries to fetch the English spelling model. Files
 under `<moonshine-cache>\download.moonshine.ai\model\`, the layout the host later reads
 through `MOONSHINE_VOICE_CACHE`. With a complete cache the host start downloads nothing
 for Moonshine; if the spelling files are missing, the package tries to fetch them at
-host start and continues without them. This repository does not pin Moonshine model
-hashes: the receipt pins the bytes you downloaded. Before writing the receipt, check
+host start and continues without them. `prepare` does not check that the cache holds
+the plan's tier, so download only that one architecture into a dedicated directory; a
+cache for another tier is found only at host start. This repository does not pin
+Moonshine model hashes: the receipt pins the bytes you downloaded. Before writing the
+receipt, check
 that an interrupted download left no `.partial` or `.lock` file in the directory; an
 empty file is refused as `speech_asset_size`. This step follows from the
 `moonshine-voice` 0.1.5 source and has not been exercised on a clean machine here.
@@ -158,19 +173,28 @@ of the profile's `config.yaml`, which staging copies unchanged. At the `29112bef
 baseline (`tools/web_tools.py`):
 
 1. `web.search_backend` and `web.extract_backend` select a backend per tool.
-2. Otherwise `web.backend` selects one for both.
+2. Otherwise `web.backend` selects one for both. If only one per-tool key is set and
+   `web.backend` is empty, the other tool uses Firecrawl.
 3. With no stored selection, Hermes picks the first available of: an Exa, Parallel or
    Keenable API key; a Firecrawl API key or self-hosted Firecrawl URL; the managed tool
-   gateway; a SearXNG URL; a Brave Search key; the `ddgs` package if it is importable.
-4. With none of those, it uses the keyless tier, unless `web.keyless_fallback` is
-   `false`.
+   gateway; a SearXNG URL; a Brave Search key; the `ddgs` package if it is importable;
+   then any plugin-registered provider.
+4. With none of those, it uses the keyless tier. If `web.keyless_fallback` is `false`,
+   it selects Firecrawl, which fails without a key.
 
-A stored selection is never replaced by another configured backend. Two keyless
-behaviors still apply to it. A selected Exa, Parallel, Firecrawl or Keenable backend
-with no key uses that vendor's keyless endpoint, unless `web.provider_tier.<name>` is
-`paid`. A failed keyed call is retried once through the keyless tier, unless
-`web.keyless_rescue` is `false`. Setting `web.keyless_fallback: false` turns the whole
-keyless tier off, including that retry.
+A stored selection is never replaced by another configured backend. These keyless
+behaviors still apply to it:
+
+- A selected Exa, Parallel, Firecrawl or Keenable backend with no key uses that
+  vendor's keyless endpoint, unless `web.provider_tier.<name>` is `paid`. The value
+  `free` forces the keyless endpoint even when a key is set.
+- A failed keyed call is retried once through the keyless tier, unless
+  `web.keyless_rescue` is `false`.
+- A keyless call that is rate limited can be answered by another keyless vendor, so
+  the backend you selected is not always the one that served a result.
+
+Setting `web.keyless_fallback: false` turns the whole keyless tier off, including the
+retry.
 
 A keyed backend needs that provider's own API key, or for SearXNG and self-hosted
 Firecrawl a service URL, in the environment variable Hermes names for it. Put it in the
@@ -178,9 +202,10 @@ profile source's `.env`. The owner starts the gateway with a reduced environment
 key exported in your shell does not reach it. Never put a key in the plan,
 `config.yaml`, a command line or an issue.
 
-The keyless tier needs no credential. It sends search queries and requested URLs
-anonymously to third-party public endpoints, so a profile with no web selection and no
-web key still performs real retrieval.
+The keyless tier needs no credential. It sends search queries and requested URLs to
+third-party public endpoints without an account or user identifier, from this
+machine's network address. A profile with no web selection and no web key therefore
+still performs real retrieval.
 
 The owner sets `HERMES_DISABLE_LAZY_INSTALLS=1` for the gateway, so Hermes does not add
 packages to its own environment while running. Install any client package the selected
@@ -208,7 +233,8 @@ described in [native web evidence](native-web-evidence.md).
 - **Managed GPU speech.** The example plan is CPU-only. The GPU worker environment,
   the scoped vram-mcp server and its operator profile are set up as
   [managed Kokoro](kokoro-mcp.md) describes; the operator profile's values are
-  specific to one machine.
+  specific to one machine. The host Python needs the `kokoro-mcp` extra, and `prepare`
+  does not detect its absence: it shows only when the host starts.
 - **Codex CLI and vram-mcp installs.** This repository documents no install command
   for either, as stated above.
 
@@ -287,7 +313,8 @@ Setup order, each step using the section named:
 3. Build the wheel from a clean checkout and install it into the runtime target with
    `--no-deps` (Plan reference).
 4. Populate the two speech caches and write the receipt (Speech caches).
-5. Select the web backend and place its credential, if it needs one (Web tools).
+5. Select the web backend and place its credential, if it needs one (Web tools backend
+   and credential).
 6. For managed GPU speech only, prepare the worker and its configuration
    ([managed Kokoro](kokoro-mcp.md)).
 7. Write the plan outside the checkout, then run the commands below from the checkout
@@ -314,7 +341,12 @@ run's.
 & $previewPython -I -B scripts/preview_cutover.py stop --output "<output>"
 ```
 
-Each command prints one `[voice-preview]` status line with a JSON `category`. The
+Each command prints one `[voice-preview]` status line with a JSON `category`. A
+refused `prepare` prints only a general `failure_category`; the specific one is in
+`<output>\preparation-refused.private.json`. The refused output directory remains, so
+use a new one for the next attempt. `launch` starts the owner, whose own output goes
+to `owner.private.log` and `owner.stderr.private.log` in `<output>`; both are private
+and are kept. The
 owner then writes
 `ready-receipt.private.json` when the preview is ready and
 `result-receipt.private.json` when it has stopped, both in `<output>`. Open

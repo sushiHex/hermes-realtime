@@ -39,7 +39,9 @@ The host checks only its shape: exactly the fields `version`, `python`,
 `python_sha256`, `venv_python`, `venv_python_sha256`, `worker`, `worker_sha256`,
 `model`, `model_sha256`, `voices`, `voices_sha256`, `gpu_index`, `gpu_uuid`,
 `reserve_gb`, `headroom_mb`, `voice` and `language`, plus an optional
-`execution_policy`. `venv_python`, `worker`, `model` and `voices` are absolute paths.
+`execution_policy`, which is `cuda-primary-profiled` (the default) or
+`cuda-primary-profiled-kokoro-v1-benchmark`. `venv_python`, `worker`, `model` and
+`voices` are absolute paths, and `gpu_index` is a non-negative integer.
 `venv_python` is the worker environment's interpreter, created by
 [`scripts/setup-kokoro-cuda-worker.sh`](../scripts/setup-kokoro-cuda-worker.sh) from
 the [pinned worker dependencies](../requirements/README.md). The meaning and checking

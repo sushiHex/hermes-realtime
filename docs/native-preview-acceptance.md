@@ -35,7 +35,8 @@ hearing and speaking observations.
 Record once, so the session binds to one candidate:
 
 - the hermes-realtime commit, and whether `prepare` accepted the plan (its status
-  category);
+  category; for a refusal, the `failure_category` in
+  `preparation-refused.private.json`);
 - the Hermes commit the plan binds;
 - the foreground and background model names and efforts from the plan;
 - the Moonshine tier and Kokoro voice, and whether the plan carries both
@@ -51,16 +52,20 @@ Record once, so the session binds to one candidate:
 
 - **Command status lines.** Each `preview_cutover.py` command prints one
   `[voice-preview]` line with a JSON `category`. Record the category.
-- **Owner receipts** in the plan's output directory: `ready-receipt.private.json`,
-  `result-receipt.private.json` and `handoff.private.json`. They are private. Record
-  only the fields this page names.
+- **Receipts** in the plan's output directory: the owner's
+  `ready-receipt.private.json` and `result-receipt.private.json`, and
+  `handoff.private.json` from `finalize`. They are private. Record only the fields
+  this page names.
 - **Child output.** While the preview runs, the owner keeps the first 1 MiB of each
-  child's output in `host.private.log` and `gateway.private.log` in the output
-  directory, and deletes them when it writes the stop receipt. Extract marker lines
-  before you stop, with the command in the diagnostic guide's
-  [Markers](desktop-mvp-diagnostic.md#markers) section, which also explains each
-  marker. The files are private; publish marker lines only. Writes are buffered, so a
-  marker can appear late. A marker missing from the file is unknown, not absent.
+  child's output in `gateway.private.log`, `livekit.private.log` and
+  `host.private.log` in the output directory, and deletes them when it writes the stop
+  receipt. Extract marker lines before you stop, with the command in the diagnostic
+  guide's [Markers](desktop-mvp-diagnostic.md#markers) section, which also explains
+  each marker. The files are private; publish marker lines only. Writes are buffered,
+  so a marker can appear late. A marker missing from the file is unknown, not absent.
+  Markers printed during shutdown cannot be collected, because the files are gone when
+  `stop` returns. The owner's own `owner.private.log` and `owner.stderr.private.log`
+  remain; they are private too.
 - **The browser.** The **Session model** panel shows providers, models, **Response
   last** and **Response average**. **Diagnostics → Latency markers** lists named
   timings in milliseconds.
@@ -81,8 +86,10 @@ any step here.
 - **Expect:** `prepared`, `ready_to_launch` and `launch_requested`, then a ready
   receipt with `category: ready`.
 - **Record:** the three status categories; the receipt's `category`,
-  `readiness_policy` and `listener_ownership`; seconds from `launch` to the receipt;
-  any `kokoro_mcp_*` or host failure category.
+  `readiness_policy` and `listener_ownership`; seconds from `launch` to the receipt.
+  If no ready receipt appears, record the result receipt's `failure_category` and the
+  category names and counts under its `child_output_metadata`, which include any
+  managed speech refusal (`kokoro_mcp_...`) and host startup failure.
 
 ### 2. Connect and audibility
 
@@ -112,10 +119,10 @@ any step here.
 - **Do:** ask in ordinary words, with no command prefix, for something that needs
   current public information and has a checkable date.
 - **Expect:** no **Proposed background task** card, because the start policy is
-  automatic. Exactly one task card with a `task_...` identifier appears after the turn
-  that announces it, becomes active, then completes, and the completion is spoken. The
-  result states a date and its detail lists sources. No `run_...` or `deleg_...`
-  identifier appears anywhere.
+  automatic. Exactly one **Background task** card appears after the turn that
+  announces it, reads **Running**, then **Completed in**, and the completion is
+  spoken. The result states a date and its detail lists sources. No `run_...` or
+  `deleg_...` identifier appears anywhere.
 - **Record:** proposal card shown yes or no; task cards created; the state sequence;
   seconds from the request to active and to completed; completion heard yes or no;
   number of sources listed; date stated yes or no; date agrees with a listed source
@@ -147,30 +154,36 @@ correct, current or complete.
 
 ### 8. Explicit task commands
 
-Run these in order and record each part separately.
+Run these in order and record each part separately. A task card shows its state as
+**Running** (active), **Stopping** (cancelling), **Stopped after** (interrupted),
+**Completed in**, **Failed after** or **Not started**.
 
-1. **Spoken start.** Say `start task` followed by a short harmless objective. Expect
-   one new task card that becomes active and completes.
+1. **Spoken start.** Say `start task` and a short harmless objective without pausing
+   after the words. Expect one new task card that reads **Running** and then
+   **Completed in**. The command is recognized only when the final transcript begins
+   with `start task` followed by a space, so a transcript with a comma after `task` is
+   an ordinary turn. If that happens, record the punctuation category, not the words.
 2. **Typed start.** Type `task: ` followed by a short harmless objective. Expect the
    same.
 3. **Cancel with no task.** With no active task, say `cancel task`. Expect the page to
    say there is no active task to cancel, and nothing else to change.
 4. **Cancel with one task.** Start one longer harmless task, then say `cancel task`.
-   Expect exactly that task to move to cancelling and then interrupted.
+   Expect exactly that task to read **Stopping** and then **Stopped after**.
 5. **Ambiguous cancel.** Start two longer harmless tasks with different objectives,
    then say `cancel task`.
    Expect the page to say several tasks are active and to point to the task card's
    **Cancel** control, with neither task changing. Press **Cancel** on one card and
-   expect only that task to move to cancelling and then interrupted. Type
-   `cancel task: ` followed by the other card's `task_...` identifier and expect the
-   same for it.
+   expect only that task to read **Stopping** and then **Stopped after**. Then press
+   **Cancel** on the other card and expect the same for it.
 
 - **Record:** for each part, the state sequence and task-card count; seconds from the
-  command to active, completed or interrupted; for parts 3 and 5, guidance shown yes
-  or no and tasks changed by the bare command (expect 0).
+  command to **Running**, **Completed in** or **Stopped after**; for parts 3 and 5,
+  guidance shown yes or no and tasks changed by the bare command (expect 0).
 
 A cancellation acknowledgment means stopping was requested. Only the terminal state
-shows that the task ended.
+shows that the task ended. The card's **Cancel** sends the typed
+`cancel task: <task-id>` command for that card. The card does not display the
+identifier, so typing that form by hand is not part of this step.
 
 ### 9. Disconnect and reconnect
 
@@ -190,15 +203,17 @@ shows that the task ended.
   `--previous` naming the stopped run, then `launch` and **Connect**. With managed GPU
   speech, the new output needs its own operator profile and configuration
   ([managed Kokoro](kokoro-mcp.md)). Ask a question that needs the fact from step 9.
-- **Expect:** `stop` reports `stopped`; the host stops the active task as it shuts
-  down, so the stop receipt has `run_journal_empty: true`. `finalize` reports
+- **Expect:** `stop` reports `stopped`. The host stops the active task as it shuts
+  down. If Hermes confirms that within the 45 seconds the owner waits for the host to
+  exit, the stop receipt has `run_journal_empty: true`. `finalize` reports
   `ready_to_launch` and the handoff records `normal_stop_handoff_verified`. The new
   host's log has a `[voice-tail]` line with a positive `restored` count. After
   **Connect**, the question is answered in context, no task is active and the stopped
   task does not start again. A clean stop makes no restart announcement.
 - **Record:** the `stop` category; from the stop receipt, `category`,
-  `cleanup_settled`, `cleanup_failed`, `owned_survivor_count`, `run_journal_empty`,
-  `host_graceful_stop_timed_out`, `host_exit_code`, and `remaining_owned_listeners` or
+  `failure_category`, `cleanup_settled`, `cleanup_failed`, `owned_survivor_count`,
+  `run_journal_empty`, `host_graceful_stop_timed_out`, `host_exit_code`, and
+  `remaining_owned_listeners` or
   `remaining_accepting_endpoints`; the handoff category; the `[voice-tail]` line;
   recall yes or no; active task cards after **Connect** (expect 0); before any new
   request, the new run's `state\hermes-runs-v1.json` absent, or its `pending` and
@@ -238,10 +253,12 @@ receipt to continue.
   the Kokoro claims this session still holds.
 - **Expect:** `stop` reports `stopped`. Both counts are 0. A process ID can be reused
   by an unrelated process after a restart, so a nonzero process count needs a look at
-  what the process is before it is called a survivor. No Kokoro claim from this
-  session remains. Processes and services you did not start are untouched.
+  what the process is before it is called a survivor. The check assumes the run
+  reached readiness, so that `pids.json` names all three children. No Kokoro claim
+  from this session remains. Processes and services you did not start are untouched.
 - **Record:** the same stop receipt fields as step 10; the two counts; remaining
-  Kokoro claims; any marker printed at shutdown, such as `[voice-review-close]`.
+  Kokoro claims. Shutdown markers such as `[voice-review-close]` cannot be collected
+  here; record them `not_run`.
 
 Stop only through the `stop` command. Do not end processes by name.
 
