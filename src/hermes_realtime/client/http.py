@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -14,6 +13,8 @@ from hermes_realtime.evidence.models import (
     parse_evidence_consent_request,
     parse_evidence_revoke_request,
 )
+from hermes_realtime.protocol.identifiers import WORKER_IDENTITY
+from hermes_realtime.protocol.limits import utf16_units
 from hermes_realtime.result_limits import (
     LEGACY_RESULT_NOTICE,
     MAX_LEGACY_RESULT_CHARS,
@@ -66,7 +67,7 @@ class BrowserBootstrapResponse:
 class BrowserBootstrapApplication:
     """Strict same-origin exchange after identity-bound worker provisioning."""
 
-    _WORKER_IDENTITY = re.compile(r"worker_[A-Za-z0-9_-]{8,64}\Z")
+    _WORKER_IDENTITY = WORKER_IDENTITY
     _RESPONSE_HEADERS = {
         "cache-control": "no-store",
         "content-type": "application/json; charset=utf-8",
@@ -662,7 +663,7 @@ class BrowserBootstrapApplication:
                     and event.kind == "task_result"
                     and data.get("status") == "completed"
                     and type(text) is str
-                    and len(text.encode("utf-16-le")) // 2 > MAX_LEGACY_RESULT_CHARS
+                    and utf16_units(text) > MAX_LEGACY_RESULT_CHARS
                 ):
                     data["text"] = LEGACY_RESULT_NOTICE
                 public_events.append(

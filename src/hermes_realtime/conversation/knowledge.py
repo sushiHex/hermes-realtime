@@ -16,6 +16,7 @@ from hermes_realtime.conversation.telemetry import (
     KnowledgeTurnBudget,
     UtteranceTicket,
 )
+from hermes_realtime.protocol.identifiers import IDENTIFIER
 from hermes_realtime.providers.current_facts import (
     CurrentFactEvidence,
     CurrentFactLookup,
@@ -25,7 +26,8 @@ from hermes_realtime.providers.current_facts import (
 )
 
 _MAX_TRANSCRIPT_CHARS = 512
-_TURN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+# The general identifier rule, which also admits a leading digit that TURN_ID refuses.
+_TURN_ID = IDENTIFIER
 _CONFLICT_TERMS = (
     ("allowed", "forbidden"),
     ("available", "unavailable"),

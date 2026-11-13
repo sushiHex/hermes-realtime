@@ -634,6 +634,10 @@ dev = [
     { name = "pytest-timeout" },
     { name = "ruff" },
 ]
+native-stage = [
+    { name = "pyyaml" },
+    { name = "requests" },
+]
 qualification-hermes = [
     { name = "concurrent-log-handler" },
     { name = "cryptography", version = "48.0.1", source = { registry = "https://pypi.org/simple" } },
@@ -676,6 +680,10 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.25" },
     { name = "pytest-timeout", specifier = ">=2.4" },
     { name = "ruff", specifier = ">=0.11" },
+]
+native-stage = [
+    { name = "pyyaml", specifier = ">=6,<7" },
+    { name = "requests", specifier = ">=2.32,<3" },
 ]
 qualification-hermes = [
     { name = "concurrent-log-handler", specifier = "==0.9.29" },

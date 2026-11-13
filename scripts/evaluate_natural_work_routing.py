@@ -34,6 +34,7 @@ from hermes_realtime.host_launcher import (
     _build_streaming_inference,
     build_local_host_launcher,
 )
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN as _PRIVATE_AUTHORITY
 from hermes_realtime.providers.codex_app_server import (
     CodexAppServerStreamingInference,
     _resolve_codex_executable,
@@ -80,7 +81,6 @@ _ACCEPTANCE = {
 _ACTIVE_CONTEXT_CASE_IDS = frozenset({"nw-054", "nw-074"})
 _TERMINAL_HISTORY_CASE_IDS = frozenset({"nw-098"})
 
-_PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 _CASE_ID = re.compile(r"nw-[0-9]{3}\Z")
 _INVOCATION_ID = re.compile(r"(?:tool_[0-9a-f]{32}|ollama_work_[0-9a-f]{64})\Z")
 _PUBLIC_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}\Z")

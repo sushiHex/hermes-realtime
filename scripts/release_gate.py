@@ -25,6 +25,7 @@ import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import NoReturn
+from xml.etree import ElementTree
 
 MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
 NPM = "npm.cmd" if os.name == "nt" else "npm"
@@ -42,6 +43,23 @@ NPM = "npm.cmd" if os.name == "nt" else "npm"
 # comparable with healthy runs.
 PYTEST_DURATIONS = ("--durations=0", "--durations-min=0.005")
 VITEST_DURATIONS = ("--", "--reporter=verbose", "--slowTestThreshold=100")
+# The tests the native stage owns: they need the owned loopback LiveKit server, or the
+# `requests` and `yaml` packages that the `native-stage` dependency group installs for
+# them. The default suite skips them, so the native stage must run every one of them.
+NATIVE_STAGE_TESTS = (
+    "tests/integration/test_local_livekit.py",
+    "tests/integration/test_browser_livekit.py",
+    "tests/integration/test_local_launcher.py",
+    "tests/integration/test_qualification_full_host_ingress.py",
+    "tests/integration/test_qualification_full_host_synthetic_audio.py",
+    "tests/test_lookup_backend_gateway.py::test_exa_event_stream_preserves_punctuation_through_real_requests_response",
+    "tests/test_preview_cutover.py::test_native_profile_accepts_bounded_yaml_for_staging_and_verification",
+)
+NATIVE_STAGE_SKIP_REASON = "set HERMES_REALTIME_LIVEKIT_LOCAL=1 to run against local LiveKit"
+NATIVE_ONLY_PASSED = (
+    "native release gate passed; the default suite, browser build and packaging "
+    "belong to the hermetic gate"
+)
 REQUIRED_STATIC = {
     "hermes_realtime/client/static/index.html": "web/index.html",
     "hermes_realtime/client/static/assets/app.js": "src/hermes_realtime/client/static/assets/app.js",
@@ -1001,6 +1019,202 @@ def _verified_livekit_listener_pid() -> int:
     return listener_pids[0]
 
 
+def native_stage_selector(classname: str, name: str) -> str | None:
+    """Return the native-stage selector that owns one collected test, if any."""
+
+    for selector in NATIVE_STAGE_TESTS:
+        path, _, test = selector.partition("::")
+        module = path.removesuffix(".py").replace("/", ".")
+        if test:
+            if classname == module and name == test:
+                return selector
+        elif classname == module or classname.startswith(module + "."):
+            return selector
+    return None
+
+
+def native_enabled_skip(reason: str | None) -> bool:
+    """Whether a skip is one that only the native stage's environment lifts."""
+
+    return reason is not None and (
+        reason == NATIVE_STAGE_SKIP_REASON or reason.startswith("could not import ")
+    )
+
+
+TEST_OWNERSHIP_STAGES = frozenset({"native-stage", "default-suite"})
+# Each category's fixed message. Test names appear only in the exception, never the marker.
+_OWNERSHIP_MESSAGES = {
+    "report_missing_or_malformed": "test outcome report is missing or malformed",
+    "report_invalid_case": (
+        "test outcome report holds a duplicate, unnamed, failed or unrecognized test"
+    ),
+    "empty_report": "test outcome report holds no test",
+    "selector_unmatched": "native stage selector collected no test",
+    "native_ran_outside_selection": "native stage ran a test outside its selection",
+    "native_test_skipped": "native stage test did not run",
+    "skipped_in_no_stage": "skipped test runs in no gate stage",
+    "native_test_ran_in_default": "native stage test also ran in the default suite",
+    "unexpected_error": "test ownership check did not complete",
+}
+TEST_OWNERSHIP_REFUSALS = frozenset(_OWNERSHIP_MESSAGES)
+OWNERSHIP_NAMED_TESTS = 10
+
+
+class OwnershipRefusal(RuntimeError):
+    """A test-ownership guard rejection with a fixed category and a count of tests."""
+
+    def __init__(self, refusal: str, tests: tuple[str, ...]) -> None:
+        if type(refusal) is not str or refusal not in TEST_OWNERSHIP_REFUSALS:
+            raise ValueError("unknown test-ownership refusal category")
+        message = _OWNERSHIP_MESSAGES[refusal]
+        if tests:
+            message += ": " + ", ".join(tests[:OWNERSHIP_NAMED_TESTS])
+        if len(tests) > OWNERSHIP_NAMED_TESTS:
+            message += f" and {len(tests) - OWNERSHIP_NAMED_TESTS} more"
+        super().__init__(message)
+        self.refusal = refusal
+        self.tests = len(tests)
+
+
+@contextlib.contextmanager
+def _test_ownership_refusal_evidence(stage: str) -> Iterator[None]:
+    """Emit one bounded marker line when an ownership check refuses: a category and a count."""
+    record: dict[str, object] | None = None
+    try:
+        yield
+    except BaseException as error:
+        if type(error) is OwnershipRefusal:
+            refusal, tests = error.refusal, error.tests
+        else:
+            refusal, tests = "unexpected_error", 0
+        record = {
+            "version": 1,
+            "stage": stage if stage in TEST_OWNERSHIP_STAGES else None,
+            "refusal": refusal,
+            "tests": tests,
+        }
+        raise
+    finally:
+        if record is not None:
+            print("[test-ownership] " + json.dumps(record), file=sys.stderr, flush=True)
+
+
+def read_test_outcomes(report: Path) -> dict[tuple[str, str], str | None]:
+    """Read one pytest JUnit report: every collected test, and why it was skipped if it was."""
+
+    try:
+        cases = list(ElementTree.parse(report).getroot().iter("testcase"))
+    except (OSError, ElementTree.ParseError):
+        # The parser's own message can quote the report path; the category says enough.
+        raise OwnershipRefusal("report_missing_or_malformed", ()) from None
+    outcomes: dict[tuple[str, str], str | None] = {}
+    for case in cases:
+        classname, name = case.get("classname"), case.get("name")
+        results = [
+            child
+            for child in case
+            if child.tag not in ("properties", "system-out", "system-err")
+        ]
+        skipped = len(results) == 1 and results[0].tag == "skipped"
+        reason = results[0].get("message") if skipped else None
+        if (
+            not classname
+            or not name
+            or (classname, name) in outcomes
+            or (results and not skipped)
+            or (skipped and (results[0].get("type") != "pytest.skip" or reason is None))
+        ):
+            raise OwnershipRefusal("report_invalid_case", ("::".join((classname or "", name or "")),))
+        outcomes[(classname, name)] = reason
+    if not outcomes:
+        raise OwnershipRefusal("empty_report", ())
+    return outcomes
+
+
+def _require_every_native_selector(owners: list[str | None]) -> None:
+    unmatched = tuple(sorted(set(NATIVE_STAGE_TESTS) - set(owners)))
+    if unmatched:
+        raise OwnershipRefusal("selector_unmatched", unmatched)
+
+
+def check_native_stage_outcomes(report: Path) -> None:
+    """Require the native stage to have run exactly its selection, with nothing skipped."""
+
+    with _test_ownership_refusal_evidence("native-stage"):
+        outcomes = read_test_outcomes(report)
+        owners = {node: native_stage_selector(*node) for node in outcomes}
+        outside = tuple(sorted("::".join(node) for node in outcomes if owners[node] is None))
+        if outside:
+            raise OwnershipRefusal("native_ran_outside_selection", outside)
+        _require_every_native_selector(list(owners.values()))
+        skipped = tuple(
+            sorted("::".join(node) for node, reason in outcomes.items() if reason is not None)
+        )
+        if skipped:
+            raise OwnershipRefusal("native_test_skipped", skipped)
+    print(f"test ownership verified: native stage ran {len(outcomes)} tests, 0 skipped", flush=True)
+
+
+def check_default_suite_outcomes(report: Path, *, native_stage_ran: bool) -> None:
+    """Require the default suite and the native stage to partition the collected tests.
+
+    The default suite collects everything. A test it skips for a reason only the native
+    environment lifts must belong to the native stage, or it runs in no gate stage. A
+    native-stage test must be skipped here unless this invocation ran the native stage
+    first and left its extra installed.
+    """
+
+    with _test_ownership_refusal_evidence("default-suite"):
+        outcomes = read_test_outcomes(report)
+        owners = {node: native_stage_selector(*node) for node in outcomes}
+        _require_every_native_selector(list(owners.values()))
+        unowned = tuple(
+            sorted(
+                "::".join(node)
+                for node, reason in outcomes.items()
+                if native_enabled_skip(reason) and owners[node] is None
+            )
+        )
+        if unowned:
+            raise OwnershipRefusal("skipped_in_no_stage", unowned)
+        duplicated = tuple(
+            sorted(
+                "::".join(node)
+                for node, reason in outcomes.items()
+                if reason is None and owners[node] is not None
+            )
+        )
+        if duplicated and not native_stage_ran:
+            raise OwnershipRefusal("native_test_ran_in_default", duplicated)
+    owned = sum(owner is not None for owner in owners.values())
+    skipped = sum(reason is not None for reason in outcomes.values())
+    print(
+        f"test ownership verified: default suite collected {len(outcomes)} tests, "
+        f"{owned} owned by the native stage, {skipped} skipped",
+        flush=True,
+    )
+
+
+def _run_reported(command: tuple[str, ...], *, cwd: Path, env: dict[str, str], name: str) -> Path:
+    report = cwd.parent / f"{name}-test-outcomes.xml"
+    report.unlink(missing_ok=True)
+    run(*command, f"--junitxml={report}", cwd=cwd, env=env)
+    return report
+
+
+def run_native_stage(*command: str, cwd: Path, env: dict[str, str]) -> None:
+    check_native_stage_outcomes(_run_reported(command, cwd=cwd, env=env, name="native-stage"))
+
+
+def run_default_suite(
+    *command: str, native_stage_ran: bool, cwd: Path, env: dict[str, str]
+) -> None:
+    check_default_suite_outcomes(
+        _run_reported(command, cwd=cwd, env=env, name="default-suite"),
+        native_stage_ran=native_stage_ran,
+    )
+
+
 def check_livekit(
     root: Path,
     environment: dict[str, str],
@@ -1032,7 +1246,7 @@ def check_livekit(
             "native LiveKit gate requires a running loopback server at 127.0.0.1:7880"
         ) from error
     local_env = environment | {"HERMES_REALTIME_LIVEKIT_LOCAL": "1"}
-    run(
+    run_native_stage(
         "uv",
         "run",
         "--frozen",
@@ -1040,16 +1254,14 @@ def check_livekit(
         "local",
         "--group",
         "dev",
+        "--group",
+        "native-stage",
         "pytest",
         "-q",
         *PYTEST_DURATIONS,
         "-W",
         "error::jwt.warnings.InsecureKeyLengthWarning",
-        "tests/integration/test_local_livekit.py",
-        "tests/integration/test_browser_livekit.py",
-        "tests/integration/test_local_launcher.py",
-        "tests/integration/test_qualification_full_host_ingress.py",
-        "tests/integration/test_qualification_full_host_synthetic_audio.py",
+        *NATIVE_STAGE_TESTS,
         cwd=root,
         env=local_env,
     )
@@ -1127,6 +1339,7 @@ def gate_materialized_candidate(
     root: Path,
     *,
     livekit: bool,
+    native_only: bool = False,
     git_executable: Path | None = None,
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
@@ -1135,6 +1348,8 @@ def gate_materialized_candidate(
 ) -> None:
     """Qualify one already-materialized disposable candidate source tree."""
 
+    if native_only and not livekit:
+        fail("native-only gate requires the native LiveKit stage")
     environment = clean_environment()
     web_environment = environment
     if declared_tool_path:
@@ -1222,7 +1437,12 @@ def gate_materialized_candidate(
             expected_sha256=livekit_executable_sha256,
             process_id=livekit_pid,
         )
-    run(
+        if native_only:
+            # The hermetic gate runs everything below once on this same verified
+            # archive. Repeating it here added no test: the default suite's
+            # ownership check holds every native-enabled test to the stage above.
+            return
+    run_default_suite(
         "uv",
         "run",
         "--frozen",
@@ -1232,6 +1452,7 @@ def gate_materialized_candidate(
         "-q",
         *PYTEST_DURATIONS,
         *((f"--native-git-executable={git_executable}",) if git_executable is not None else ()),
+        native_stage_ran=livekit,
         cwd=root,
         env=environment,
     )
@@ -1256,6 +1477,7 @@ def gate(
     source: Path,
     livekit: bool,
     *,
+    native_only: bool = False,
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
     livekit_pid: int | None = None,
@@ -1275,12 +1497,13 @@ def gate(
         gate_materialized_candidate(
             root,
             livekit=livekit,
+            native_only=native_only,
             livekit_executable=livekit_executable,
             livekit_executable_sha256=livekit_executable_sha256,
             livekit_pid=livekit_pid,
             declared_tool_path=declared_tool_path,
         )
-    print("release gate passed")
+    print(NATIVE_ONLY_PASSED if native_only else "release gate passed")
 
 
 def expect_failure(action: Callable[[], None], expected: str) -> None:
@@ -1399,6 +1622,11 @@ def main() -> None:
     parser.add_argument(
         "--require-livekit", action="store_true", help="run native local LiveKit integration tests"
     )
+    parser.add_argument(
+        "--native-only",
+        action="store_true",
+        help="with --require-livekit: stop after the native stage; the hermetic gate owns the rest",
+    )
     parser.add_argument("--livekit-executable", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--livekit-executable-sha256", help=argparse.SUPPRESS)
     parser.add_argument("--livekit-pid", type=int, help=argparse.SUPPRESS)
@@ -1416,6 +1644,8 @@ def main() -> None:
     if arguments.self_test:
         self_test()
         return
+    if arguments.native_only and not arguments.require_livekit:
+        parser.error("--native-only requires --require-livekit")
     ownership_arguments = (
         arguments.livekit_executable,
         arguments.livekit_executable_sha256,
@@ -1435,6 +1665,7 @@ def main() -> None:
     gate(
         arguments.candidate.resolve(),
         arguments.require_livekit,
+        native_only=arguments.native_only,
         livekit_executable=arguments.livekit_executable,
         livekit_executable_sha256=arguments.livekit_executable_sha256,
         livekit_pid=arguments.livekit_pid,

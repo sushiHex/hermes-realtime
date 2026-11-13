@@ -532,6 +532,7 @@ def test_run_fast_track_consumes_verified_token_into_downstream_gate(
             "candidate",
             {
                 "livekit": True,
+                "native_only": False,
                 "git_executable": executable,
                 "livekit_executable": tmp_path / "livekit.exe",
                 "livekit_executable_sha256": "e" * 64,
@@ -584,6 +585,7 @@ def test_main_forwards_candidate_and_livekit_ownership_arguments(
             {
                 "git_executable": git,
                 "require_livekit": True,
+                "native_only": False,
                 "livekit_executable": livekit,
                 "livekit_executable_sha256": "f" * 64,
                 "livekit_pid": 456,

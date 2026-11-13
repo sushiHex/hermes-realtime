@@ -20,10 +20,10 @@ from pathlib import Path
 from typing import Any
 
 from hermes_realtime.client.projection import _EVENT_KINDS, BrowserPublicEvent
+from hermes_realtime.protocol.identifiers import TASK_ID as TASK
 from scripts.native_run_witness import RUN_ID, NativeRunWitness, require, validate_origin
 
 LABEL = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
-TASK = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}\Z")
 TERMINAL = {"completed", "failed", "interrupted"}
 _PUBLICATION_TIMING_FIELDS = (
     "firstPublicationMs", "tokenToPublicationMs", "publicationToPlayableMs",
