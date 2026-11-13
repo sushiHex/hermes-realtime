@@ -10,14 +10,19 @@ fault exits the host and restart recovers") and changes neither.
 Reviewed source: [`5b66d584`](https://github.com/sushiHex/hermes-realtime/commit/5b66d5842d626531d81d4911348f6a4b8a60b972).
 Every `file:line` is at that commit, relative to `src/hermes_realtime/` unless it starts with
 `scripts/`, `tests/`, `web/` or `docs/`. Nothing below is implemented. This record changes no
-schema, prompt, default or gate. Every claim is from reading source; nothing was run.
+schema, prompt, default or gate. Every claim is from reading source, except cases 1 and 3
+below, which [#530](https://github.com/sushiHex/hermes-realtime/pull/530) reproduced by
+execution with in-memory providers. No model, backend, transport or voice session was run.
 
 ## Context
 
 The package handles an unexpected failure with a **latch**: an object records the first error
 and refuses every later call. Refusing is right, because the object's state is no longer
-known. The defect is what follows: for most latches, nothing. Twenty-five latches were found;
-the ones cited here were re-read. Each is held by an object with one of three lifetimes: a
+known. The defect is what follows: for most latches, nothing. A first inventory by hand found
+twenty-five; the ones cited here were re-read. That count has no owner here. The ratchet
+proposed in [#533](https://github.com/sushiHex/hermes-realtime/pull/533) owns it: by a
+structural definition it lists 65 sticky attributes, 18 of them failure latches, and names
+nine more it cannot see. Each is held by an object with one of three lifetimes: a
 turn, a binding (one browser connection, built per bind at `host_launcher.py:2618-2642`), or
 the host (built once by `build_local_host_launcher`). Only the binding's latch ends its own
 holder: the next audio frame raises, the receiver fails, and the transport is torn down
@@ -49,6 +54,10 @@ qualification channel failure, SIGTERM off Windows and SIGBREAK in qualification
    spoken, and a rebind fails and leaves no binding. It is not silent: the command path
    shows one `uncertain` task state and prints one `[task-command-settlement]` line. Nothing
    says the conversation has ended, and nothing exits.
+   Since [#537](https://github.com/sushiHex/hermes-realtime/pull/537), text a task session
+   reports can no longer trip the controller or director latch; a dispatch exception still
+   does. A refusal by the browser projection inside the update policy is one more trip of
+   the director latch, with the same consequence.
 2. The work-control health is per host (`host_launcher.py:2326`,
    `conversation/work_tools.py:684-686`, `:1014-1016`). The user is told to "Restart the
    session" (`conversation/commands.py:363`), which cannot clear it.
@@ -287,4 +296,5 @@ the owner's instruction of 2026-11-13 on #159, for the purpose of fixing #531.
   exits when its parent does.
 - Which fixed sentence a rejected dispatch produces, between the two at
   `conversation/task_proposals.py:39-42`.
-- No test, model, backend or voice session was run for this record.
+- No model, backend, transport or voice session was run for this record. The only execution
+  behind it is #530 (merged), for cases 1 and 3, within the limits above.
