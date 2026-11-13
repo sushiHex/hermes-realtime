@@ -8,6 +8,7 @@ import re
 from urllib.parse import urlsplit
 
 from hermes_realtime.protocol.identifiers import PRIVATE_HANDLE as _PRIVATE_RESULT_HANDLE
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
     MAX_LEGACY_RESULT_CHARS,
@@ -18,7 +19,11 @@ from hermes_realtime.result_limits import (
 _COMPLETION_REFERENCE = re.compile(
     r"(?:\[([^\]]+)\]\()?(https?://[^\s<>]+)", re.IGNORECASE,
 )
-_COMPLETION_MACHINE_TOKEN = re.compile(r"\b(?:task_|run_|deleg_)[A-Za-z0-9_.:-]+")
+# Rendering a result can assemble a run token from parts that were not one (a link label
+# beside its trailing text), so the shared rule is applied again to every rendered form.
+_COMPLETION_MACHINE_TOKEN = re.compile(
+    r"(?:\b(?:task_|run_|deleg_)[A-Za-z0-9_.:-]+|" + PRIVATE_RUN_TOKEN.pattern + ")"
+)
 _TAGGED_COMPLETION = re.compile(
     r"\A<voice>(?P<voice>[\s\S]*?)</voice>\s*"
     r"<detail>(?P<detail>[\s\S]*?)</detail>\Z"
@@ -27,6 +32,40 @@ _COMPLETION_PROTOCOL_TAG = re.compile(r"</?(?:voice|detail)>", re.IGNORECASE)
 _MAX_SPOKEN_COMPLETION_CHARS = 240
 _MAX_CONVERSATION_COMPLETION_DETAIL_CHARS = 3200
 _NO_DISPLAYABLE_RESULT = "No displayable result was returned."
+_PRIVATE_REFERENCE = "private reference"
+UNUSABLE_RESULT_SUMMARY = "The task finished, but its result could not be used."
+UNUSABLE_RESULT_REASON = "The task did not finish, and its details could not be displayed."
+
+
+def _without_private_handles(text: str) -> str:
+    """Replace every browser-private handle, including one a replacement completes.
+
+    One pass is not enough: ``run_-deleg_`` becomes ``run_-private reference``, whose first
+    twelve characters are again a handle the projection refuses. Each pass removes at least
+    one handle prefix and the replacement contains none, so this terminates.
+    """
+    while _PRIVATE_RESULT_HANDLE.search(text) is not None:
+        text = _PRIVATE_RESULT_HANDLE.sub(_PRIVATE_REFERENCE, text)
+    return text
+
+
+def admit_result_text(text: str, *, limit: int, notice: str) -> tuple[str, str | None]:
+    """Decide once what untrusted result text becomes; a string never makes this raise.
+
+    A background result is text a model wrote and may quote anything. This is the one place
+    that applies the private run token rule to it: a token is replaced, and text that then
+    cannot be used at all becomes the caller's fixed notice. The second value is the closed
+    category of what was done, or None when the text was admitted unchanged.
+    """
+    category = None
+    if PRIVATE_RUN_TOKEN.search(text) is not None:
+        text = PRIVATE_RUN_TOKEN.sub(_PRIVATE_REFERENCE, text)
+        category = "private_token"
+    if not text.strip():
+        return notice, "blank"
+    if len(text) > limit:
+        return notice, "bound"
+    return text, category
 
 
 def _completion_projections(detail: str) -> tuple[str, str]:
@@ -106,7 +145,7 @@ def completed_result_reference(detail: str) -> str:
         if voice and voice != visual else visual
     )
     safe = _COMPLETION_MACHINE_TOKEN.sub("the reference", _completion_reference_text(reference))
-    safe = _PRIVATE_RESULT_HANDLE.sub("private reference", safe)
+    safe = _without_private_handles(safe)
     safe = " ".join(safe.replace("•", " ").split()).strip()
     return _bounded_result(safe) or _NO_DISPLAYABLE_RESULT
 
@@ -173,7 +212,7 @@ def _conversation_completion_text(status: str, voice_detail: str, visual_detail:
 def _browser_safe_task_result(detail: str, *, completed: bool = False) -> str:
     refusal: str | None = None
     try:
-        safe = _PRIVATE_RESULT_HANDLE.sub("private reference", detail)
+        safe = _without_private_handles(detail)
         if completed:
             if not has_valid_result_unicode(safe):
                 refusal = "unicode"

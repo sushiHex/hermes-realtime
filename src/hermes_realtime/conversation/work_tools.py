@@ -22,7 +22,12 @@ from .context import (
     PrivateRunDisclosureError,
 )
 from .task_status import TaskStatusSnapshot
-from .tasks import TaskCancelOutcome, TaskDispatchOutcome
+from .tasks import (
+    CANCEL_REJECTED_REASON,
+    DISPATCH_REJECTED_REASON,
+    TaskCancelOutcome,
+    TaskDispatchOutcome,
+)
 
 WORK_OBJECTIVE_CONTEXT_POLICY = (
     "Background work receives the objective, not this conversation. Make the objective "
@@ -695,9 +700,7 @@ class ConversationWorkControlSurface:
                 dispatch = TaskDispatchOutcome(
                     task_id=dispatch.task_id, accepted=dispatch.accepted, reason=dispatch.reason,
                 )
-                public_reason = dispatch.reason or "Hermes rejected task dispatch"
-                if _PRIVATE_AUTHORITY.search(public_reason) is not None:
-                    public_reason = "Hermes rejected task dispatch"
+                public_reason = dispatch.reason or DISPATCH_REJECTED_REASON
                 start_result = WorkStartResult(
                     accepted=False,
                     state="rejected",
@@ -1030,7 +1033,7 @@ class ConversationWorkControlSurface:
             state="cancelling" if outcome.accepted else "rejected",
             task_id=outcome.task_id,
             reason=(
-                None if outcome.accepted else outcome.reason or "Hermes rejected task cancellation"
+                None if outcome.accepted else outcome.reason or CANCEL_REJECTED_REASON
             ),
         )
 

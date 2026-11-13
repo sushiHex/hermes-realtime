@@ -1092,11 +1092,11 @@ async def test_mutated_private_controller_result_is_rejected_on_reconstruction()
         "private prefixdeleg_private_12345678",
     )
 
-    result = await surface.start_work(
-        objective="Inspect evidence", invocation_id="private_result",
-    )
-    assert result.reason == "Hermes rejected task dispatch"
-    assert surface.health == "open"
+    # The controller admits a reason once; a value that bypassed it is not repaired here.
+    with pytest.raises(PrivateRunDisclosureError):
+        await surface.start_work(
+            objective="Inspect evidence", invocation_id="private_result",
+        )
 
 
 @pytest.mark.asyncio
@@ -1286,20 +1286,10 @@ async def test_close_timeout_is_bounded_and_retryable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_controller_accepted_rejection_text_does_not_latch_surface() -> None:
-    surface, controller, events = _surface(accepted=False)
-    # This is a valid controller outcome: the private namespace has a left boundary.
-    controller.dispatch_outcome = TaskDispatchOutcome(
-        task_id="task_public",
-        accepted=False,
-        reason="prefixdeleg_operational_option unavailable",
-    )
-    try:
-        result = await surface.start_work(
-            objective="Inspect evidence", invocation_id="ordinary_rejection"
-        )
-        assert not result.accepted
-        assert result.reason == "Hermes rejected task dispatch"
-        assert surface.health == "open"
-    finally:
-        await surface.close()
+async def test_a_controller_outcome_cannot_carry_a_run_token_behind_a_prefix() -> None:
+    # The private namespace has no left boundary: one rule decides, in the controller, and
+    # tests/conversation/test_result_text_first_boundary.py pins that a rejection reason
+    # naming a token is replaced there without latching anything.
+    for reason in ("prefixdeleg_operational_option unavailable", "1deleg_a", "deleg_a"):
+        with pytest.raises(PrivateRunDisclosureError):
+            TaskDispatchOutcome(task_id="task_public", accepted=False, reason=reason)
