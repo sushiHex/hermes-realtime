@@ -12,8 +12,13 @@ exists and binds it by equality to the tables in ``tests/support/marker_catalogu
 - ``NEVER_WRITTEN``: every name that is read or declared and has no write site.
 
 The test fails on a measurement that is not listed and on a listing that no longer
-matches, so the last four tables can only shrink. Run this file as a script to print the
-tables as measured.
+matches, so the last four tables can only shrink. ``uv run python -m
+tests.test_marker_catalogue`` prints the tables as measured.
+
+What shows a value to be content-free is stated in two places only: ``_judge`` for the
+shape of an expression, and ``_guarded`` with ``_vocabulary`` for a conditional that
+checks a value against a set. A disjunction shows nothing unless every alternative does,
+and a named set counts only when it can be read from source as a collection of constants.
 
 Limits. The measurement is static and syntactic. A prefix is seen only as a string or
 bytes constant that starts with ``[name]`` followed by a space or the end of the constant,
@@ -44,6 +49,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
+
+import pytest
 
 from tests.support import marker_catalogue as tables
 
@@ -337,9 +344,10 @@ class _Module:
         elif kind is ast.Compare:
             return
         elif kind is ast.IfExp:
-            if not self._guarded(node):
+            if not self._guarded(node.test, node.body, context, when=True):
                 again(node.body)
-            again(node.orelse)
+            if not self._guarded(node.test, node.orelse, context, when=False):
+                again(node.orelse)
         elif kind is ast.Dict:
             for key, value in zip(node.keys, node.values, strict=True):
                 if key is None:
@@ -389,31 +397,195 @@ class _Module:
             return
         self._doubt(marker, label, "text" if called in _STRING_CALLS else "call", node)
 
-    @staticmethod
-    def _guarded(node: ast.IfExp) -> bool:
-        """True for ``x if x in <set> else ...`` and ``x if type(x) is int else ...``."""
-        body = _text(node.body)
-        tests = node.test.values if type(node.test) is ast.BoolOp else [node.test]
-        for test in tests:
-            if type(test) is not ast.Compare or len(test.ops) != 1:
-                continue
-            left, operator, right = test.left, test.ops[0], test.comparators[0]
-            if type(operator) is ast.In and _text(left) == body:
-                listed = type(right) in (ast.Set, ast.Tuple, ast.List) and all(
-                    type(item) is ast.Constant for item in right.elts
-                )
-                if listed or type(right) is ast.Name:
-                    return True
-            if (
-                type(operator) is ast.Is
-                and type(left) is ast.Call
-                and _called(left) == "type"
-                and len(left.args) == 1
-                and _text(left.args[0]) == body
-                and type(right) is ast.Name
-                and right.id in _NUMBER_TYPES
+    # -- guards ---------------------------------------------------------------------
+
+    def _guarded(
+        self, test: ast.AST, value: ast.AST, context: _Function | None, *, when: bool,
+    ) -> bool:
+        """Whether ``test`` being ``when`` shows ``value`` to be a listed label or a number.
+
+        This is the one rule for a conditional expression, ``value if test else other``
+        (``when`` true) and ``other if test else value`` (``when`` false):
+
+        - ``value in V`` shows it when ``V`` is a literal vocabulary (``_vocabulary``);
+          ``value == "constant"`` and ``type(value) is int`` (or ``bool``, ``float``) show it.
+          Their negations (``not in``, ``!=``, ``is not``) show it when the test is false.
+        - ``not T`` shows it exactly when ``T`` being the opposite does.
+        - A conjunction that is true has every part true, so one part that shows it is
+          enough. A disjunction that is true has only some part true, so EVERY part must
+          show it. For a test that is false the two swap.
+        - Nothing else shows it, and ``value`` must be a plain name, attribute or subscript:
+          a call is evaluated again and may differ.
+
+        The rule is local to the expression. A value checked by an earlier statement
+        (``if x not in V: raise``) is not followed and stays unproven.
+        """
+        if any(type(node) is ast.Call for node in ast.walk(value)):
+            return False
+        kind = type(test)
+        if kind is ast.UnaryOp and type(test.op) is ast.Not:
+            return self._guarded(test.operand, value, context, when=not when)
+        if kind is ast.BoolOp:
+            shown = [self._guarded(part, value, context, when=when) for part in test.values]
+            every = type(test.op) is (ast.Or if when else ast.And)
+            return all(shown) if every else any(shown)
+        if kind is not ast.Compare or len(test.ops) != 1:
+            return False
+        left, operator, right = test.left, type(test.ops[0]), test.comparators[0]
+        if _text(left) == _text(value):
+            if operator is (ast.In if when else ast.NotIn):
+                return self._vocabulary(right, context)
+            if operator is (ast.Eq if when else ast.NotEq):
+                return type(right) is ast.Constant
+        return (
+            operator is (ast.Is if when else ast.IsNot)
+            and type(left) is ast.Call
+            and _called(left) == "type"
+            and len(left.args) == 1
+            and _text(left.args[0]) == _text(value)
+            and type(right) is ast.Name
+            and right.id in _NUMBER_TYPES
+        )
+
+    def _vocabulary(self, node: ast.AST | None, context: _Function | None, depth: int = 0) -> bool:
+        """Whether ``node`` is a collection of constants that can be read from source.
+
+        Accepted: a tuple, list, set or dict literal of constants; ``frozenset`` and its
+        like around one; a union of two; ``get_args`` of a ``Literal`` alias; an ``Enum``
+        class; and a name bound once, in this function or module or through a ``from``
+        import of a module in this repository, to one of those. Anything else, including a
+        parameter, an attribute and a computed collection, is not a vocabulary.
+        """
+        if node is None or depth > 6:
+            return False
+        kind = type(node)
+        if kind in (ast.Set, ast.Tuple, ast.List):
+            return all(self._is_constant(item, depth + 1) for item in node.elts)
+        if kind is ast.Dict:
+            return all(self._is_constant(key, depth + 1) for key in node.keys)
+        if kind is ast.BinOp:
+            left = self._vocabulary(node.left, context, depth + 1)
+            if type(node.op) is ast.BitOr:
+                return left and self._vocabulary(node.right, context, depth + 1)
+            return left and type(node.op) in (ast.Sub, ast.BitAnd)
+        if kind is ast.Call:
+            called, arguments = _called(node), node.args
+            if node.keywords or len(arguments) > 1:
+                return False
+            if called in ("frozenset", "set", "tuple", "list", "sorted"):
+                return not arguments or self._vocabulary(arguments[0], context, depth + 1)
+            return called == "get_args" and len(arguments) == 1 and self._literal(arguments[0])
+        if kind is not ast.Name:
+            return False
+        scope: ast.AST | None = context
+        while scope is not None:
+            bound = self._plainly_bound(scope, node.id)
+            if bound is None:
+                return False
+            if bound:
+                return all(self._vocabulary(value, scope, depth + 1) for value in bound)
+            scope = self._function(scope)
+        return self._module_vocabulary(node.id, depth + 1)
+
+    def _is_constant(self, node: ast.AST | None, depth: int) -> bool:
+        """A constant, a choice between constants, or a module-level name for one."""
+        if node is None or depth > 6:
+            return False
+        if type(node) is ast.IfExp:
+            return self._is_constant(node.body, depth + 1) and self._is_constant(
+                node.orelse, depth + 1,
+            )
+        if type(node) is ast.Name:
+            values = self._module_values(node.id)
+            return bool(values) and all(self._is_constant(value, depth + 1) for value in values)
+        return type(node) is ast.Constant
+
+    def _plainly_bound(self, scope: ast.AST, name: str) -> list[ast.AST] | None:
+        """Values assigned to ``name`` in a function; None if it is bound any other way."""
+        assert type(scope) in _FUNCTIONS
+        if self._parameter(scope, name) is not None:
+            return None
+        values: list[ast.AST] = []
+        for node in self._nodes(scope):
+            kind = type(node)
+            if kind is ast.Assign and any(
+                type(item) is ast.Name and item.id == name
+                for target in node.targets for item in ast.walk(target)
             ):
-                return True
+                if not all(type(target) is ast.Name for target in node.targets):
+                    return None
+                values.append(node.value)
+            elif kind is ast.AnnAssign and _text(node.target) == name:
+                if node.value is None:
+                    return None
+                values.append(node.value)
+            elif self._binds_otherwise(node, name):
+                return None
+        return values
+
+    def _binds_otherwise(self, node: ast.AST, name: str) -> bool:
+        """Whether ``node`` binds ``name`` in any way but a plain assignment to it."""
+        kind = type(node)
+        if kind is ast.Name and node.id == name and type(node.ctx) is not ast.Load:
+            above = self.parent.get(node)
+            plain = (type(above) is ast.Assign and node in above.targets) or (
+                type(above) is ast.AnnAssign and above.target is node
+            )
+            return not plain
+        if kind in (ast.Global, ast.Nonlocal):
+            return name in node.names
+        if kind is ast.ExceptHandler:
+            return node.name == name
+        return kind in (ast.Import, ast.ImportFrom) and any(
+            (alias.asname or alias.name.partition(".")[0]) == name for alias in node.names
+        )
+
+    def _literal(self, node: ast.AST) -> bool:
+        """Whether ``node`` names a module-level ``Literal[...]`` alias, or is one."""
+        if type(node) is ast.Subscript:
+            return _text(node.value) in ("Literal", "typing.Literal")
+        return type(node) is ast.Name and any(
+            self._literal(value) for value in self._module_values(node.id) or ()
+        )
+
+    def _module_values(self, name: str) -> list[ast.AST] | None:
+        """Values assigned to ``name`` at module level; None if bound in any other way."""
+        values: list[ast.AST] = []
+        for statement in self.tree.body:
+            kind = type(statement)
+            if kind is ast.Assign and any(
+                type(item) is ast.Name and item.id == name
+                for target in statement.targets for item in ast.walk(target)
+            ):
+                if not all(type(target) is ast.Name for target in statement.targets):
+                    return None
+                values.append(statement.value)
+            elif kind is ast.AnnAssign and _text(statement.target) == name:
+                if statement.value is None:
+                    return None
+                values.append(statement.value)
+            elif kind is ast.AugAssign and _text(statement.target) == name:
+                return None
+        return values
+
+    def _module_vocabulary(self, name: str, depth: int) -> bool:
+        if depth > 6:
+            return False
+        for statement in self.tree.body:
+            if type(statement) is ast.ClassDef and statement.name == name:
+                return any(_text(base).endswith("Enum") for base in statement.bases)
+        values = self._module_values(name)
+        if values is None:
+            return False
+        if values:
+            return all(self._vocabulary(value, None, depth + 1) for value in values)
+        for node in self.tree.body:
+            if type(node) is not ast.ImportFrom:
+                continue
+            for alias in node.names:
+                if (alias.asname or alias.name) == name:
+                    other = _load(_module_file(self.where, node.module, node.level))
+                    return other is not None and other._module_vocabulary(alias.name, depth + 1)
         return False
 
     # -- names ----------------------------------------------------------------------
@@ -597,6 +769,35 @@ class _Module:
                 )
 
 
+def _module_file(where: str, module: str | None, level: int) -> str | None:
+    """The repository file a ``from`` import names, when it can be read from source."""
+    parts = module.split(".") if module else []
+    if level:
+        base = Path(where).parent
+        for _ in range(level - 1):
+            base = base.parent
+    elif parts[:1] == ["hermes_realtime"]:
+        base = Path("src")
+    elif parts[:1] == ["scripts"]:
+        base = Path()
+    else:
+        return None
+    target = base.joinpath(*parts)
+    for candidate in (target.with_suffix(".py"), target / "__init__.py"):
+        if parts and (ROOT / candidate).is_file():
+            return candidate.as_posix()
+    return None
+
+
+@cache
+def _load(where: str | None) -> _Module | None:
+    """Another module of the repository, parsed only to resolve a name it defines."""
+    if where is None:
+        return None
+    tree = ast.parse((ROOT / where).read_text(encoding="utf-8"), filename=where)
+    return _Module(where, tree, Scan())
+
+
 # -- the browser ------------------------------------------------------------------------
 
 _WEB_PREFIX = re.compile(r"([`'\"])\[(" + _NAME + r")\](?= |\1)")
@@ -760,10 +961,125 @@ def test_the_known_free_strings_are_among_the_unproven_values() -> None:
 # -- what the scan sees, on small sources -----------------------------------------------
 
 
-def _scan(source: str) -> Scan:
+def _scan(source: str, where: str = "m.py") -> Scan:
     scan = Scan()
-    scan_python("m.py", source, scan)
+    scan_python(where, source, scan)
     return scan
+
+
+def _guard(test: str, *, preamble: str = "", where: str = "m.py") -> tuple[str, ...]:
+    """The unproven entries of ``{'operation': <test>}`` printed from a small module."""
+    scan = _scan(
+        "import json\n"
+        "_OPERATIONS = frozenset({'pull', 'start'})\n"
+        "NPM = 'npm.cmd' if True else 'npm'\n"
+        "_TOOLS = ('git', NPM)\n"
+        f"{preamble}"
+        "def f(first, arguments, other):\n"
+        "    local = {'pull', 'start'}\n"
+        "    rebuilt = set(arguments)\n"
+        f"    operation = {test}\n"
+        "    print('[some-marker] ' + json.dumps({'operation': operation}))\n",
+        where,
+    )
+    return _unproven(scan).get(where, {}).get("some-marker", ())
+
+
+_FIRST = ("operation: argument: first",)
+
+
+@pytest.mark.parametrize(
+    "test",
+    [
+        "first if first in _OPERATIONS else 'other'",
+        "first if type(first) is str and first in _OPERATIONS else 'other'",
+        "first if first in {'pull', 'start'} else 'other'",
+        "first if first in ('pull', 'start') else 'other'",
+        "first if first in local else 'other'",
+        "first if first in _TOOLS else 'other'",
+        "first if first in _OPERATIONS | {'rm'} else 'other'",
+        "first if first in _OPERATIONS or first in local else 'other'",
+        "first if first == 'pull' else 'other'",
+        "first if type(first) is int else None",
+        "first if not (first not in _OPERATIONS) else 'other'",
+        "first if not (type(first) is not str or first not in _OPERATIONS) else 'other'",
+        "'other' if first not in _OPERATIONS else first",
+        "'other' if not (first in _OPERATIONS) else first",
+        "'other' if type(first) is not str or first not in _OPERATIONS else first",
+        "first if type(first) is str and (first in _OPERATIONS or first == 'rm') else 'other'",
+    ],
+)
+def test_a_guard_that_bounds_the_value_is_accepted(test: str) -> None:
+    assert _guard(test) == ()
+
+
+@pytest.mark.parametrize(
+    "test",
+    [
+        # A disjunction is true when only one part is: every part must bound the value.
+        "first if type(first) is str or first in _OPERATIONS else 'other'",
+        "first if first in _OPERATIONS or other else 'other'",
+        "first if type(first) is str and (first in _OPERATIONS or first) else 'other'",
+        # A negated membership is the complement of a vocabulary.
+        "first if not (first in _OPERATIONS) else 'other'",
+        "first if first not in _OPERATIONS else 'other'",
+        "'other' if first in _OPERATIONS else first",
+        "'other' if type(first) is not str and first not in _OPERATIONS else first",
+        "first if first != 'pull' else 'other'",
+        # A named collection must resolve to a literal vocabulary.
+        "first if first in arguments else 'other'",
+        "first if type(first) is str and first in arguments else 'other'",
+        "first if first in rebuilt else 'other'",
+        "first if first in set(arguments) else 'other'",
+        "first if first in other.allowed else 'other'",
+        "first if first in _UNDEFINED else 'other'",
+        "first if first in _OPERATIONS | set(arguments) else 'other'",
+        # The guard must be about the value that is written.
+        "first if other in _OPERATIONS else 'other'",
+        "first if type(first) is str else 'other'",
+    ],
+)
+def test_a_guard_that_does_not_bound_the_value_leaves_it_unproven(test: str) -> None:
+    assert _guard(test) == _FIRST
+
+
+def test_a_guarded_call_is_unproven_because_it_is_evaluated_again() -> None:
+    assert _guard("str(first) if str(first) in _OPERATIONS else 'other'") == (
+        "operation: text: str(first)",
+    )
+
+
+def test_a_rebound_or_computed_named_collection_is_not_a_vocabulary() -> None:
+    rebound = "_SEEN = {'pull'}\n_SEEN = set(open('x'))\n"
+    assert _guard("first if first in _SEEN else 'other'", preamble=rebound) == _FIRST
+    grown = "_SEEN = {'pull'}\n_SEEN |= {'start'}\n"
+    assert _guard("first if first in _SEEN else 'other'", preamble=grown) == _FIRST
+    unpacked = "_SEEN, _REST = {'pull'}, {'start'}\n"
+    assert _guard("first if first in _SEEN else 'other'", preamble=unpacked) == _FIRST
+    mixed = "_SEEN = ('pull', other_module.NAME)\n"
+    assert _guard("first if first in _SEEN else 'other'", preamble=mixed) == _FIRST
+
+
+def test_a_named_collection_is_followed_through_an_alias_an_enum_and_an_import() -> None:
+    alias = "from typing import Literal, get_args\nKind = Literal['pull', 'start']\n"
+    assert _guard("first if first in get_args(Kind) else 'other'", preamble=alias) == ()
+    assert _guard("first if first in get_args(Missing) else 'other'", preamble=alias) == _FIRST
+    enum = "from enum import Enum\nclass Kind(Enum):\n    PULL = 'pull'\n"
+    assert _guard("first if first in Kind else 'other'", preamble=enum) == ()
+    plain = "class Kind:\n    PULL = 'pull'\n"
+    assert _guard("first if first in Kind else 'other'", preamble=plain) == _FIRST
+    # A real module of this repository: a frozenset of constants, and a name that is not one.
+    imported = "from hermes_realtime.protocol.events import VOICE_REFUSAL_CATEGORIES as LISTED\n"
+    script = "scripts/_synthetic.py"
+    assert _guard("first if first in LISTED else 'other'", preamble=imported, where=script) == ()
+    function = "from hermes_realtime.protocol.events import parse_event as LISTED\n"
+    assert _guard(
+        "first if first in LISTED else 'other'", preamble=function, where=script,
+    ) == _FIRST
+    foreign = "from os import environ as LISTED\n"
+    assert _guard(
+        "first if first in LISTED else 'other'", preamble=foreign, where=script,
+    ) == _FIRST
 
 
 def test_a_literal_line_is_a_write_with_nothing_unproven() -> None:

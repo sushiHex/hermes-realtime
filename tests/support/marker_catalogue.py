@@ -2,7 +2,7 @@
 
 These tables are data for that test and hold nothing else. Each is bound to the source by
 equality, so an entry is added, changed or deleted in the same change that adds, changes or
-deletes what it describes. ``python -m tests.test_marker_catalogue`` prints the first five as
+deletes what it describes. ``uv run python -m tests.test_marker_catalogue`` prints five as
 measured. The last four tables record debts and are meant to shrink (ADR 0007).
 """
 
@@ -572,6 +572,7 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
     "scripts/lookup_backend_gateway.py": {
         "lookup-transport-refusal": (
             "callerCategory: call: denial_caller_category()",
+            "category: text: str(error)",
             "denialCount: subscript: witness['transportDenialCount']",
             "extractRequests: subscript: witness['extractRequests']",
             "metadataRequests: call: witness.get('metadataRequests', 0)",
