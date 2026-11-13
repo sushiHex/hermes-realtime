@@ -30,7 +30,6 @@ from hermes_realtime.conversation.output_style import (
     require_output_style,
 )
 from hermes_realtime.conversation.streaming import (
-    AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
     ModelOutputRefused,
 )
@@ -40,6 +39,7 @@ from hermes_realtime.conversation.task_proposals import (
 )
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.telemetry import KnowledgeLookupTiming, RollingRouteMetrics
+from hermes_realtime.conversation.turn import foreground_turn, turn_routes
 from hermes_realtime.conversation.work_tools import (
     WORK_OBJECTIVE_CONTEXT_POLICY,
     WORK_ROUTING_POLICY,
@@ -1004,21 +1004,9 @@ class CodexAppServerStreamingInference:
         turn_id: str,
     ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]:
         style = require_output_style(self._output_style())
-        accepted_ack = type(snapshot) is AcceptedStartInferenceRequest
-        accepted_objective: str | None = None
-        if accepted_ack:
-            validated_ack = AcceptedStartInferenceRequest(
-                revision=snapshot.revision, messages=snapshot.messages,
-                active_tasks=snapshot.active_tasks,
-                terminal_task_count=snapshot.terminal_task_count, memory=snapshot.memory,
-                task_id=cast(AcceptedStartInferenceRequest, snapshot).task_id,
-                recent_task_results=snapshot.recent_task_results,
-            )
-            accepted_objective = next(
-                task.objective for task in validated_ack.active_tasks
-                if task.task_id == validated_ack.task_id
-            )
-        admitted_user_turn = type(snapshot) is ConversationInferenceRequest
+        turn = foreground_turn(snapshot)
+        accepted_objective = turn.accepted_objective
+        accepted_ack = accepted_objective is not None
         snapshot = self._trusted_snapshot(snapshot)
         self._validate_turn_id(turn_id)
         async with self._turn_lock:
@@ -1140,17 +1128,14 @@ class CodexAppServerStreamingInference:
                 and not private_turn
             )
             handler = self._work_tool_handler
-            tool_handler = handler
-            current_user_turn = bool(snapshot.messages and snapshot.messages[-1].role == "user")
-            status_available = (
-                handler is not None and admitted_user_turn
-                and current_user_turn and not private_turn
+            routes = turn_routes(
+                turn, work_bound=handler is not None, private_material=private_turn,
+                lookup_attempted=lookup_attempted, start_requires_admission=False,
             )
-            if accepted_ack or not current_user_turn or private_turn or lookup_attempted:
-                tool_handler = None
+            tool_handler = handler if routes.start_work else None
+            status_available = routes.task_status
             if accepted_ack:
                 search_available = False
-                status_available = False
             if foreground_lookup_unavailable:
                 if search_available or tool_handler is not None:
                     knowledge_policy += (
@@ -3249,8 +3234,7 @@ class CodexAppServerStreamingInference:
                  "status": result.status, "text": result.text}
                 for result in snapshot.recent_task_results
             ]
-        host_indices = [index for index, message in enumerate(snapshot.messages)
-                        if message.source in {"host_task_status", "host_task_proposal"}]
+        host_indices = snapshot.host_speech_message_indices
         if host_indices:
             payload["host_speech_message_indices"] = host_indices
         if snapshot.memory is not None:

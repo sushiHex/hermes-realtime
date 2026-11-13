@@ -112,6 +112,11 @@ class ConversationMessage:
             raise ValueError("conversation text exceeds supported maximum")
         _validate_model_visible_value(self.text)
 
+    @property
+    def host_speech(self) -> bool:
+        """Whether the host, not the model, authored this heard row."""
+        return self.source != "conversation"
+
 
 @dataclass(frozen=True, slots=True)
 class ActiveTaskSummary:
@@ -256,6 +261,13 @@ class ConversationContextSnapshot:
                     truncated=self.memory.truncated,
                 ),
             )
+
+    @property
+    def host_speech_message_indices(self) -> tuple[int, ...]:
+        """Positions of host-authored rows: the one derivation every renderer shares."""
+        return tuple(
+            index for index, message in enumerate(self.messages) if message.host_speech
+        )
 
 
 @dataclass(frozen=True, slots=True)
