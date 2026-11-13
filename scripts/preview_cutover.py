@@ -2428,6 +2428,183 @@ def launch_preview(active_path: Path) -> dict[str, Any]:
     return {"category": "launch_requested", "launch_authorized": True, "ready": False}
 
 
+# How often one owner run replaces a host that ended itself. A fixed count, never refilled
+# by time: a refill would need a stored judgement that the host had "served well".
+_HOST_RESTART_BUDGET = 3
+_HOST_RESTART_SETTLE_SECONDS = 15.0
+
+
+# One sample is a snapshot of every process on the machine: about 26 ms with some 900
+# processes where this was measured. Taken at every half-second poll that would be about
+# five percent of one core beside realtime speech; at this cadence it is about half a
+# percent. The set of processes below a host changes rarely.
+_HOST_TREE_SAMPLE_SECONDS = 5.0
+# A host runs a handful of processes below it. More than this is not a tree this owner
+# will end on its own judgement, so the restart is refused instead.
+_HOST_TREE_LIMIT = 64
+
+
+class _HostTree:
+    """What runs below one host, remembered only so that it can be ended after the host.
+
+    Sampled on its own slow cadence while the host lives, and once more when it has exited:
+    its direct children still name it as their parent then, so a child started after the
+    last sample is found too. What is not found is a process whose own parent ended before
+    any sample saw it. The host port and the two host locks are the backstop for that.
+
+    A process seen earlier is kept only while it is still that same running process. One
+    that ended is forgotten. One whose parent ended stays, because it can no longer be
+    reached from the host and is exactly what must not be left behind.
+    """
+
+    def __init__(self) -> None:
+        self.seen: dict[int, int] = {}
+        self.unbounded = False
+        self.unobservable = False
+        self._due = 0.0
+
+    def sample(self, host_pid: int, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now < self._due:
+            return
+        self._due = now + _HOST_TREE_SAMPLE_SECONDS
+        from scripts import rehearse_desktop_mvp as owner
+
+        table = owner.process_table()
+        below: set[int] = set()
+        frontier = {host_pid}
+        while frontier:
+            frontier = {
+                pid for pid, (parent, _) in table.items() if parent in frontier
+            } - below - {host_pid}
+            below |= frontier
+        # A process that cannot be observed is not known to be gone. It is never recorded
+        # as a new identity and never forgotten, and the sample says it was incomplete.
+        merged: dict[int, int] = {}
+        unobservable = False
+        for pid in below:
+            try:
+                started = owner.started_at(pid)
+            except owner.ProcessUnobservable:
+                unobservable = True
+                continue
+            if started is not None:
+                merged[pid] = started
+        for pid, when in self.seen.items():
+            if pid in merged or pid not in table:
+                continue
+            try:
+                same = owner.started_at(pid) == when
+            except owner.ProcessUnobservable:
+                same = unobservable = True
+            # Reached only for one that is no longer below the host, or cannot be observed.
+            if same:
+                merged[pid] = when
+        self.unobservable = unobservable
+        if len(merged) > _HOST_TREE_LIMIT:
+            self.unbounded = True
+            return
+        self.seen = merged
+
+
+def _settle_exited_host(
+    plan: PreviewPlanV1, left_running: Mapping[int, int], members: Any
+) -> None:
+    """Refuse a successor until nothing of the exited host remains.
+
+    A host that ended itself ran none of its close paths, so its children outlive it. Only
+    processes that were seen below it, are still that same process and are inside this
+    owner's Job are ended, by process ID and never by name. Then its port must be quiet
+    and both of its locks free: the lock, not a process ID, says the store can be opened.
+    """
+    from scripts import rehearse_desktop_mvp as owner
+
+    def remaining() -> list[int]:
+        owned = members()
+        found = []
+        for pid, started in sorted(left_running.items()):
+            if pid not in owned:
+                continue
+            try:
+                same = owner.started_at(pid) == started
+            except owner.ProcessUnobservable:
+                # Not known to be gone: a successor must not start beside it.
+                raise PreviewRefusal("host_restart_process_unobservable") from None
+            if same:
+                found.append(pid)
+        return found
+
+    deadline = time.monotonic() + _HOST_RESTART_SETTLE_SECONDS
+    for pid in remaining():
+        owner._kill_tree(pid)
+    while remaining():
+        require(time.monotonic() < deadline, "host_restart_survivors")
+        time.sleep(_STOP_POLL_SECONDS)
+    while any(_endpoint_snapshot(plan, [plan.ports["host"]]).values()):
+        require(time.monotonic() < deadline, "host_restart_port_held")
+        time.sleep(_STOP_POLL_SECONDS)
+    _require_host_locks_free(
+        plan.state_root, (_TAIL + ".lock",), "state_root_lock_file", "host_restart_store_held"
+    )
+    _require_host_locks_free(
+        plan.output / "state", ("hermes-runs-v1.json.lock",),
+        "previous_lock_file", "host_restart_record_held",
+    )
+
+
+def _supervise_owned_children(
+    *,
+    stop_requested: Any,
+    roots: Any,
+    restart_host: Any,
+    reserved_status: int | None,
+    restarts: list[str],
+    budget: int = _HOST_RESTART_BUDGET,
+) -> None:
+    """Watch the owned roots until a stop is requested.
+
+    Any root exiting ends the run, as before, with one exception: a host that exited with
+    the reserved status ended itself after a host-wide fault and saved the conversation
+    first. It is replaced in place, against the same run directory, gateway and LiveKit,
+    so its successor settles the same run record and tells the user what was stopped.
+    Each replacement leaves one line, whatever its outcome, and the budget is final.
+    """
+    tree = _HostTree()
+    while not stop_requested():
+        current = roots()
+        exited = {name for name, process in current.items() if process.poll() is not None}
+        if not exited:
+            host = current.get("host")
+            if host is not None and reserved_status is not None:
+                tree.sample(host.pid)
+            time.sleep(_STOP_POLL_SECONDS)
+            continue
+        status = current["host"].poll() if exited == {"host"} else None
+        require(
+            reserved_status is not None and type(status) is int and status == reserved_status,
+            "owned_child_exited",
+        )
+        outcome = "refused"
+        try:
+            if len(restarts) >= budget:
+                outcome = "budget_spent"
+                raise PreviewRefusal("host_restart_budget_spent")
+            tree.sample(current["host"].pid, force=True)
+            require(not tree.unbounded, "host_restart_tree_unbounded")
+            require(not tree.unobservable, "host_restart_process_unobservable")
+            restart_host(tree.seen)
+            tree = _HostTree()
+            outcome = "restarted"
+            restarts.append(outcome)
+        finally:
+            emit({
+                "category": "host_restart",
+                "outcome": outcome,
+                "restarts": len(restarts),
+                "remaining": budget - len(restarts),
+            })
+
+
 def serve(active_path: Path) -> int:
     require(sys.platform == "win32", "windows_required")
     plan, _, profile = _active_plan(active_path)
@@ -2466,6 +2643,7 @@ def serve(active_path: Path) -> int:
         "listener_ownership": "unavailable" if _dev_readiness(plan) else "not_established",
     }
     startup_error: str | None = None
+    host_restarts: list[str] = []
     gateway_manifest = None
     try:
         from scripts.preview_owner_launch import (
@@ -2592,48 +2770,67 @@ def serve(active_path: Path) -> int:
                         break
             time.sleep(_STOP_POLL_SECONDS)
         require(gateway_ready, "gateway_start_timeout")
-        host_process = processes.spawn(
+        host_ready_path = output / "host-ready.private.json"
+
+        def await_host(host_process: Any) -> None:
+            """Establish one host incarnation's readiness, the same way for each."""
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline and not host_ready_path.exists():
+                require(not (output / "stop.request").exists(), "stop_requested_during_start")
+                require(processes.roots["host"].poll() is None, "host_exited_during_start")
+                time.sleep(_STOP_POLL_SECONDS)
+            require(host_ready_path.is_file(), "host_start_timeout")
+            members = containment.members()
+            host_ready = _read_json_file(host_ready_path)
+            if _dev_readiness(plan):
+                from scripts.preview_readiness import require_host_readiness
+
+                require(livekit_process.poll() is None and livekit_process.pid in members,
+                        "livekit_process_owner")
+                require_host_readiness(host_ready, root_pid=host_process.pid, members=members)
+                _require_host_http_ready(plan.ports["host"])
+            else:
+                host_pid = _require_owned_endpoint_rows(
+                    _listener_rows(plan.ports["host"]), host_process.pid, members, 1,
+                    role_pids=_owned_role_members(host_process.pid, members),
+                )
+                require(
+                    host_ready == {"version": 1, "ready": True, "pid": host_pid},
+                    "host_ready_receipt",
+                )
+
+        def restart_host(left_running: Mapping[int, int]) -> None:
+            """Replace a host that ended itself, once nothing of it remains."""
+            _settle_exited_host(plan, left_running, containment.members)
+            # The exited host wrote this for itself; its successor writes its own.
+            host_ready_path.unlink()
+            await_host(processes.respawn(
+                "host",
+                host_command,
+                env=_host_environment(plan, profile),
+                cwd=plan.hermes_source,
+                log=Path(os.devnull),
+            ))
+
+        await_host(processes.spawn(
             "host",
             host_command,
             env=_host_environment(plan, profile),
             cwd=plan.hermes_source,
             log=Path(os.devnull),
-        )
-        host_ready_path = output / "host-ready.private.json"
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline and not host_ready_path.exists():
-            require(not (output / "stop.request").exists(), "stop_requested_during_start")
-            require(processes.roots["host"].poll() is None, "host_exited_during_start")
-            time.sleep(_STOP_POLL_SECONDS)
-        require(host_ready_path.is_file(), "host_start_timeout")
-        members = containment.members()
-        host_ready = _read_json_file(host_ready_path)
-        if _dev_readiness(plan):
-            from scripts.preview_readiness import require_host_readiness
-
-            require(livekit_process.poll() is None and livekit_process.pid in members,
-                    "livekit_process_owner")
-            require_host_readiness(host_ready, root_pid=host_process.pid, members=members)
-            _require_host_http_ready(plan.ports["host"])
-        else:
-            host_pid = _require_owned_endpoint_rows(
-                _listener_rows(plan.ports["host"]), host_process.pid, members, 1,
-                role_pids=_owned_role_members(host_process.pid, members),
-            )
-            require(
-                host_ready == {"version": 1, "ready": True, "pid": host_pid},
-                "host_ready_receipt",
-            )
+        ))
         result.update(category="ready", ready=True, ports=ports,
                       listener_ownership="unavailable" if _dev_readiness(plan) else "verified")
         _write_new(output / "ready-receipt.private.json", result)
         emit({"category": "ready", "launch_authorized": True, "ports": ports})
-        while not (output / "stop.request").exists():
-            require(
-                all(process.poll() is None for process in processes.roots.values()),
-                "owned_child_exited",
-            )
-            time.sleep(_STOP_POLL_SECONDS)
+        _supervise_owned_children(
+            stop_requested=(output / "stop.request").exists,
+            roots=lambda: processes.roots,
+            restart_host=restart_host,
+            # A runtime without the reserved status never ends itself this way.
+            reserved_status=getattr(host_module, "HOST_FATAL_EXIT_STATUS", None),
+            restarts=host_restarts,
+        )
         startup_error = None
     except BaseException as error:
         startup_error = (
@@ -2731,6 +2928,7 @@ def serve(active_path: Path) -> int:
             "child_output_metadata": child_facts,
             "host_graceful_stop_timed_out": host_stop_timed_out,
             "host_exit_code": host_exit_code,
+            "host_restarts": len(host_restarts),
             "failure_category": (
                 None if stopped
                 else startup_error if startup_error is not None
@@ -2739,7 +2937,10 @@ def serve(active_path: Path) -> int:
             ),
         }
         _write_new(output / "result-receipt.private.json", receipt)
-        for name in ("gateway.private.log", "livekit.private.log", "host.private.log"):
+        for name in (
+            "gateway.private.log", "livekit.private.log", "host.private.log",
+            *(f"host.restart{index}.private.log" for index in range(1, _HOST_RESTART_BUDGET + 1)),
+        ):
             with contextlib.suppress(FileNotFoundError):
                 (output / name).unlink()
         if stopped:
