@@ -316,7 +316,7 @@ def test_cli_does_not_normalize_a_malformed_baseline(
 
 @pytest.mark.parametrize(
     "broken",
-    ["first_parent", "ignores_baseline", "accepts_anything"],
+    ["first_parent", "ignores_baseline", "accepts_anything", "wrong_digest"],
 )
 def test_self_test_rejects_a_weakened_baseline_binding(
     monkeypatch: pytest.MonkeyPatch, broken: str
@@ -333,9 +333,14 @@ def test_self_test_rejects_a_weakened_baseline_binding(
             return real(source, parent, revision=revision)
         if broken == "accepts_anything" and baseline is not None:
             return "0" * 64
+        if broken == "wrong_digest":
+            # Every refusal intact; only the accepted binding is not the canonical one.
+            real_binding(source, baseline, revision=revision)
+            return "0" * 64
         return real(source, baseline, revision=revision)
 
-    monkeypatch.setattr(gate, "candidate_diff_binding", weakened, raising=False)
+    real_binding = gate.candidate_diff_binding
+    monkeypatch.setattr(gate, "candidate_diff_binding", weakened)
     with pytest.raises(RuntimeError, match="self-test"):
         gate.self_test()
 
