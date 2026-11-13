@@ -8,6 +8,7 @@ import pytest
 from scripts.native_work_profile import (
     StatusServer,
     build_native_work_profile,
+    memory_provider_inspection,
     validate_native_work_profile,
 )
 
@@ -128,6 +129,60 @@ def test_explicit_web_presentation_preserves_native_capabilities(server, monkeyp
     assert config["approvals"] == original["approvals"]
     assert config["platform_toolsets"]["api_server"] == ["web", "mcp-vram"]
     assert validate_native_work_profile(config, server)["lookup_policy"] is None
+
+
+_SECRET = "synthetic-memory-secret-value"
+
+
+@pytest.mark.parametrize("name", ["synthetic-provider", " "])
+def test_profile_refuses_a_selected_external_memory_provider_by_category_only(server, name):
+    original = base_config()
+    original["memory"] = {
+        "provider": name,
+        "synthetic-provider": {"api_key": _SECRET, "base_url": "https://example.invalid/v1"},
+    }
+    with pytest.raises(ValueError) as refused:
+        build_native_work_profile(original, server)
+    assert refused.value.args == ("memory_provider_selected",)
+    for private in (_SECRET, "example.invalid", "synthetic-provider"):
+        assert private not in str(refused.value)
+
+    config = build_native_work_profile(base_config(), server)
+    config["memory"] = {"provider": "synthetic-provider"}
+    with pytest.raises(ValueError, match="memory_provider_selected"):
+        validate_native_work_profile(config, server)
+
+
+@pytest.mark.parametrize(
+    ("memory", "expected"),
+    [
+        (None, "absent"),
+        ({}, "absent"),
+        ({"memory_enabled": True, "nudge_interval": 10}, "absent"),
+        ({"provider": ""}, "builtin"),
+    ],
+    ids=["section_absent", "section_empty", "provider_absent", "builtin_only"],
+)
+def test_built_in_memory_passes_and_is_reported_as_config_inspection(server, memory, expected):
+    original = base_config()
+    if memory is not None:
+        original["memory"] = memory
+    config = build_native_work_profile(original, server)
+    assert config.get("memory") == memory
+    assert memory_provider_inspection(config) == expected
+
+
+@pytest.mark.parametrize(
+    "memory",
+    [[], "builtin", 0, {"provider": None}, {"provider": 1}, {"provider": ["x"]},
+     {"provider": {}}, {"provider": False}],
+)
+def test_profile_refuses_a_memory_value_of_the_wrong_exact_type(server, memory):
+    original = base_config()
+    original["memory"] = memory
+    with pytest.raises(ValueError) as refused:
+        build_native_work_profile(original, server)
+    assert refused.value.args == ("memory_provider_refused",)
 
 
 @pytest.mark.parametrize(

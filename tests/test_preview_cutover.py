@@ -526,7 +526,65 @@ def test_prepare_success_runs_the_prefixed_preflight_before_receipt(tmp_path, mo
     assert result["category"] == "prepared"
     assert prepared["preflight"] == "accepted"
     assert prepared["profile_complete"] is False
+    assert prepared["memory_provider_config_inspection"] == "absent"
     assert not (tmp_path / "preview" / "input" / "home" / ".env").exists()
+
+
+def test_prepare_refuses_a_profile_selecting_an_external_memory_provider(tmp_path):
+    plan_path, profile = _plan(tmp_path)
+    config = json.loads((profile / "config.yaml").read_text(encoding="utf-8"))
+    config["memory"] = {"provider": "synthetic-provider", "synthetic-provider": {"k": "v"}}
+    (profile / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="preflight_refused"):
+        preview_cutover.prepare(plan_path)
+
+    output = tmp_path / "preview"
+    assert not (output / "prepared.private.json").exists()
+    assert not (output / "input" / "home" / "config.yaml").exists()
+    refusal = (output / "preparation-refused.private.json").read_text(encoding="utf-8")
+    assert json.loads(refusal) == {
+        "version": 1,
+        "category": "preparation_refused",
+        "failure_kind": "ValueError",
+        "failure_category": "memory_provider_selected",
+        "prepared": False,
+    }
+    assert "synthetic-provider" not in refusal
+
+
+@pytest.mark.parametrize(
+    ("memory", "category"),
+    [
+        ({"provider": "synthetic-provider", "synthetic-provider": {"k": "secret-v"}},
+         "memory_provider_selected"),
+        ({"provider": ["synthetic-provider"]}, "memory_provider_refused"),
+    ],
+)
+def test_preflight_marker_carries_only_the_memory_refusal_category(
+    tmp_path, monkeypatch, capsys, memory, category
+):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.output.mkdir()
+    home = preview_cutover.stage_preflight_profile(plan)
+    config = json.loads((home / "config.yaml").read_text(encoding="utf-8"))
+    config["memory"] = memory
+    (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setattr(preview_cutover, "verify_realtime_runtime", lambda _: None)
+
+    code = preview_cutover.main(["preflight", "--plan", str(plan_path), "--home", str(home)])
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert output.startswith("[voice-preview] ") and output.count("\n") == 1
+    assert json.loads(output.removeprefix("[voice-preview] ")) == {
+        "category": "refused",
+        "failure_kind": "ValueError",
+        "failure_category": category,
+    }
+    for private in ("synthetic-provider", "secret-v"):
+        assert private not in output
 
 
 def test_native_staging_uses_the_reviewed_status_profile_projection(tmp_path):

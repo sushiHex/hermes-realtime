@@ -54,7 +54,12 @@ from .foreground import (
     ForegroundTurnCoordinator,
     ForegroundTurnLease,
 )
-from .task_proposals import ConversationTaskProposals, HostTaskProposalRequest, TaskProposal
+from .task_proposals import (
+    ConversationTaskProposals,
+    HostTaskProposalRequest,
+    TaskProposal,
+    unaccepted_start_speech,
+)
 from .task_status import HostSpeechRequest, TaskStatusSnapshot
 from .tasks import TaskTerminalOutcome
 from .updates import UpdateDecision, UpdateDecisionKind
@@ -1167,7 +1172,20 @@ class StreamingSpeechLoop:
                     accepted = await self._task_proposals.submit_for_ack(
                         automatic_proposal, anchor_turn_id=lease.turn_id,
                     )
-                    if (accepted is not None and accepted.accepted and accepted.state == "active"
+                    refusal = unaccepted_start_speech(accepted)
+                    if refusal is not None:
+                        # A fixed host sentence chosen by result category, never the
+                        # result's reason; spoken only under this still-current lease.
+                        if lease.is_current:
+                            segment_count += 1
+                            if (segment_count > self._max_segments
+                                    or len(refusal) > self._max_segment_chars):
+                                raise ValueError("host refusal speech capacity exceeded")
+                            text_seen = True
+                            await lease.publish(
+                                refusal, on_admit=admit_generated, source="host_task_status",
+                            )
+                    elif (accepted is not None and accepted.accepted and accepted.state == "active"
                             and accepted.task_id is not None and lease.is_current):
                         current = self._context.snapshot()
                         accepted_tasks = tuple(
