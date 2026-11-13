@@ -60,6 +60,7 @@ class _Run:
         self.late_children: dict[int, int] = {}  # started after the last tree sample
         self.grandchildren: dict[int, tuple[int, int]] = {}  # pid -> (parent, start)
         self.ends_early: set[int] = set()  # ends just before the host does
+        self.unobservable: set[int] = set()  # cannot be opened or timed
         self.actions: list[str] = []
         self.lines: list[dict[str, Any]] = []
         self.hosts: list[_FakeProcess] = []
@@ -158,7 +159,12 @@ class _Run:
         monkeypatch.setattr(lookup_backend_logs, "CappedProcesses", Capped)
         monkeypatch.setattr(owner, "Containment", Containment)
         monkeypatch.setattr(owner, "process_table", process_table)
-        monkeypatch.setattr(owner, "_observed_start", lambda pid: run.started.get(pid))
+        def started_at(pid: int) -> int | None:
+            if pid in run.unobservable:
+                raise owner.ProcessUnobservable(pid)
+            return run.started.get(pid)
+
+        monkeypatch.setattr(owner, "started_at", started_at)
         monkeypatch.setattr(owner, "_kill_tree", kill_tree)
         monkeypatch.setattr(preview_cutover, "emit", emit)
         monkeypatch.setattr(
@@ -422,6 +428,20 @@ def test_a_child_started_after_the_last_sample_is_still_ended(run: _Run) -> None
     assert run.receipt["host_restarts"] == 1
 
 
+def test_a_new_child_that_could_never_be_identified_refuses_the_restart(run: _Run) -> None:
+    run.exits = [HOST_FATAL_EXIT_STATUS]
+    run.idle_ticks = 2
+    run.late_children = {41950: 5}
+    run.unobservable = {41950}
+
+    assert run.serve() == 1
+
+    # It was never recorded, so settling could not have known to wait for it.
+    assert run.state["spawned"].count("host") == 1
+    assert run.receipt["failure_category"] == "host_restart_process_unobservable"
+
+
+
 def test_a_grandchild_whose_parent_ended_before_the_host_is_still_ended(run: _Run) -> None:
     run.exits = [HOST_FATAL_EXIT_STATUS]
     run.idle_ticks = 3
@@ -465,7 +485,14 @@ class _World:
             return dict(self.table)
 
         monkeypatch.setattr(owner, "process_table", process_table)
-        monkeypatch.setattr(owner, "_observed_start", lambda pid: self.started.get(pid))
+        self.unobservable: set[int] = set()
+
+        def started_at(pid: int) -> int | None:
+            if pid in self.unobservable:
+                raise owner.ProcessUnobservable(pid)
+            return self.started.get(pid)
+
+        monkeypatch.setattr(owner, "started_at", started_at)
         monkeypatch.setattr(
             preview_cutover, "time", types.SimpleNamespace(monotonic=lambda: self.now)
         )
@@ -524,6 +551,49 @@ def test_the_host_tree_forgets_what_ended_and_keeps_what_lost_its_parent(
     assert tree.seen == {12: 1}
 
 
+def test_the_host_tree_keeps_a_process_it_can_no_longer_observe_and_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World(monkeypatch)
+    world.run(10, 1)
+    world.run(11, 10)
+    world.run(12, 10)
+    tree = preview_cutover._HostTree()
+    tree.sample(10, force=True)
+    assert tree.unobservable is False
+
+    world.unobservable = {11}
+    world.run(13, 10)
+    world.unobservable.add(13)  # a new child that could never be identified
+    tree.sample(10, force=True)
+
+    # Not known to be gone, so not forgotten; and the sample says it was incomplete.
+    assert tree.seen == {11: 1, 12: 1}
+    assert tree.unobservable is True
+
+    world.unobservable = set()
+    tree.sample(10, force=True)
+    assert tree.seen == {11: 1, 12: 1, 13: 1}
+    assert tree.unobservable is False
+
+
+def test_a_leftover_child_that_cannot_be_observed_refuses_the_restart(run: _Run) -> None:
+    run.exits = [HOST_FATAL_EXIT_STATUS]
+    run.idle_ticks = 2
+    run.children = {41900: 7}
+    run.after_exit = lambda: run.unobservable.add(41900)
+
+    assert run.serve() == 1
+
+    assert not any(action.startswith("kill:") for action in run.actions)
+    assert run.state["spawned"].count("host") == 1
+    assert run.restart_lines == [
+        {"category": "host_restart", "outcome": "refused", "restarts": 0, "remaining": 3}
+    ]
+    assert run.receipt["failure_category"] == "host_restart_process_unobservable"
+
+
+
 def test_the_final_sample_finds_children_of_a_host_that_has_already_exited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -563,7 +633,14 @@ def test_settling_ends_nothing_whose_number_was_reused_after_the_last_sample(
 
     killed: list[int] = []
     started = {50: 1, 51: 2, 52: 3}
-    monkeypatch.setattr(owner, "_observed_start", lambda pid: started.get(pid))
+    unobservable: set[int] = set()
+
+    def started_at(pid: int) -> int | None:
+        if pid in unobservable:
+            raise owner.ProcessUnobservable(pid)
+        return started.get(pid)
+
+    monkeypatch.setattr(owner, "started_at", started_at)
     monkeypatch.setattr(owner, "_kill_tree", lambda pid: (killed.append(pid), started.pop(pid)))
     monkeypatch.setattr(preview_cutover, "_endpoint_snapshot", lambda _plan, ports: {})
     plan = types.SimpleNamespace(
@@ -576,6 +653,18 @@ def test_settling_ends_nothing_whose_number_was_reused_after_the_last_sample(
         plan, {50: 1, 51: 2, 52: 3}, lambda: {50, 52},  # type: ignore[arg-type]
     )
 
+    assert killed == [50]
+
+    # A process of this Job that cannot be observed is not known to be gone: refuse.
+    started.update({60: 4, 61: 5})
+    unobservable.update({60, 61})
+    preview_cutover._settle_exited_host(
+        plan, {61: 5}, lambda: {60},  # type: ignore[arg-type]
+    )
+    with pytest.raises(preview_cutover.PreviewRefusal, match="host_restart_process_unobservable"):
+        preview_cutover._settle_exited_host(
+            plan, {60: 4}, lambda: {60},  # type: ignore[arg-type]
+        )
     assert killed == [50]
 
 

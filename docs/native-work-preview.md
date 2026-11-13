@@ -376,7 +376,9 @@ the number `remaining`. One owner run replaces the host at most three times; the
 not refilled by time. When it is spent the run ends as `refused` with
 `failure_category` `host_restart_budget_spent`. A replacement that cannot be made safely
 ends the run too: `host_restart_survivors`, `host_restart_port_held`,
-`host_restart_store_held`, `host_restart_record_held` or `host_restart_tree_unbounded`, or
+`host_restart_store_held`, `host_restart_record_held`, `host_restart_tree_unbounded` or
+`host_restart_process_unobservable` (a leftover process that could not be observed is not
+known to be gone), or
 the category of whatever
 stopped the new host from becoming ready. `result-receipt.private.json` records
 `host_restarts`. A host that exits with any other status, and any exit of the gateway or

@@ -2460,6 +2460,7 @@ class _HostTree:
     def __init__(self) -> None:
         self.seen: dict[int, int] = {}
         self.unbounded = False
+        self.unobservable = False
         self._due = 0.0
 
     def sample(self, host_pid: int, *, force: bool = False) -> None:
@@ -2477,11 +2478,29 @@ class _HostTree:
                 pid for pid, (parent, _) in table.items() if parent in frontier
             } - below - {host_pid}
             below |= frontier
-        current = {pid: owner._observed_start(pid) for pid in below}
-        merged = {pid: when for pid, when in current.items() if when is not None}
+        # A process that cannot be observed is not known to be gone. It is never recorded
+        # as a new identity and never forgotten, and the sample says it was incomplete.
+        merged: dict[int, int] = {}
+        unobservable = False
+        for pid in below:
+            try:
+                started = owner.started_at(pid)
+            except owner.ProcessUnobservable:
+                unobservable = True
+                continue
+            if started is not None:
+                merged[pid] = started
         for pid, when in self.seen.items():
-            if pid not in below and pid in table and owner._observed_start(pid) == when:
+            if pid in merged or pid not in table:
+                continue
+            try:
+                same = owner.started_at(pid) == when
+            except owner.ProcessUnobservable:
+                same = unobservable = True
+            # Reached only for one that is no longer below the host, or cannot be observed.
+            if same:
                 merged[pid] = when
+        self.unobservable = unobservable
         if len(merged) > _HOST_TREE_LIMIT:
             self.unbounded = True
             return
@@ -2502,10 +2521,18 @@ def _settle_exited_host(
 
     def remaining() -> list[int]:
         owned = members()
-        return [
-            pid for pid, started in sorted(left_running.items())
-            if pid in owned and owner._observed_start(pid) == started
-        ]
+        found = []
+        for pid, started in sorted(left_running.items()):
+            if pid not in owned:
+                continue
+            try:
+                same = owner.started_at(pid) == started
+            except owner.ProcessUnobservable:
+                # Not known to be gone: a successor must not start beside it.
+                raise PreviewRefusal("host_restart_process_unobservable") from None
+            if same:
+                found.append(pid)
+        return found
 
     deadline = time.monotonic() + _HOST_RESTART_SETTLE_SECONDS
     for pid in remaining():
@@ -2564,6 +2591,7 @@ def _supervise_owned_children(
                 raise PreviewRefusal("host_restart_budget_spent")
             tree.sample(current["host"].pid, force=True)
             require(not tree.unbounded, "host_restart_tree_unbounded")
+            require(not tree.unobservable, "host_restart_process_unobservable")
             restart_host(tree.seen)
             tree = _HostTree()
             outcome = "restarted"
