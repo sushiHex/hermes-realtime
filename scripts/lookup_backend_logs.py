@@ -198,6 +198,7 @@ class CappedProcesses:
         self.roots = owner.roots
         self._drainers: list[Any] = []
         self._pipes: list[Any] = []
+        self._exited: dict[str, Any] = {}
 
     def __getattr__(self, name: Any) -> Any:
         return getattr(self.owner, name)
@@ -207,6 +208,26 @@ class CappedProcesses:
         self.captures[name] = witness
         if name in self.owner.roots:
             raise RuntimeError("owned launch already attempted")
+        return self._launch(name, argv, env, cwd, witness)
+
+    def respawn(self, name: Any, argv: Any, *, env: Any, cwd: Any = None, log: Any) -> Any:
+        """Start the successor of an owned root that has exited; anything else is refused.
+
+        The earlier launch keeps its capture under ``<name>.exited<n>`` and stays in the
+        pipes this owner closes. Only the newest launch is the root of that name.
+        """
+        previous = self.owner.roots.get(name)
+        if previous is None or previous.poll() is None:
+            raise RuntimeError("owned root has not exited")
+        earlier = sum(1 for key in self.captures if key.startswith(name + ".exited"))
+        witness = CappedCapture(self.directory / f"{name}.restart{earlier + 1}.private.log")
+        self.captures[f"{name}.exited{earlier + 1}"] = self.captures.pop(name)
+        self._exited[f"{name}.exited{earlier + 1}"] = previous
+        self.captures[name] = witness
+        del self.owner.roots[name]
+        return self._launch(name, argv, env, cwd, witness)
+
+    def _launch(self, name: Any, argv: Any, env: Any, cwd: Any, witness: Any) -> Any:
         process = subprocess.Popen(
             argv,
             env=dict(env),
@@ -253,7 +274,7 @@ class CappedProcesses:
         facts = {}
         for name, capture in self.captures.items():
             item = capture.finish()
-            process = self.roots.get(name)
+            process = self.roots.get(name) or self._exited.get(name)
             try:
                 code = process.poll() if process is not None else None
             except Exception:
