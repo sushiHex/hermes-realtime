@@ -1512,3 +1512,23 @@ def test_validating_user_text_is_pure_and_matches_what_the_store_records() -> No
 
     assert context.snapshot().revision == 0
     assert changes == []
+
+
+def test_host_speech_rows_are_identified_from_each_row_own_source() -> None:
+    snapshot = ConversationContextSnapshot(
+        revision=1,
+        messages=(
+            ConversationMessage("user", "What is running?"),
+            ConversationMessage("assistant", "Nothing is running.", source="host_task_status"),
+            ConversationMessage("assistant", "Sure, one mo", interrupted=True),
+            ConversationMessage("assistant", "Start the audit?", source="host_task_proposal"),
+        ),
+        active_tasks=(),
+    )
+
+    assert [message.host_speech for message in snapshot.messages] == [False, True, False, True]
+    assert snapshot.host_speech_message_indices == (1, 3)
+    assert type(snapshot.host_speech_message_indices) is tuple
+    assert ConversationContextSnapshot(
+        revision=0, messages=snapshot.messages[:1], active_tasks=(),
+    ).host_speech_message_indices == ()

@@ -545,13 +545,14 @@ async def test_memory_in_codex_instruction_channel_fails_data_only_witness(
 async def test_memory_in_ollama_user_role_fails_data_only_witness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from hermes_realtime.conversation.turn import ForegroundTurn
     from hermes_realtime.providers.ollama import OllamaStreamingInference
 
     render = OllamaStreamingInference._messages
 
-    def user_role(snapshot: object) -> list[dict[str, str]]:
-        messages = render(snapshot)
-        if snapshot.memory is not None:
+    def user_role(turn: ForegroundTurn) -> list[dict[str, str]]:
+        messages = render(turn)
+        if turn.request.memory is not None:
             messages[0]["role"] = "user"
         return messages
 
@@ -573,9 +574,9 @@ async def test_removed_ollama_memory_fails_only_data_only_witness(monkeypatch) -
 
     render = OllamaStreamingInference._messages
 
-    def dropped_memory(snapshot):
-        messages = render(snapshot)
-        if snapshot.memory is not None:
+    def dropped_memory(turn):
+        messages = render(turn)
+        if turn.request.memory is not None:
             prefix, raw = messages[0]["content"].split("\n\nReference data:\n", 1)
             sections = json.loads(raw)
             del sections["memory"]

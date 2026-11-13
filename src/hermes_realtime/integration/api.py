@@ -25,6 +25,9 @@ from hermes_realtime.conversation.output_style import (
     QUANTITY_PRESENTATION_POLICY,
     SPEECH_WORDING_POLICY,
 )
+from hermes_realtime.conversation.result_projection import (
+    UNUSABLE_RESULT_SUMMARY as _UNUSABLE_RESULT_SUMMARY,
+)
 from hermes_realtime.integration import run_record
 from hermes_realtime.integration import web_evidence_contract as web_contract
 from hermes_realtime.integration.run_record import PendingRun
@@ -40,6 +43,7 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedEvent,
     WorkTerminalStatus,
 )
+from hermes_realtime.protocol.identifiers import IDENTIFIER as _SESSION_ID
 from hermes_realtime.providers._speech_text import strip_markdown_emphasis_for_speech
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
@@ -54,7 +58,6 @@ _LOOKUP_GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _RUN_ID_EXACT = re.compile(r"run_[a-fA-F0-9]{16,64}\Z")
 _RUN_ID_DISCLOSURE = re.compile(r"run_[A-Za-z0-9][A-Za-z0-9_-]{15,127}")
 _PRIVATE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}\Z")
-_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _REQUIRED_CAPABILITIES = frozenset(
     {
         "approval_events",
@@ -88,7 +91,6 @@ _RESTART_SETTLEMENT_PREFIX = "[hermes-restart-settlement] "
 _RUN_RECORD_LOCK_PREFIX = "[hermes-run-record-lock] "
 _MAX_RUN_RECORD_BYTES = run_record.max_run_record_bytes(_MAX_ACTIVE_RUNS, _MAX_HTTP_BODY_BYTES)
 _RESULT_REFUSAL_PREFIX = "[hermes-result-refusal] "
-_UNUSABLE_RESULT_SUMMARY = "The task finished, but its result could not be used."
 _BACKGROUND_RESULT = re.compile(
     r"<voice>(?P<voice>[\s\S]*?)</voice><detail>(?P<detail>[\s\S]*?)</detail>"
 )

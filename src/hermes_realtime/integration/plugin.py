@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import RLock
@@ -13,6 +12,7 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from hermes_realtime.protocol import Durability
+from hermes_realtime.protocol.identifiers import IDENTIFIER as _IDENTIFIER_PATTERN
 from hermes_realtime.result_limits import (
     MAX_COMPLETED_RESULT_CHARS,
     MAX_LEGACY_RESULT_CHARS,
@@ -23,7 +23,6 @@ from hermes_realtime.result_limits import (
 from .service import HermesDispatchCommand, HermesDispatchRejected
 
 logger = logging.getLogger(__name__)
-_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
 class HermesPluginContext(Protocol):

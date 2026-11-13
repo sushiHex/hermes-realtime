@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
@@ -27,19 +27,22 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedPayload,
     WorkTerminalStatus,
 )
+from hermes_realtime.protocol.identifiers import DELEGATION_RUN_ID as _RUN_ID_PATTERN
+from hermes_realtime.protocol.identifiers import IDENTIFIER as _IDENTIFIER_PATTERN
+from hermes_realtime.protocol.identifiers import PRIVATE_RUN_TOKEN as _PRIVATE_RUN_TOKEN_PATTERN
+from hermes_realtime.protocol.identifiers import TASK_ID as _TASK_ID_PATTERN
 from hermes_realtime.result_limits import MAX_COMPLETED_RESULT_CHARS, has_valid_result_unicode
 
 from .context import ConversationContextStore, PrivateRunDisclosureError, TaskAdmission
-from .result_projection import completed_result_reference
+from .result_projection import (
+    UNUSABLE_RESULT_REASON,
+    UNUSABLE_RESULT_SUMMARY,
+    admit_result_text,
+    completed_result_reference,
+)
 from .task_status import TaskStatusSnapshot
 
-_TASK_ID_PATTERN = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_RUN_ID_PATTERN = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
-_PRIVATE_RUN_TOKEN_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*"
-)
-_MAX_TASK_ID_CHARS = 128
+_RESULT_ADMISSION_PREFIX = "[task-result-admission] "
 _MAX_OUTCOME_TEXT_CHARS = 1024
 _MAX_COMPLETED_SUMMARY_CHARS = MAX_COMPLETED_RESULT_CHARS
 _MAX_PROTOCOL_SEQUENCE = (1 << 63) - 1
@@ -49,7 +52,7 @@ _TERMINAL_STATUSES = frozenset(("completed", "failed", "interrupted"))
 def _validate_task_id(task_id: str) -> None:
     if type(task_id) is not str:
         raise TypeError("task_id must be an exact built-in string")
-    if len(task_id) > _MAX_TASK_ID_CHARS or _TASK_ID_PATTERN.fullmatch(task_id) is None:
+    if _TASK_ID_PATTERN.fullmatch(task_id) is None:
         raise ValueError("task_id must use the bounded task_ namespace")
     if _PRIVATE_RUN_TOKEN_PATTERN.search(task_id) is not None:
         raise PrivateRunDisclosureError("model-visible text contains a private run token")
@@ -58,14 +61,14 @@ def _validate_task_id(task_id: str) -> None:
 def _validate_run_id(run_id: str) -> None:
     if type(run_id) is not str:
         raise TypeError("run_id must be an exact built-in string")
-    if len(run_id) > _MAX_TASK_ID_CHARS or _RUN_ID_PATTERN.fullmatch(run_id) is None:
+    if _RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ValueError("run_id must use the bounded deleg_ namespace")
 
 
 def _validate_protocol_identifier(value: str, field_name: str) -> None:
     if type(value) is not str:
         raise TypeError(f"{field_name} must be an exact built-in string")
-    if len(value) > _MAX_TASK_ID_CHARS or _IDENTIFIER_PATTERN.fullmatch(value) is None:
+    if _IDENTIFIER_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{field_name} must be a canonical protocol identifier")
 
 
@@ -106,6 +109,42 @@ def _validate_outcome_text(
         raise ValueError(f"{field} must be non-empty and bounded")
     if _PRIVATE_RUN_TOKEN_PATTERN.search(value) is not None:
         raise PrivateRunDisclosureError("model-visible text contains a private run token")
+
+
+# What a session reported and where its text is replaced when it cannot be used:
+# source -> (field, bound, fixed notice).
+DISPATCH_REJECTED_REASON = "Hermes rejected task dispatch"
+CANCEL_REJECTED_REASON = "Hermes rejected task cancellation"
+_ADMISSION = {
+    "completed": ("summary", _MAX_COMPLETED_SUMMARY_CHARS, UNUSABLE_RESULT_SUMMARY),
+    "failed": ("reason", _MAX_OUTCOME_TEXT_CHARS, UNUSABLE_RESULT_REASON),
+    "interrupted": ("reason", _MAX_OUTCOME_TEXT_CHARS, UNUSABLE_RESULT_REASON),
+    "dispatch_rejected": ("reason", _MAX_OUTCOME_TEXT_CHARS, DISPATCH_REJECTED_REASON),
+    "cancel_rejected": ("reason", _MAX_OUTCOME_TEXT_CHARS, CANCEL_REJECTED_REASON),
+}
+
+
+def _admitted_text(value: Any, source: str, *, report: bool = True) -> Any:
+    """Apply the one decision on text a session reports; its outcome stays local to the task.
+
+    This is the first conversation boundary such text crosses, so nothing later can disagree
+    with the decision and raise. Anything that is not a string is left for the exact-type
+    validation that follows: that is a protocol violation, not content.
+    """
+    if type(value) is not str:
+        return value
+    field, limit, notice = _ADMISSION[source]
+    text, category = admit_result_text(value, limit=limit, notice=notice)
+    if category is not None and report:
+        evidence = {"category": category, "field": field, "source": source, "version": 1}
+        # Reporting what was replaced must not turn a finished task into a failure.
+        with contextlib.suppress(OSError, ValueError):
+            print(
+                _RESULT_ADMISSION_PREFIX
+                + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                flush=True,
+            )
+    return text
 
 
 class TaskControlSession(Protocol):
@@ -505,7 +544,7 @@ class ConversationTaskController:
                 return TaskDispatchOutcome(
                     task_id=task_id,
                     accepted=False,
-                    reason=acknowledgment.payload.reason,
+                    reason=_admitted_text(acknowledgment.payload.reason, "dispatch_rejected"),
                 )
             run_id = acknowledgment.payload.run_id
             if run_id is None:
@@ -546,7 +585,7 @@ class ConversationTaskController:
         if type(acknowledgment.payload.accepted) is not bool:
             raise TypeError("dispatch acceptance must be an exact boolean")
         run_id = acknowledgment.payload.run_id
-        reason = acknowledgment.payload.reason
+        reason = _admitted_text(acknowledgment.payload.reason, "dispatch_rejected", report=False)
         if run_id is not None:
             _validate_run_id(run_id)
         _validate_outcome_text(reason, "reason")
@@ -587,7 +626,7 @@ class ConversationTaskController:
         signaled_run_ids = acknowledgment.payload.signaled_run_ids
         for run_id in signaled_run_ids:
             _validate_run_id(run_id)
-        reason = acknowledgment.payload.reason
+        reason = _admitted_text(acknowledgment.payload.reason, "cancel_rejected", report=False)
         _validate_outcome_text(reason, "reason")
         if acknowledgment.payload.accepted:
             if not signaled_run_ids or reason is not None:
@@ -641,7 +680,7 @@ class ConversationTaskController:
                 return TaskCancelOutcome(
                     task_id=task_id,
                     accepted=False,
-                    reason=acknowledgment.payload.reason,
+                    reason=_admitted_text(acknowledgment.payload.reason, "cancel_rejected"),
                 )
             signaled_run_ids = acknowledgment.payload.signaled_run_ids
             if len(signaled_run_ids) != 1 or signaled_run_ids[0] != expected_run_id:
@@ -677,8 +716,9 @@ class ConversationTaskController:
             raise TypeError("terminal status must be exact")
         _validate_task_id(update.task_id)
         _validate_run_id(update.run_id)
-        summary = update.payload.summary
-        reason = update.payload.reason
+        source = update.payload.status.value
+        summary = _admitted_text(update.payload.summary, source)
+        reason = _admitted_text(update.payload.reason, source)
         _validate_outcome_text(
             summary, "summary", max_chars=_MAX_COMPLETED_SUMMARY_CHARS
         )

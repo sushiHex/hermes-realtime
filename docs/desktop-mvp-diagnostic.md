@@ -385,6 +385,8 @@ From the host:
   pending` appears on every run: the companion holds the read while the conversation's
   archive has a write in flight, the stream stays open, and the readback follows once the
   write commits. `outcome: disconnected` means the link dropped and is retried.
+- In these four `-send`/`-receive` lines, a refusal category this host does not list (one a
+  newer companion added) prints as `unlisted`; the host still handles it as before.
 - `[voice-review-close]`: at shutdown, a review close could not settle (`deadline`,
   `unsettled`, `not_open`), or had nothing to cover (`empty_window`).
 - `[hermes-run-record-lock]`: `cause: held`, another host holds the Hermes run record.
