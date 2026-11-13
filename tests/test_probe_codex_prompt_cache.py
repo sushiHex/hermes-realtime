@@ -217,8 +217,13 @@ async def test_request_shapes_isolate_one_variable_per_case() -> None:
     }
     # No case can read another case's cache entry: each input differs from its first line.
     assert len({text.splitlines()[0] for text in (texts[2], texts[4])}) == 2
-    assert pauses == [5.0]
-    assert server.order[-3:] == ["pause", "thread", "turn"]
+    # Both deciding requests (b2, c2) wait the same time after the request that wrote.
+    assert pauses == [5.0, 5.0]
+    assert server.order == [
+        "thread", "turn", "thread", "turn",  # a1, a2
+        "thread", "turn", "pause", "turn",  # b1, wait, b2
+        "thread", "turn", "pause", "thread", "turn",  # c1, wait, c2
+    ]
 
 
 def test_synthetic_text_is_long_inert_and_differs_per_run() -> None:

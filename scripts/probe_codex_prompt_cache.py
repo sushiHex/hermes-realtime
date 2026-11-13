@@ -37,7 +37,7 @@ QUOTA_FLAG = "--i-understand-this-spends-model-quota"
 REQUEST_COUNT = 6
 MINIMUM_CACHEABLE_INPUT_TOKENS = 1024
 VERDICT_MEANINGS = {
-    "no_cache_reported": "b=0, c=0: no cached input is provided or reported; a limitation",
+    "no_cache_reported": "b=0, c=0: no cached input was reported within the pause",
     "affinity_survives_new_thread": "b>0, c>0: a new thread can reuse the cache",
     "affinity_per_thread": "b>0, c=0: only requests on one thread reuse the cache",
     "inconclusive": "a deciding count is missing, too small, or contradicts the table",
@@ -304,6 +304,8 @@ async def _run_cases(
         repeated = synthetic_text("b", nonce)
         persisted = await client.start_thread(ephemeral=False)
         await client.turn(persisted, repeated)
+        # Both deciding requests wait equally, so a slow cache write cannot favour one case.
+        await sleep(pause_seconds)
         recorder.stage = "b2"
         recorder.records["b2"].model = recorder.records["b1"].model
         await client.turn(persisted, repeated)
@@ -416,7 +418,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--effort", default="low")
     parser.add_argument("--codex-executable", default=None)
     parser.add_argument("--pause-seconds", type=_bounded_seconds(0, 60), default=5.0,
-                        help="wait between the two fresh-thread requests of case (c)")
+                        help="wait before the second request of case (b) and of case (c)")
     parser.add_argument("--timeout-seconds", type=_bounded_seconds(1, 900), default=300.0,
                         help="hard limit for the whole probe")
     args = parser.parse_args(argv)
