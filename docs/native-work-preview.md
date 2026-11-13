@@ -359,6 +359,28 @@ owner then writes
 [acceptance procedure](native-preview-acceptance.md) lists what to observe and record
 from there.
 
+### A host that ends itself
+
+A host that can no longer work ends itself with status 75 after saving the conversation
+(the `[host-fatal-exit]` line in the
+[diagnostic notes](desktop-mvp-diagnostic.md)). The owner replaces it in place: same run
+directory, same gateway, same LiveKit server, same address. It first ends what that host
+left running, by process ID and only inside its own Job, and waits for the host's port
+and its two locks to be free. The new host then settles the same run record, so on the
+next connection the user hears once that a task was stopped. Open the preview address
+again.
+
+Each replacement prints one `[voice-preview]` line with category `host_restart`, an
+`outcome` (`restarted`, `refused` or `budget_spent`), the count of `restarts` so far and
+the number `remaining`. One owner run replaces the host at most three times; the count is
+not refilled by time. When it is spent the run ends as `refused` with
+`failure_category` `host_restart_budget_spent`. A replacement that cannot be made safely
+ends the run too: `host_restart_survivors`, `host_restart_port_held`,
+`host_restart_store_held` or `host_restart_record_held`, or the category of whatever
+stopped the new host from becoming ready. `result-receipt.private.json` records
+`host_restarts`. A host that exits with any other status, and any exit of the gateway or
+the LiveKit server, ends the run as before (`owned_child_exited`).
+
 ### Conversation state
 
 The saved conversation lives in the plan's `state_root`, not in a run directory. It
