@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import math
-import re
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Final, cast
 
+from hermes_realtime.protocol.identifiers import METRIC_LABEL as _LABEL
+
 _MAX_BROWSER_INTEGER: Final = (1 << 53) - 1
-_LABEL = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 
 
 def _finite_non_negative(name: str, value: object) -> float:

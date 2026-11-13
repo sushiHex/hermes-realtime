@@ -55,6 +55,7 @@ from hermes_realtime.protocol import (
     parse_event,
     parse_voice_event,
 )
+from hermes_realtime.protocol.identifiers import IDENTIFIER as _IDENTIFIER_PATTERN
 from hermes_realtime.result_limits import (
     LEGACY_RESULT_NOTICE,
     MAX_COMPLETED_RESULT_CHARS,
@@ -68,7 +69,6 @@ from .service import HermesIntegrationService
 from .session import SessionBinding
 
 _MAX_LINE_BYTES = 64 * 1024
-_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 # The hello carries no secret: each side proves the token with an HMAC over the handshake.
 _HELLO_FIELDS = frozenset({"participant_id", "protocol_version", "capabilities", "client_nonce"})
 # Before the client proves the token it is told nothing but a nonce and the server's proof.

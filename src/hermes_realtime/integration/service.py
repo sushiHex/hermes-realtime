@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from hermes_realtime.protocol import (
     WorkDispatchAcknowledgedPayload,
     WorkDispatchRequestedEvent,
 )
+from hermes_realtime.protocol.identifiers import IDENTIFIER
 
 from .sequencing import EventSequencer
 from .session import SessionBinding, SessionBindings
@@ -36,7 +36,7 @@ class HermesDispatchCommand:
 
     def __post_init__(self) -> None:
         for name, value in (("session_id", self.session_id), ("task_id", self.task_id)):
-            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None:
+            if IDENTIFIER.fullmatch(value) is None:
                 raise ValueError(f"{name} contains unsupported identifier characters")
 
 
