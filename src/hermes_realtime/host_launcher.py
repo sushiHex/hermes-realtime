@@ -1852,6 +1852,8 @@ _HOST_FATAL_MARKER_PREFIX = "[host-fatal-exit] "
 _HOST_FATAL_INPUT_STOP_SECONDS = 5.0
 _HOST_FATAL_FLUSH_SECONDS = 15.0
 _HOST_FATAL_DEADLINE_SECONDS = 30.0
+# How long the timer's exit waits for its own evidence line before exiting without it.
+_HOST_FATAL_LINE_SECONDS = 1.0
 
 
 class HostFatalExit:
@@ -1901,6 +1903,7 @@ class HostFatalExit:
         self._armed = False
         self._cause: str | None = None
         self._finished = False
+        self._exited = False
         self._operation: asyncio.Task[None] | None = None
         self._watchdog: threading.Timer | None = None
 
@@ -1933,9 +1936,7 @@ class HostFatalExit:
                 return
             self._cause = cause
         try:
-            watchdog = threading.Timer(
-                self._deadline_seconds, self._finish, ("timeout", "timeout")
-            )
+            watchdog = threading.Timer(self._deadline_seconds, self._deadline)
             watchdog.daemon = True
             watchdog.start()
             self._watchdog = watchdog
@@ -1944,7 +1945,7 @@ class HostFatalExit:
             )
         except BaseException:
             # No loop to stop input or flush on: the exit itself must still happen.
-            self._finish("failed", "failed")
+            self._deadline("failed", "failed")
 
     async def _run(self) -> None:
         stopped, flushed = "failed", "failed"
@@ -1968,26 +1969,50 @@ class HostFatalExit:
         return "done"
 
     def _finish(self, stopped: str, flushed: str) -> None:
+        # The timer stays armed while the line is written: a stdout nobody drains must not
+        # keep a host alive that has already decided to end.
+        try:
+            self._print_line(stopped, flushed)
+        finally:
+            self._exit_once()
+
+    def _deadline(self, stopped: str = "timeout", flushed: str = "timeout") -> None:
+        """The timer's exit. It depends on nothing: not the loop, and not stdout."""
+        writer = threading.Thread(target=self._print_line, args=(stopped, flushed), daemon=True)
+        try:
+            writer.start()
+            writer.join(_HOST_FATAL_LINE_SECONDS)
+        finally:
+            self._exit_once()
+
+    def _print_line(self, stopped: str, flushed: str) -> None:
         with self._state:
             if self._finished:
                 return
             self._finished = True
             cause = self._cause
-        watchdog = self._watchdog
-        if watchdog is not None and watchdog is not threading.current_thread():
-            watchdog.cancel()
+        print(
+            _HOST_FATAL_MARKER_PREFIX
+            + json.dumps(
+                {"cause": cause, "flush": flushed, "input": stopped, "version": 1},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    def _exit_once(self) -> None:
+        with self._state:
+            if self._exited:
+                return
+            self._exited = True
         try:
-            print(
-                _HOST_FATAL_MARKER_PREFIX
-                + json.dumps(
-                    {"cause": cause, "flush": flushed, "input": stopped, "version": 1},
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-        finally:
             self._exit_process(HOST_FATAL_EXIT_STATUS)
+        finally:
+            # Reached only when the exit is a stand-in that returns.
+            watchdog = self._watchdog
+            if watchdog is not None and watchdog is not threading.current_thread():
+                watchdog.cancel()
 
 
 def _host_exit_category(error: BaseException | None) -> str:

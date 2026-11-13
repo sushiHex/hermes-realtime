@@ -303,3 +303,59 @@ async def test_the_exit_happens_even_when_the_evidence_line_cannot_be_printed(
         await asyncio.wait_for(operation, timeout=5)
 
     assert recorder.statuses == [HOST_FATAL_EXIT_STATUS]
+
+
+@pytest.mark.asyncio
+async def test_a_stdout_nobody_drains_cannot_keep_the_host_alive(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    recorder = _Recorder(capsys)
+    owner = recorder.owner(deadline_seconds=0.1)
+    printing: list[str] = []
+
+    def blocked_print(*_args: object, **_kwargs: object) -> None:
+        # The write blocks, as on a full pipe. Only the exit itself lets it return.
+        printing.append("started")
+        assert recorder.exited.wait(5), "the exit never came while stdout was blocked"
+        printing.append("returned")
+
+    monkeypatch.setattr(builtins, "print", blocked_print)
+    owner.reporter("task_control")()
+    await _settled(owner)
+
+    # The timer ended the process while the line was still being written, once.
+    assert recorder.statuses == [HOST_FATAL_EXIT_STATUS]
+    assert recorder.steps == ["input", "flush", "exit"]
+    assert printing == ["started", "returned"]
+
+
+def test_the_timer_exit_does_not_wait_on_its_own_evidence_line(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    import hermes_realtime.host_launcher as host_launcher
+
+    recorder = _Recorder(capsys)
+    owner = recorder.owner(deadline_seconds=0.05)
+    release = threading.Event()
+
+    def blocked_print(*_args: object, **_kwargs: object) -> None:
+        release.wait(10)
+
+    monkeypatch.setattr(builtins, "print", blocked_print)
+    monkeypatch.setattr(host_launcher, "_HOST_FATAL_LINE_SECONDS", 0.05)
+
+    async def report_then_block_the_loop() -> None:
+        owner.reporter("update_executor")()
+        # The loop never yields and stdout never drains: nothing but the timer is left.
+        assert recorder.exited.wait(5)
+
+    try:
+        asyncio.run(report_then_block_the_loop())
+    finally:
+        release.set()
+
+    assert recorder.statuses == [HOST_FATAL_EXIT_STATUS]
