@@ -97,21 +97,24 @@ def _one_shot(*set_in: str) -> Latch:
 
 LATCHES: dict[Key, Latch] = {
     # --- failure latches whose holder lives as long as the host ---------------------------
+    # The first four report to the full host's HostFatalExit, which ends the host (#531).
+    # The conversation-only launcher does not wire them.
     ("conversation/tasks.py", "ConversationTaskController", "_terminal_error"): _failure(
         HOST, "any dispatch exception; a contradictory acknowledgment; a failed terminal loop",
-        False, "_fail_locked",
+        True, "_fail_locked",
     ),
     ("conversation/updates.py", "ConversationUpdateDirector", "_error"): _failure(
-        HOST, "the controller's latched error; a policy or publication failure",
-        False, "_consume",
+        HOST, "the controller's latched error; a policy failure, including a refusal by the "
+        "browser projection inside it; a publication failure",
+        True, "_consume",
     ),
     ("conversation/actions.py", "ConversationUpdateExecutor", "_terminal_error"): _failure(
         HOST, "the director's latched error; a replaced announcement that did not settle",
-        False, "_consume_decisions", cleared_in=("_close_owned",),
+        True, "_consume_decisions", cleared_in=("_close_owned",),
     ),
     ("providers/codex_app_server.py", "CodexAppServerStreamingInference", "_closed"): _failure(
         HOST, "a failed or late send, including to a dead child; also its own close",
-        False, "_begin_close",
+        True, "_begin_close",
     ),
     ("providers/ollama_session.py", "OllamaSessionSelection", "_closed"): _failure(
         HOST, "a failed re-selection or adapter cleanup; also its own close",
@@ -254,6 +257,15 @@ LATCHES: dict[Key, Latch] = {
 # Latches the scan cannot recognise, with the reason. Checked only to exist as an attribute
 # of the named class, and not to be measured: a row the scan starts to see moves to LATCHES.
 UNSEEN: dict[Key, tuple[str, Latch]] = {
+    ("host_launcher.py", "HostFatalExit", "_cause"): (
+        "its guard returns instead of raising: a later report is ignored, not refused",
+        Latch(ONE_SHOT, (), (), HOST,
+              "the first report of a host-wide fault; this is what ends the host", True),
+    ),
+    ("providers/codex_app_server.py", "CodexAppServerStreamingInference", "_latch_reported"): (
+        "its guard returns instead of raising",
+        Latch(ONE_SHOT, (), (), HOST, "the adapter's first report that it has latched", True),
+    ),
     ("conversation/work_tools.py", "ConversationWorkControlSurface", "_health"): (
         "enum-valued; its guards compare against the open member",
         _failure(HOST, "any dispatch exception or unsettled work-control operation", False),
