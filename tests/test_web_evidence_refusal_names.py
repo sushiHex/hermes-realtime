@@ -97,14 +97,21 @@ async def _refused_codex(observer: NativeWebEvidence, response: Any) -> None:
 async def test_rendered_detail_over_bound_names_length_stage_and_detail_length(
     monkeypatch: Any, capsys: Any,
 ) -> None:
+    # Fields within the per-request limits always fit (tests/test_presentation_fits.py), so
+    # the rendered-detail check is a backstop for a route that ignores the schema bounds.
+    # Widen the accepted bounds to reach it.
     _install_fake_openai_models(monkeypatch)
+    from hermes_realtime.integration import evidence_presentation
+
+    monkeypatch.setattr(evidence_presentation, "presentation_limits", lambda _catalog: {
+        "lead": 220, "support": 1800, "sources": 256})
     support = "s" * 1790
     detail = LEAD + "\n\n" + support + "\n\nSources:\n" + URL
     assert len(detail) > 1800
     await _refused_chat(_observer(_Formatted(_answer(LEAD, support, [0]))))
 
     assert _markers(capsys) == [{
-        "category": "refused", "count": 1, "reason": "internal", "phase": "render",
+        "category": "refused", "count": 1, "reason": "too_long", "phase": "render",
         "cause": "presentation-content-length", "error_class": "ValueError",
         "stage": "content", "selected_source_count": 1,
         "rendered_detail_length": len(detail),
@@ -112,22 +119,22 @@ async def test_rendered_detail_over_bound_names_length_stage_and_detail_length(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("lead", "support", "cause"), [
-    ("x" * 221, "", "presentation-content-length"),
-    (LEAD, "s" * 1801, "presentation-content-length"),
-    ("two\nlines", "", "presentation-content-shape"),
-    (LEAD, "<detail>", "presentation-content-shape"),
-    (" ", "", "presentation-content-shape"),
+@pytest.mark.parametrize(("lead", "support", "cause", "reason"), [
+    ("x" * 221, "", "presentation-content-length", "too_long"),
+    (LEAD, "s" * 1790, "presentation-content-length", "too_long"),
+    ("two\nlines", "", "presentation-content-shape", "internal"),
+    (LEAD, "<detail>", "presentation-content-shape", "internal"),
+    (" ", "", "presentation-content-shape", "internal"),
 ], ids=["lead-length", "support-length", "lead-newline", "markup", "blank-lead"])
 async def test_answer_field_refusals_split_length_from_shape(
-    lead: str, support: str, cause: str, monkeypatch: Any, capsys: Any,
+    lead: str, support: str, cause: str, reason: str, monkeypatch: Any, capsys: Any,
 ) -> None:
     _install_fake_openai_models(monkeypatch)
     await _refused_chat(_observer(_Formatted(_answer(lead, support, [0]))))
 
     [marker] = _markers(capsys)
     assert (marker["cause"], marker["stage"], marker["phase"]) == (cause, "content", "render")
-    assert marker["reason"] == "internal"
+    assert marker["reason"] == reason
     assert marker["rendered_detail_length"] is None
 
 

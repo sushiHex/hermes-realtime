@@ -25,8 +25,8 @@ from .evidence_presentation import (
     MAX_CODEX_STREAM_TEXT_CHARS,
     PRESENTATION_INSTRUCTIONS,
     PRESENTATION_MODES,
-    PRESENTATION_SCHEMA,
     frozen,
+    presentation_schema,
 )
 
 
@@ -66,6 +66,11 @@ async def _consume_codex_stream(
         event_type = getattr(event, "type", None)
         if type(event_type) is not str:
             raise ValueError("responses-event-type")
+        if event_type == "response.incomplete":
+            details = getattr(getattr(event, "response", None), "incomplete_details", None)
+            if getattr(details, "reason", None) == "max_output_tokens":
+                # The presenter reports its own cut; any other incomplete reason stays below.
+                raise ValueError("presentation-content-length")
         if event_type in {"response.failed", "response.incomplete", "error"}:
             raise ValueError("responses-terminal-failure")
         if event_type not in allowed:
@@ -278,8 +283,10 @@ class Presentation:
                 {"role": "user", "content": source_input},
             ],
             "response_format": {"type": "json_schema", "json_schema": {
-                "name": "voice_detail", "strict": True, "schema": PRESENTATION_SCHEMA}},
-            "max_tokens": 1024,
+                "name": "voice_detail", "strict": True,
+                "schema": presentation_schema(source_input)}},
+            # Above the worst-case output the schema admits, so a token cut is not the norm.
+            "max_tokens": 4096,
             "stream": False,
             "reasoning_effort": "none",
         }
@@ -363,7 +370,7 @@ class Presentation:
             "stream": True,
             "text": {"format": {
                 "type": "json_schema", "name": "voice_detail", "strict": True,
-                "schema": PRESENTATION_SCHEMA,
+                "schema": presentation_schema(source_input),
             }},
             "reasoning": {"effort": "low"},
         }

@@ -75,6 +75,7 @@ _WEB_REFUSAL_NOTICES = MappingProxyType({
     "route": "The web presentation model does not match the task's model, "
              "so the result was withheld.",
     "source_changed": "The web sources changed while being presented. Please try again.",
+    "too_long": "That answer was too long to show. Ask for a shorter one.",
     "unobserved": "The task's answer could not be checked against its web sources, "
                   "so it was withheld.",
 })
@@ -175,6 +176,23 @@ def _has_result_controls(text: str, *, detail: bool = False) -> bool:
         if codepoint < 32 or 127 <= codepoint <= 159 or 0xD800 <= codepoint <= 0xDFFF:
             return True
     return False
+
+
+def displayable_detail_text(text: object) -> bool:
+    """The host's content predicate for result detail text; length is the caller's bound.
+
+    One function, two callers: the completed-result validator applies it to the detail,
+    and the web-evidence presenter applies it to each source URL before offering that
+    source, so a source the presenter may cite always displays.
+    """
+    return (
+        type(text) is str
+        and _has_result_text(text)
+        and not _has_result_controls(text, detail=True)
+        and _BACKGROUND_DETAIL_PROTOCOL_TAG.search(text) is None
+        and "deleg_" not in text
+        and _RUN_ID_DISCLOSURE.search(text) is None
+    )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1831,12 +1849,7 @@ class HermesApiTaskSession:
             ):
                 return _UNUSABLE_RESULT_SUMMARY
             category = "detail"
-            if (
-                not _has_result_text(detail)
-                or len(detail) > MAX_PRESENTATION_DETAIL_CHARS
-                or _has_result_controls(detail, detail=True)
-                or _BACKGROUND_DETAIL_PROTOCOL_TAG.search(detail) is not None
-            ):
+            if not displayable_detail_text(detail) or len(detail) > MAX_PRESENTATION_DETAIL_CHARS:
                 return _UNUSABLE_RESULT_SUMMARY
             category = None
             return text

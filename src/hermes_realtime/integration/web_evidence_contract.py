@@ -32,7 +32,7 @@ UNGROUNDED_REASONS = frozenset({"unobserved"})
 REFUSED_REASONS = frozenset({
     "binding", "capture", "closed", "deadline", "final_response", "input_bound",
     "insufficient", "internal", "presentation_failed", "route", "source_changed",
-    "unobserved",
+    "too_long", "unobserved",
 })
 _UNCLAIMED = frozenset({"no_web", "mixed_ungrounded"})
 _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
