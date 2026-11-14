@@ -329,7 +329,8 @@ def test_voice_keeps_source_attribution_in_detail_unless_objective_asks(setup):
     assert "Lead is a complete standalone conversational answer" in instructions
     assert "host uses this lead for speech with deterministic unit/time projection" in instructions
     assert "at most 220 characters" in instructions
-    assert "complete display" in instructions and "limited to 1800 characters" in instructions
+    assert "complete display including the source footer fits" in instructions
+    assert "top-level limits object" in instructions and "1800" not in instructions
     assert "Put every supported requested date, qualification" in instructions
 
 
@@ -367,19 +368,25 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert body["response_format"]["json_schema"]["strict"] is True
     payload = json.loads(body["messages"][-1]["content"])
     assert "answer" not in payload
-    assert set(payload) == {"objective", "sources", "evidence", "missing_source_ids"}
+    assert set(payload) == {"objective", "limits", "sources", "evidence", "missing_source_ids"}
     assert payload["sources"] == [{"id": 0, "url": "https://example.invalid/source"}]
     assert payload["objective"] == "synthetic lookup"
     assert payload["evidence"] == [{"source_id": 0, "kind": "search", "text": "Supplied evidence.",
                                     "original_bytes": 18, "truncated": False}]
     assert payload["missing_source_ids"] == []
+    # 1800 - 220 - 2 - len("\n\nSources:\n" + the one 30-character URL)
+    assert payload["limits"] == {"lead": 220, "support": 1537, "sources": 1}
     schema = body["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["source_ids"]["minItems"] == 0
+    assert schema["properties"]["source_ids"]["maxItems"] == 2
+    assert schema["properties"]["source_ids"]["items"] == {"type": "integer", "enum": [0]}
     assert set(schema["properties"]) == {"answer", "source_ids"}
     answer_schema = schema["properties"]["answer"]
     assert set(answer_schema["properties"]) == {"lead", "support"}
-    assert answer_schema["properties"]["lead"]["maxLength"] == 220
-    assert answer_schema["properties"]["support"]["maxLength"] == 1800
+    # Each bound is one past the accepted bound, so a cut field is recognisable.
+    assert answer_schema["properties"]["lead"]["maxLength"] == 221
+    assert answer_schema["properties"]["support"]["maxLength"] == 1538
+    assert body["max_tokens"] == 4096
     assert s.captured["sdk"][0]["max_retries"] == 0
     assert s.captured["http"][0]["follow_redirects"] is False
     assert s.captured["closed"] == 2 and s.row["presentation_active"] is None
@@ -396,7 +403,7 @@ def test_formatter_input_contains_no_fallible_native_draft():
     catalog = ("https://example.invalid/source",)
     passages = MappingProxyType({catalog[0]: (("search", "Supported passage."),)})
     payload = json.loads(presentation_input("synthetic lookup", catalog, passages))
-    assert set(payload) == {"objective", "sources", "evidence", "missing_source_ids"}
+    assert set(payload) == {"objective", "limits", "sources", "evidence", "missing_source_ids"}
     assert payload["objective"] == "synthetic lookup"
     assert payload["evidence"][0]["text"] == "Supported passage."
 
@@ -599,10 +606,13 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     assert body["model"] == CODEX_CONFIG["model"]
     assert body["store"] is False and body["stream"] is True
     assert body["reasoning"] == {"effort": "low"}
+    from hermes_realtime.integration.evidence_presentation import presentation_schema
+
     assert body["text"]["format"] == {
         "type": "json_schema", "name": "voice_detail", "strict": True,
-        "schema": s.module.PRESENTATION_SCHEMA,
+        "schema": presentation_schema(body["input"][0]["content"]),
     }
+    assert body["text"]["format"]["schema"] != s.module.PRESENTATION_SCHEMA
     assert "tools" not in body and "tool_choice" not in body
     assert s.captured["stream_closed"] == 1
     assert s.row["presentation_evidence"]["usage"] == {
@@ -1441,11 +1451,13 @@ def test_attribution_refuses_invalid_selected_ids(setup, ids):
         })
     )
     assert setup.run() is setup.refused
+    # Two IDs over this one-source catalog are past its one-ID bound: a cut, refused at
+    # the content stage before the duplicate check (tests/test_presentation_fits.py).
     expected = (
         "source-selection" if type(ids) is not list
         else (
         "source-id-type" if any(type(index) is not int for index in ids) else
-        "source-id-range" if ids == [-1] or ids == [1] else "source-id-unique")
+        "source-id-range" if ids == [-1] or ids == [1] else "content")
     )
     assert setup.row["presentation_evidence"]["stage"] == expected
 

@@ -28,6 +28,7 @@ from .evidence_presentation import (
     _raw_responses_result,
     _replace_codex_final_text,
     captured_passages,
+    displayable_sources,
     frozen,
     presentation_input,
     render_presentation_response,
@@ -61,11 +62,14 @@ _REASONLESS = frozenset({"presented", "no_web", "mixed_ungrounded"})
 _REASONS = MappingProxyType({
     "native-final-response": "final_response",
     "native-result-bound": "capture",
+    "presentation-content-length": "too_long",
     "presentation-deadline": "deadline",
     "presentation-input-bound": "input_bound",
+    "presentation-input-limits": "internal",
     "presentation-model": "route",
     "presentation-ownership": "binding",
     "presentation-route": "route",
+    "responses-stream-text-bound": "too_long",
     "web-evidence-binding": "binding",
     "web-evidence-catalog-bound": "input_bound",
     "web-evidence-closed": "closed",
@@ -95,7 +99,8 @@ _CAUSES = frozenset({
     "presentation-credential-cleanup", "presentation-deadline", "presentation-duplicate-key",
     "presentation-envelope", "presentation-evidence-catalog", "presentation-evidence-shape",
     "presentation-fields", "presentation-inline-link", "presentation-input-bound",
-    "presentation-json", "presentation-model", "presentation-ownership", "presentation-route",
+    "presentation-input-limits", "presentation-json", "presentation-model",
+    "presentation-ownership", "presentation-route",
     "presentation-source-id-duplicate", "presentation-source-id-range",
     "presentation-source-id-type", "presentation-source-ids",
     "presentation-source-without-evidence", "presentation-terminal-contract",
@@ -716,9 +721,16 @@ class NativeWebEvidence:
                     raise ValueError("web-evidence-insufficient")
                 if time.monotonic() >= row["deadline"]:
                     raise ValueError("web-evidence-deadline")
+                # ``catalog``/``passages`` stay the identity checked at publication; the
+                # shown pair, only sources the host can display, feeds the input, the
+                # render and every attested count and hash.
                 catalog = tuple(sorted(row["urls"]))
                 passages = row["passages"]
-                source_input = presentation_input(row["objective"], catalog, passages)
+                shown_catalog, shown_passages = displayable_sources(catalog, passages)
+                if not shown_catalog:
+                    raise ValueError("web-evidence-insufficient")
+                source_input = presentation_input(
+                    row["objective"], shown_catalog, shown_passages)
                 if len(source_input.encode("utf-8")) > _MAX_INPUT_BYTES:
                     raise ValueError("web-evidence-input-bound")
                 source_payload = json.loads(source_input)
@@ -728,17 +740,18 @@ class NativeWebEvidence:
                     item["kind"] in {"search", "extract"} and bool(item["text"])
                     for item in evidence_items
                 )
-                if not catalog or not passage_count or missing >= len(catalog):
+                if not passage_count or missing >= len(shown_catalog):
                     raise ValueError("web-evidence-insufficient")
                 truncated_count = sum(item["truncated"] is True for item in evidence_items)
                 row["input_sha256"] = hashlib.sha256(source_input.encode()).hexdigest()
                 row["input_bytes"] = len(source_input.encode())
+                row["catalog_count"] = len(shown_catalog)
                 row["passage_count"] = passage_count
                 row["missing_count"] = missing
                 row["truncated_count"] = truncated_count
                 row["catalog_sha256"] = hashlib.sha256(
                     frozen(
-                        [{"id": index, "url": url} for index, url in enumerate(catalog)]
+                        [{"id": index, "url": url} for index, url in enumerate(shown_catalog)]
                     ).encode()
                 ).hexdigest()
             evidence = {
@@ -749,7 +762,7 @@ class NativeWebEvidence:
             formatted = await self.presentation.complete(self, run_id, row, source_input, evidence)
             stage, phase = "internal", "render"
             rendered = render_presentation_response(
-                formatted, catalog, api_mode, evidence, passages=passages)
+                formatted, shown_catalog, api_mode, evidence, passages=shown_passages)
             phase = "publish"
             with self.lock:
                 self._assert_current(run_id, row, enforce_deadline=True)

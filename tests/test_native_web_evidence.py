@@ -1271,6 +1271,15 @@ class _RefusalScenario:
                     return await original(*args)
 
                 self.presentation.complete = changing  # type: ignore[method-assign]
+            elif reason == "too_long":
+                async def cut(*_args: Any) -> Any:
+                    # The presenter reports its own cut; the JSON it cut is never parsed.
+                    return SimpleNamespace(choices=[SimpleNamespace(
+                        finish_reason="length", message=SimpleNamespace(
+                            content='{"answer": {"lead": "Cut', refusal=None,
+                            tool_calls=None))], usage=None)
+
+                self.presentation.complete = cut  # type: ignore[method-assign]
             returned = await asyncio.to_thread(_final_turn, observer, response)
             return cast(str, returned.choices[0].message.content)
         return cast(str, (await asyncio.to_thread(_final_turn, observer, _final_response()))
@@ -1291,6 +1300,8 @@ _REFUSAL_CAUSES: dict[str, tuple[Any, ...]] = {
     "route": ("route", "presentation-route", "ValueError"),
     "source_changed": ("publish", "web-evidence-source-changed", "ValueError",
                        "terminal-contract", 1, 117),
+    "too_long": ("render", "presentation-content-length", "ValueError",
+                 "response-envelope", None, None),
     "unobserved": ("status", "none", "none"),
 }
 

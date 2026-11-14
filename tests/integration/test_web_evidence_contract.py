@@ -458,7 +458,7 @@ def test_every_refusal_reason_has_exactly_one_notice():
 @pytest.mark.parametrize("reason", sorted([
     "binding", "capture", "closed", "deadline", "final_response", "input_bound",
     "insufficient", "internal", "presentation_failed", "route", "source_changed",
-    "unobserved",
+    "too_long", "unobserved",
 ]))
 async def test_host_speaks_the_attested_refusal_reason(reason, capsys):
     body = {"object": "hermes.run", "run_id": RUN, "status": "completed", "output": OUTPUT}

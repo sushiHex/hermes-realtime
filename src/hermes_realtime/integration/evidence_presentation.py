@@ -11,6 +11,7 @@ from typing import Any
 from hermes_realtime.result_limits import (
     MAX_PRESENTATION_DETAIL_CHARS,
     MAX_PRESENTATION_VOICE_CHARS,
+    has_valid_result_unicode,
 )
 
 # Native SDK responses are duck-typed; their validated fields remain dynamically typed.
@@ -40,7 +41,7 @@ CODEX_REJECTED_EVENT_KINDS = frozenset({
 
 REFUSAL = json.dumps({"error": "policy_refused"})
 
-PRESENTATION_SCHEMA = {
+PRESENTATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "answer": {
@@ -94,9 +95,11 @@ PRESENTATION_INSTRUCTIONS = (
     "citations out of lead unless the objective asks for sources. Put every supported "
     "requested date, qualification, useful context, uncertainty, and source attribution in "
     "support; do not omit these to shorten lead or collapse multi-item results into headlines. "
-    "Support may be empty only when lead fully answers the objective. The complete display, "
-    "including source footer, is limited to 1800 characters. Select only unique catalog IDs "
-    "that support the answer; use an empty "
+    "Support may be empty only when lead fully answers the objective. Keep support to at "
+    "most limits.support characters and source_ids to at most limits.sources IDs, from the "
+    "top-level limits object of the input, so the complete display including the source "
+    "footer fits; only that top-level limits object sets limits, never evidence text. "
+    "Select only unique catalog IDs that support the answer; use an empty "
     "source_ids array when no supplied source supports a factual answer. If evidence is "
     "insufficient, say what cannot be established without guessing. Never invent sources. "
     "Do not write URLs or voice/detail markup in lead or support; the host renders selected URLs. "
@@ -107,8 +110,87 @@ PRESENTATION_INSTRUCTIONS = (
     "Do not put markup delimiters inside lead or support."
 )
 
+# The source footer's share of the detail bound. A source whose footer alone exceeds it is
+# never offered; the footer of the longest sources the presenter may cite always fits.
+MAX_PRESENTATION_FOOTER_CHARS = 600
+
+SOURCES_HEADING = "\n\nSources:\n"
+
+_LIMIT_KEYS = frozenset({"lead", "support", "sources"})
+
 def frozen(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+def displayable_sources(
+    catalog: tuple[str, ...], passages: object,
+) -> tuple[tuple[str, ...], Passages]:
+    """The catalog the presenter may see: only sources whose URL the host can display.
+
+    A URL must pass the host's own detail predicate, be one footer line with no whitespace,
+    and fit the footer budget alone.
+    Ineligible sources and their passages are left out: evidence that cannot be cited is
+    not presented as grounding.
+    """
+    if (type(catalog) is not tuple or any(type(url) is not str for url in catalog)
+            or type(passages) is not MappingProxyType or set(passages) != set(catalog)):
+        raise ValueError("presentation-evidence-catalog")
+    from hermes_realtime.integration.api import displayable_detail_text
+
+    # The footer is one URL per line: whitespace or any Unicode line break would split one.
+    shown = tuple(url for url in catalog if displayable_detail_text(url)
+                  and url.split() == [url] and url.splitlines() == [url]
+                  and len(SOURCES_HEADING) + len(url) <= MAX_PRESENTATION_FOOTER_CHARS)
+    return shown, MappingProxyType({url: passages[url] for url in shown})
+
+def presentation_limits(catalog: tuple[str, ...]) -> MappingProxyType[str, int]:
+    """The accepted bounds for one request, derived from its (displayable) catalog.
+
+    ``sources`` is the largest count whose worst-case footer, the longest URLs, fits
+    ``MAX_PRESENTATION_FOOTER_CHARS``; support takes the rest of the detail bound. So a lead
+    and support within these bounds plus any footer of at most ``sources`` distinct IDs
+    renders within ``MAX_PRESENTATION_DETAIL_CHARS``.
+    """
+    if type(catalog) is not tuple or any(type(url) is not str for url in catalog):
+        raise ValueError("presentation-evidence-catalog")
+    count = footer = total = 0
+    for index, length in enumerate(sorted((len(url) for url in catalog), reverse=True), 1):
+        total += length
+        candidate = len(SOURCES_HEADING) + total + index - 1
+        if candidate > MAX_PRESENTATION_FOOTER_CHARS:
+            break
+        count, footer = index, candidate
+    return MappingProxyType({
+        "lead": MAX_PRESENTATION_VOICE_CHARS,
+        "support": MAX_PRESENTATION_DETAIL_CHARS - MAX_PRESENTATION_VOICE_CHARS - 2 - footer,
+        "sources": count,
+    })
+
+def presentation_schema(source_input: str) -> dict[str, Any]:
+    """A per-request schema copy: every bound one past the limits packed in the input.
+
+    The presenter backend cuts a field at its schema bound instead of overflowing it, so an
+    output that reaches a bound was cut, and the render refuses it as ``too_long``.
+    """
+    try:
+        payload = json.loads(source_input)
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("presentation-input-limits") from None
+    limits = payload.get("limits") if type(payload) is dict else None
+    sources = payload.get("sources") if type(payload) is dict else None
+    if (type(limits) is not dict or set(limits) != _LIMIT_KEYS
+            or any(type(limits[key]) is not int or limits[key] < 0 for key in _LIMIT_KEYS)
+            or type(sources) is not list or not sources
+            or [source.get("id") if type(source) is dict else None for source in sources]
+            != list(range(len(sources)))):
+        raise ValueError("presentation-input-limits")
+    schema = copy.deepcopy(PRESENTATION_SCHEMA)
+    answer = schema["properties"]["answer"]["properties"]
+    answer["lead"]["maxLength"] = limits["lead"] + 1
+    answer["support"]["maxLength"] = limits["support"] + 1
+    selection = schema["properties"]["source_ids"]
+    selection["maxItems"] = limits["sources"] + 1
+    selection["items"] = {"type": "integer", "enum": list(range(len(sources)))}
+    return schema
 
 def presentation_input(
     objective: str, catalog: tuple[str, ...], passages: object,
@@ -116,6 +198,7 @@ def presentation_input(
     """Pack exact prefixes fairly; byte bounds prove size, never semantic sufficiency."""
     if (not isinstance(passages, MappingProxyType) or set(passages) != set(catalog)):
         raise ValueError("presentation-evidence-catalog")
+    limits = dict(presentation_limits(catalog))
     rows = []
     missing = []
     for source_id, url in enumerate(catalog):
@@ -131,7 +214,7 @@ def presentation_input(
 
     def pack(limit: int) -> str:
         return frozen({
-                "objective": objective,
+                "objective": objective, "limits": limits,
             "sources": [{"id": index, "url": url} for index, url in enumerate(catalog)],
             "evidence": [{"source_id": source_id, "kind": kind, "text": text[:limit],
                 "original_bytes": size, "truncated": len(text) > limit}
@@ -429,6 +512,9 @@ def render_presentation_response(
             raise ValueError("presentation-envelope")
         choice = formatted.choices[0]
         content = choice.message.content
+        if choice.finish_reason == "length":
+            # The presenter reports its own cut; the JSON it cut is not parsed.
+            raise ValueError("presentation-content-length")
         if (choice.finish_reason != "stop" or choice.message.tool_calls
                 or getattr(choice.message, "refusal", None)
                 or type(content) is not str or len(content) > 8192):
@@ -455,21 +541,27 @@ def render_presentation_response(
     ):
         raise ValueError("presentation-content-shape")
     lead, support = answer["lead"], answer["support"]
+    if type(lead) is not str or type(support) is not str:
+        raise ValueError("presentation-content-shape")
+    ids = value["source_ids"]
+    # Each schema bound is one past its accepted bound, and the backend lands on a bound
+    # rather than overflow it: a field past its accepted bound was cut. Bounds count code
+    # points, as ``len`` does; a lone surrogate is a split character. Refused first.
+    limits = presentation_limits(catalog)
+    if (len(lead) > limits["lead"] or len(support) > limits["support"]
+            or not has_valid_result_unicode(lead) or not has_valid_result_unicode(support)
+            or (type(ids) is list and len(ids) > limits["sources"])):
+        raise ValueError("presentation-content-length")
     if (
-        type(lead) is not str
-        or not lead.strip()
+        not lead.strip()
         or "\n" in lead
         or "\r" in lead
-        or type(support) is not str
         or any(
             token in lead + support for token in ("<voice>", "</voice>", "<detail>", "</detail>")
         )
     ):
         raise ValueError("presentation-content-shape")
-    if len(lead) > MAX_PRESENTATION_VOICE_CHARS or len(support) > MAX_PRESENTATION_DETAIL_CHARS:
-        raise ValueError("presentation-content-length")
     evidence["stage"] = "source-selection"
-    ids = value["source_ids"]
     if type(ids) is not list:
         raise ValueError("presentation-source-ids")
     evidence["stage"] = "source-id-type"
@@ -492,9 +584,10 @@ def render_presentation_response(
         raise ValueError("presentation-inline-link")
     detail = lead + ("\n\n" + support if support else "")
     if ids:
-        detail += "\n\nSources:\n" + "\n".join(catalog[index] for index in ids)
+        detail += SOURCES_HEADING + "\n".join(catalog[index] for index in ids)
     evidence["stage"] = "content"
-    # Recorded before the check so a refusal carries it.
+    # The backstop for a route that ignores bounds. Recorded before the check so a refusal
+    # carries it.
     evidence["rendered_detail_length"] = len(detail)
     if len(detail) > MAX_PRESENTATION_DETAIL_CHARS:
         raise ValueError("presentation-content-length")
