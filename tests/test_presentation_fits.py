@@ -352,6 +352,20 @@ def test_ineligible_sources_are_the_host_predicate_or_the_footer_budget(url: str
     assert (not displayable_detail_text(url)) or len(HEADING) + len(url) > 600
 
 
+_BREAKS = ("\t", "\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x1f", "\x85",
+           "\xa0", " ", " ", " ", "　")
+
+
+@pytest.mark.parametrize("character", _BREAKS, ids=[f"U+{ord(c):04X}" for c in _BREAKS])
+def test_a_url_with_whitespace_or_a_line_break_is_not_a_footer_line(character: str) -> None:
+    # The footer is one URL per line; the host's detail check alone admits some of these.
+    url = "https://example.com/split" + character + "url"
+    assert url.split() != [url] or url.splitlines() != [url]
+    catalog = tuple(sorted({URL, url}))
+    shown, _ = presenter.displayable_sources(catalog, _passages(catalog))
+    assert shown == (URL,)
+
+
 def test_displayable_sources_keeps_the_catalog_identity_check() -> None:
     catalog = (URL,)
     with pytest.raises(ValueError, match="^presentation-evidence-catalog$"):
