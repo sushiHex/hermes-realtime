@@ -48,7 +48,13 @@ excluding native draft prose. Strict JSON contains one `answer` object with
 `lead` and `support`, plus selected `source_ids`. The existing envelope uses the
 exact lead for speech and the same lead plus support for display. The display's
 1800-character limit includes the validated source footer; empty source selection
-can express uncertainty without that footer.
+can express uncertainty without that footer. The shared formatter input carries
+per-request `limits` derived from the catalog: a 220-character lead, at most
+`limits.sources` source IDs (the largest count whose longest-URL footer fits 600
+characters) and the rest of the bound for support. The per-request schema sets each
+bound one past its accepted bound, so a field the backend cut at its bound is refused
+rather than published. This fixture passes its complete admitted catalog; it does not
+apply the product observer's displayable-source filter.
 Spoken summaries omit source names, domains and citations unless the objective
 explicitly requests sources; the detailed result retains its source catalog.
 The trusted route must equal the actual middleware route and request model.

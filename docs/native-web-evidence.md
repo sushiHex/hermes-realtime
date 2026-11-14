@@ -64,10 +64,12 @@ host's ordinary result-envelope checks, as non-web runs already do.
 Refusal reasons form a closed set: `binding` (task, run or presentation ownership
 mismatch), `capture` (a web result could not be read), `closed` (stopped, cancelled
 or unloaded), `deadline`, `final_response` (the observed final answer was not a
-complete stop), `input_bound`, `insufficient` (no usable passage), `internal`,
-`presentation_failed`, `route` (formatter route does not match the native route),
-`source_changed`, and `unobserved` (a web-only run's final answer was never observed,
-or a completed status had no bindable output). The
+complete stop), `input_bound`, `insufficient` (no usable passage, or no displayable
+source), `internal`, `presentation_failed`, `route` (formatter route does not match the
+native route), `source_changed`, `too_long` (the formatter's answer was cut: a field
+reached its schema bound, the formatter reported a length or `max_output_tokens` stop,
+or its stream passed the text bound), and `unobserved` (a web-only run's final answer
+was never observed, or a completed status had no bindable output). The
 first reason of a refusal is the one reported. The plugin's content-free
 `[web-evidence]` line carries the same `category` and `reason`, plus where and why it
 refused: `phase` (the observer hook or final-response step), `cause` (the fixed
@@ -79,7 +81,9 @@ raised on the refusal path to be declared; the host's
 `[hermes-web-evidence]` line carries `reason` too, or `attestation` when the
 attestation is missing or unbound. The host speaks and shows a fixed notice per
 reason, and says "Please try again" only for `deadline`, `presentation_failed`
-and `source_changed`.
+and `source_changed`; `too_long` asks for a shorter answer instead. A host older than
+its plugin does not know `too_long`, reads the attestation as unbound and shows the
+unverified notice: that skew fails closed and is not otherwise handled.
 
 Tool discovery metadata does not make a run mixed. Attempted, failed or malformed
 web retrieval cannot be classified as `no_web`. Missing, evicted, malformed,
@@ -91,8 +95,14 @@ rather than publishing historical results.
 
 ## Bounds and limits
 
-The immutable formatter input includes the objective, exact catalog, retained
-passage prefixes, and missing/truncation indicators. Native draft prose is omitted
+The immutable formatter input includes the objective, the per-request `limits`, the
+displayable catalog, retained passage prefixes, and missing/truncation indicators. A
+source is displayable only when its URL passes the host's own detail-text predicate
+(`displayable_detail_text`, which the completed-result validator also applies) and its
+footer alone fits the 600-character footer budget. Other sources and their passages
+are left out of the input, the render and every attested count and hash; the full
+captured catalog still decides `source_changed`. No displayable source refuses as
+`insufficient`. Native draft prose is omitted
 from synthesis; its hash remains local diagnostic metadata. Its
 complete UTF-8 representation is at most 16 KiB. Presentation runs inside the
 native task's lifetime, with a plugin-owned 120-second allowance measured from
@@ -103,7 +113,17 @@ The formatter returns one `answer` object with required `lead` and `support`
 strings, plus `source_ids`. The lead is a standalone gist of at most 220 characters,
 used verbatim as canonical speech text. Display composes that same lead and any
 nonempty support into one narrative, followed by the validated sources footer.
-The combined display still fits the existing 1800-character detail bound. Support
+The combined display still fits the existing 1800-character detail bound, by
+construction: `limits.sources` is the largest count whose worst-case footer (the
+longest URLs) fits 600 characters, and `limits.support` is the rest of the bound after
+the 220-character lead and its separator. Each schema bound is one past its accepted
+bound (lead 221, support `limits.support + 1`, `source_ids` `limits.sources + 1`, with
+an `enum` of the shown IDs), because the formatter backend cuts a field at its bound
+rather than overflow it. A field past its accepted bound, a lone surrogate, a chat
+`finish_reason` of `length`, or a Codex `incomplete` stop for `max_output_tokens` is
+therefore a cut, refused as `too_long` before any other content or source check. Bounds
+count code points, as Python `len` does. The instructions stay one constant and refer
+to the top-level `limits` object; the schema is a per-request copy. Support
 can be empty when the lead fully answers the request, including honest uncertainty;
 its explicit slot retains requested supporting dates and qualifications for richer
 answers. Overlong leads are refused, never truncated or independently summarized.
