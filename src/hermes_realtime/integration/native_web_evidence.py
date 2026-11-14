@@ -84,6 +84,62 @@ _REASONS = MappingProxyType({
 })
 
 
+# Every fixed category that can refuse a run, so the marker can name it; any other
+# literal is emitted as ``undeclared``. Closed by ``tests/test_web_evidence_cause_ratchet.py``
+# against every ``ValueError`` literal in the web-evidence modules.
+_CAUSES = frozenset({
+    "evidence-bound", "evidence-membership", "evidence-shape",
+    "native-final-response", "native-result-bound", "native-result-item", "native-result-json",
+    "native-result-shape", "native-result-unsuccessful", "native-result-url",
+    "presentation-content-length", "presentation-content-shape", "presentation-credential",
+    "presentation-credential-cleanup", "presentation-deadline", "presentation-duplicate-key",
+    "presentation-envelope", "presentation-evidence-catalog", "presentation-evidence-shape",
+    "presentation-fields", "presentation-inline-link", "presentation-input-bound",
+    "presentation-json", "presentation-model", "presentation-ownership", "presentation-route",
+    "presentation-source-id-duplicate", "presentation-source-id-range",
+    "presentation-source-id-type", "presentation-source-ids",
+    "presentation-source-without-evidence", "presentation-terminal-contract",
+    "presentation-wire-contract", "presentation-wire-input",
+    "responses-ambiguous-final-phase", "responses-content-part", "responses-delta-shape",
+    "responses-empty-output", "responses-event-after-terminal", "responses-event-bound",
+    "responses-event-type", "responses-event-unknown", "responses-function-call-arguments",
+    "responses-function-call-incomplete", "responses-function-call-json",
+    "responses-function-call-shape", "responses-message-content", "responses-message-phase",
+    "responses-message-shape", "responses-message-text-parts",
+    "responses-multiple-final-messages", "responses-no-final-answer", "responses-no-message",
+    "responses-not-completed", "responses-output-item", "responses-output-shape",
+    "responses-publication-item", "responses-publication-part", "responses-publication-target",
+    "responses-reasoning-incomplete", "responses-refusal", "responses-stream-content-part",
+    "responses-stream-output-item", "responses-stream-text-bound", "responses-terminal-count",
+    "responses-terminal-failure", "responses-terminal-missing", "responses-text-bound",
+    "web-evidence-binding", "web-evidence-capture-refused", "web-evidence-catalog-bound",
+    "web-evidence-closed", "web-evidence-deadline", "web-evidence-extract-request",
+    "web-evidence-input-bound", "web-evidence-insufficient", "web-evidence-late-result",
+    "web-evidence-passage-count", "web-evidence-publish-closed", "web-evidence-report-bound",
+    "web-evidence-run-id", "web-evidence-session-unavailable", "web-evidence-source-changed",
+    "web-evidence-task-binding", "web-evidence-task-map", "web-evidence-task-missing",
+})
+# Where the observer refused: the hook and, on the final response, the step.
+_PHASES = frozenset({
+    "capture", "tool-binding", "llm-binding", "route", "final", "presentation", "render",
+    "publish", "status",
+})
+# The presenter's own render stages (``evidence["stage"]`` in evidence_presentation.py).
+_STAGES = frozenset({
+    "response-envelope", "json", "fields", "content", "source-selection", "source-id-type",
+    "source-id-range", "source-id-unique", "source-evidence", "inline-links",
+    "terminal-contract",
+})
+# Class labels for an error that is not an exact ValueError; any other class is ``other``.
+_ERROR_CLASSES = frozenset({
+    "ValueError", "RuntimeError", "JSONDecodeError", "TimeoutError", "CancelledError",
+    "RecursionError", "KeyError", "TypeError", "AttributeError", "IndexError", "UnicodeError",
+    "UnicodeDecodeError", "OSError", "APIConnectionError", "APITimeoutError", "APIStatusError",
+    "BadRequestError", "AuthenticationError", "PermissionDeniedError", "NotFoundError",
+    "RateLimitError", "InternalServerError",
+})
+
+
 def _reason(error: BaseException, default: str) -> str:
     if type(error) is asyncio.CancelledError:
         return "closed"
@@ -427,7 +483,10 @@ class NativeWebEvidence:
             row["reason"] = reason
         row["disposition"] = "refused"
 
-    def _refuse(self, run_id: str, row: dict[str, Any] | None, reason: str) -> None:
+    def _refuse(
+        self, run_id: str, row: dict[str, Any] | None, reason: str, *, phase: str,
+        error: BaseException | None = None, evidence: dict[str, Any] | None = None,
+    ) -> None:
         emit: str | None = None
         try:
             with self.lock:
@@ -439,13 +498,39 @@ class NativeWebEvidence:
                     row["refusal_logged"] = True
         finally:
             if emit is not None:
-                self._marker("refused", emit)
+                self._marker("refused", emit, phase, error, evidence)
 
     @staticmethod
-    def _marker(category: str, reason: str) -> None:
+    def _marker(
+        category: str, reason: str, phase: str, error: BaseException | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        """Content-free: fixed labels from closed sets and integers only, never error text.
+
+        ``cause`` is the error's literal category when it is declared in ``_CAUSES``,
+        ``undeclared`` for any other literal, and ``none`` for an error that is not an exact
+        ``ValueError`` with a string category; ``error_class`` then names its class from
+        ``_ERROR_CLASSES`` or ``other``. ``stage`` and the two counts are the presenter's
+        own facts, when it reached them. They describe the error that emitted the marker;
+        ``reason`` stays the row's first refusal reason.
+        """
+        literal = (error.args[0] if type(error) is ValueError and error.args
+                   and type(error.args[0]) is str else None)
+        cause = "none" if literal is None else literal if literal in _CAUSES else "undeclared"
+        label = "none" if error is None else type(error).__name__
+        facts = evidence if type(evidence) is dict else {}
+        stage = facts.get("stage")
+        selected = facts.get("selected_source_count")
+        length = facts.get("rendered_detail_length")
         print("[web-evidence] " + json.dumps(
             {"category": category, "count": 1,
-             "reason": reason if reason in REFUSED_REASONS | UNGROUNDED_REASONS else "internal"},
+             "reason": reason if reason in REFUSED_REASONS | UNGROUNDED_REASONS else "internal",
+             "phase": phase if phase in _PHASES else "other",
+             "cause": cause,
+             "error_class": label if label in _ERROR_CLASSES | {"none"} else "other",
+             "stage": stage if type(stage) is str and stage in _STAGES else "none",
+             "selected_source_count": selected if type(selected) is int else None,
+             "rendered_detail_length": length if type(length) is int else None},
             separators=(",", ":"), sort_keys=True,
         ), flush=True)
 
@@ -510,7 +595,7 @@ class NativeWebEvidence:
                 if row["passage_count"] > 2048:
                     raise ValueError("web-evidence-passage-count")
         except BaseException as error:
-            self._refuse(run_id, row, _reason(error, "capture"))
+            self._refuse(run_id, row, _reason(error, "capture"), phase="capture", error=error)
 
     def tool_execution(self, **kw: Any) -> Any:
         """Wrap the native effect exactly once and retain its original result."""
@@ -538,7 +623,8 @@ class NativeWebEvidence:
                 refused_row = self.rows.get(run_id)
             except BaseException:
                 refused_row = None
-            self._refuse(run_id, refused_row, _reason(error, "binding"))
+            self._refuse(run_id, refused_row, _reason(error, "binding"), phase="tool-binding",
+                         error=error)
         try:
             result = next_call(args)
         except BaseException:
@@ -574,13 +660,14 @@ class NativeWebEvidence:
                 row = None
             if row is None:
                 return next_call(request)
-            self._refuse(run_id, row, _reason(error, "binding"))
+            self._refuse(run_id, row, _reason(error, "binding"), phase="llm-binding",
+                         error=error)
         if row is None:
             return next_call(request)
         try:
             self.presentation.validate_route(kw)
         except BaseException as error:
-            self._refuse(run_id, row, _reason(error, "route"))
+            self._refuse(run_id, row, _reason(error, "route"), phase="route", error=error)
         result = next_call(request)
         if inspect.isawaitable(result):
             return self._finish_after_await(run_id, row, result, kw)
@@ -600,6 +687,8 @@ class NativeWebEvidence:
         self, run_id: str, row: dict[str, Any], response: Any, kw: dict[str, Any]
     ) -> Any:
         stage = "internal"
+        phase = "final"
+        evidence: dict[str, Any] | None = None
         try:
             api_mode = kw.get("api_mode", "chat_completions")
             if _has_tool_calls(response, api_mode):
@@ -652,15 +741,16 @@ class NativeWebEvidence:
                         [{"id": index, "url": url} for index, url in enumerate(catalog)]
                     ).encode()
                 ).hexdigest()
-            evidence: dict[str, Any] = {
+            evidence = {
                 "wire_requests": 0,
                 "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             }
-            stage = "presentation_failed"
+            stage, phase = "presentation_failed", "presentation"
             formatted = await self.presentation.complete(self, run_id, row, source_input, evidence)
-            stage = "internal"
+            stage, phase = "internal", "render"
             rendered = render_presentation_response(
                 formatted, catalog, api_mode, evidence, passages=passages)
+            phase = "publish"
             with self.lock:
                 self._assert_current(run_id, row, enforce_deadline=True)
                 if row["urls"] != set(catalog) or row["passages"] is not passages:
@@ -682,11 +772,12 @@ class NativeWebEvidence:
                 self._store_report_locked(run_id, row)
                 self._drop_source_locked(row)
                 return published
-        except asyncio.CancelledError:
-            self._refuse(run_id, row, "closed")
+        except asyncio.CancelledError as error:
+            self._refuse(run_id, row, "closed", phase=phase, error=error, evidence=evidence)
             raise
         except BaseException as error:
-            self._refuse(run_id, row, _reason(error, stage))
+            self._refuse(run_id, row, _reason(error, stage), phase=phase, error=error,
+                         evidence=evidence)
             refusal = self._refusal_response(response, kw.get("api_mode", "chat_completions"))
             try:
                 text = _terminal_text(refusal, kw.get("api_mode", "chat_completions"))
@@ -809,9 +900,9 @@ class NativeWebEvidence:
                     row["output_sha256"] = hashlib.sha256(output.encode("utf-8")).hexdigest()
             report = self._store_report_locked(run_id, row)
         if marker == "ungrounded":
-            self._marker("ungrounded", "unobserved")
+            self._marker("ungrounded", "unobserved", "status")
         elif marker == "refused":
-            self._marker("refused", "unobserved")
+            self._marker("refused", "unobserved", "status")
         return report
 
     def _store_report_locked(self, run_id: str, row: dict[str, Any]) -> str:

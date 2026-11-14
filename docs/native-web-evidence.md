@@ -69,7 +69,13 @@ complete stop), `input_bound`, `insufficient` (no usable passage), `internal`,
 `source_changed`, and `unobserved` (a web-only run's final answer was never observed,
 or a completed status had no bindable output). The
 first reason of a refusal is the one reported. The plugin's content-free
-`[web-evidence]` line carries the same `category` and `reason`; the host's
+`[web-evidence]` line carries the same `category` and `reason`, plus where and why it
+refused: `phase` (the observer hook or final-response step), `cause` (the fixed
+category literal when declared, `undeclared` for any other literal, `none` for a
+non-`ValueError`), `error_class` (from a fixed allowlist, else `other`), the
+presenter's `stage`, `selected_source_count` and `rendered_detail_length` when
+reached. `tests/test_web_evidence_cause_ratchet.py` requires every literal category
+raised on the refusal path to be declared; the host's
 `[hermes-web-evidence]` line carries `reason` too, or `attestation` when the
 attestation is missing or unbound. The host speaks and shows a fixed notice per
 reason, and says "Please try again" only for `deadline`, `presentation_failed`

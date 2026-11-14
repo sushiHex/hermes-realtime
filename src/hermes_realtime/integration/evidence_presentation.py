@@ -182,7 +182,10 @@ def _raw_responses_result(
             if (type(call_id) is not str or not call_id or type(name) is not str or not name
                     or type(arguments) is not str or len(arguments) > 16_384):
                 raise ValueError("responses-function-call-shape")
-            parsed = json.loads(arguments)
+            try:
+                parsed = json.loads(arguments)
+            except (json.JSONDecodeError, RecursionError):
+                raise ValueError("responses-function-call-json") from None
             if type(parsed) is not dict or any(call_id == call["call_id"] for call in calls):
                 raise ValueError("responses-function-call-arguments")
             calls.append({"call_id": call_id, "name": name, "arguments": arguments,
@@ -437,7 +440,11 @@ def render_presentation_response(
         return dict(items)
 
     evidence["stage"] = "json"
-    value = json.loads(content, object_pairs_hook=pairs)
+    try:
+        value = json.loads(content, object_pairs_hook=pairs)
+    except (json.JSONDecodeError, RecursionError):
+        # ``presentation-duplicate-key`` is an exact ValueError and passes through.
+        raise ValueError("presentation-json") from None
     evidence["stage"] = "fields"
     if type(value) is not dict or set(value) != {"answer", "source_ids"}:
         raise ValueError("presentation-fields")
@@ -446,21 +453,21 @@ def render_presentation_response(
     if (
         type(answer) is not dict or set(answer) != {"lead", "support"}
     ):
-        raise ValueError("presentation-content")
+        raise ValueError("presentation-content-shape")
     lead, support = answer["lead"], answer["support"]
     if (
         type(lead) is not str
         or not lead.strip()
-        or len(lead) > MAX_PRESENTATION_VOICE_CHARS
         or "\n" in lead
         or "\r" in lead
         or type(support) is not str
-        or len(support) > MAX_PRESENTATION_DETAIL_CHARS
         or any(
             token in lead + support for token in ("<voice>", "</voice>", "<detail>", "</detail>")
         )
     ):
-            raise ValueError("presentation-content")
+        raise ValueError("presentation-content-shape")
+    if len(lead) > MAX_PRESENTATION_VOICE_CHARS or len(support) > MAX_PRESENTATION_DETAIL_CHARS:
+        raise ValueError("presentation-content-length")
     evidence["stage"] = "source-selection"
     ids = value["source_ids"]
     if type(ids) is not list:
@@ -487,9 +494,10 @@ def render_presentation_response(
     if ids:
         detail += "\n\nSources:\n" + "\n".join(catalog[index] for index in ids)
     evidence["stage"] = "content"
-    if len(detail) > MAX_PRESENTATION_DETAIL_CHARS:
-        raise ValueError("presentation-content")
+    # Recorded before the check so a refusal carries it.
     evidence["rendered_detail_length"] = len(detail)
+    if len(detail) > MAX_PRESENTATION_DETAIL_CHARS:
+        raise ValueError("presentation-content-length")
     content = "<voice>" + lead + "</voice><detail>" + detail + "</detail>"
     from hermes_realtime.integration.api import HermesApiTaskSession
 
