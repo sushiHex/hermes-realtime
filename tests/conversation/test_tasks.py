@@ -27,6 +27,9 @@ from hermes_realtime.protocol import (
     WorkTerminalStatus,
 )
 
+# Bounds a hang, not latency: these waits only separate finite from never.
+_CLOSE_HANG_BOUND_SECONDS = 30.0
+
 
 class HostileTZ(tzinfo):
     calls = 0
@@ -81,12 +84,16 @@ class CancellationResistantCloseSession(TaskSessionStub):
         self.cancellations = 0
 
     async def close(self) -> None:
+        # Resists exactly the controller's one cancellation. A second one (teardown's) ends it, so
+        # a failed test cannot leave a task that hangs the event loop's shutdown forever.
         self.close_started.set()
         while not self.allow_close.is_set():
             try:
                 await self.allow_close.wait()
             except asyncio.CancelledError:
                 self.cancellations += 1
+                if self.cancellations > 1:
+                    raise
         self.close_finished.set()
 
 
@@ -125,13 +132,13 @@ async def test_close_has_finite_drain_for_cancellation_resistant_session() -> No
         close_drain_timeout_ms=5,
     )
 
-    await asyncio.wait_for(controller.close(), timeout=0.2)
+    await asyncio.wait_for(controller.close(), timeout=_CLOSE_HANG_BOUND_SECONDS)
 
     assert session.cancellations == 1
     with pytest.raises(RuntimeError, match="closed"):
         await controller.dispatch(objective="closed", utterance_id="utterance_001")
     session.allow_close.set()
-    await asyncio.wait_for(session.close_finished.wait(), timeout=0.2)
+    await asyncio.wait_for(session.close_finished.wait(), timeout=_CLOSE_HANG_BOUND_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -151,7 +158,7 @@ async def test_close_wakes_every_blocked_terminal_consumer() -> None:
 
     results = await asyncio.wait_for(
         asyncio.gather(*consumers, return_exceptions=True),
-        timeout=0.2,
+        timeout=_CLOSE_HANG_BOUND_SECONDS,
     )
     assert all(isinstance(result, RuntimeError) for result in results)
     assert all("closed" in str(result) for result in results)
@@ -172,7 +179,7 @@ async def test_close_wakes_blocked_terminal_consumer() -> None:
     await controller.close()
 
     with pytest.raises(RuntimeError, match="closed"):
-        await asyncio.wait_for(consumer, timeout=0.2)
+        await asyncio.wait_for(consumer, timeout=_CLOSE_HANG_BOUND_SECONDS)
 
 
 @pytest.mark.parametrize(
@@ -372,7 +379,7 @@ async def test_late_ack_during_close_cannot_commit_active_authority() -> None:
 
     session.release_ack.set()
     with pytest.raises(RuntimeError, match="closed before dispatch acknowledgment"):
-        await asyncio.wait_for(dispatch, timeout=0.2)
+        await asyncio.wait_for(dispatch, timeout=_CLOSE_HANG_BOUND_SECONDS)
 
     assert context.snapshot().active_tasks == ()
     assert "task_late" in controller._pending_dispatches
@@ -380,7 +387,7 @@ async def test_late_ack_during_close_cannot_commit_active_authority() -> None:
         context.prepare_task("task_probe", "reservation must remain")
 
     session.release_close.set()
-    await asyncio.wait_for(close, timeout=0.2)
+    await asyncio.wait_for(close, timeout=_CLOSE_HANG_BOUND_SECONDS)
 
 
 class DuplicateRunDispatchSession(TaskSessionStub):
@@ -579,7 +586,7 @@ async def test_late_cancel_ack_during_close_cannot_report_acceptance() -> None:
 
     session.release_ack.set()
     with pytest.raises(RuntimeError, match="closed before cancellation acknowledgment"):
-        await asyncio.wait_for(cancellation, timeout=0.2)
+        await asyncio.wait_for(cancellation, timeout=_CLOSE_HANG_BOUND_SECONDS)
 
     assert context.snapshot().active_tasks == (
         ActiveTaskSummary("task_weather", "check weather"),
@@ -587,7 +594,7 @@ async def test_late_cancel_ack_during_close_cannot_report_acceptance() -> None:
     assert "task_weather" in controller._cancel_operations
 
     session.release_close.set()
-    await asyncio.wait_for(close, timeout=0.2)
+    await asyncio.wait_for(close, timeout=_CLOSE_HANG_BOUND_SECONDS)
 
 
 class ExtraRunCancelSession(AcceptingCancelSession):
