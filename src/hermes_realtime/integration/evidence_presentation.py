@@ -126,7 +126,8 @@ def displayable_sources(
 ) -> tuple[tuple[str, ...], Passages]:
     """The catalog the presenter may see: only sources whose URL the host can display.
 
-    A URL must pass the host's own detail predicate and fit the footer budget alone.
+    A URL must pass the host's own detail predicate, be one footer line with no whitespace,
+    and fit the footer budget alone.
     Ineligible sources and their passages are left out: evidence that cannot be cited is
     not presented as grounding.
     """
@@ -135,7 +136,9 @@ def displayable_sources(
         raise ValueError("presentation-evidence-catalog")
     from hermes_realtime.integration.api import displayable_detail_text
 
+    # The footer is one URL per line: whitespace or any Unicode line break would split one.
     shown = tuple(url for url in catalog if displayable_detail_text(url)
+                  and url.split() == [url] and url.splitlines() == [url]
                   and len(SOURCES_HEADING) + len(url) <= MAX_PRESENTATION_FOOTER_CHARS)
     return shown, MappingProxyType({url: passages[url] for url in shown})
 

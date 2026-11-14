@@ -98,8 +98,9 @@ rather than publishing historical results.
 The immutable formatter input includes the objective, the per-request `limits`, the
 displayable catalog, retained passage prefixes, and missing/truncation indicators. A
 source is displayable only when its URL passes the host's own detail-text predicate
-(`displayable_detail_text`, which the completed-result validator also applies) and its
-footer alone fits the 600-character footer budget. Other sources and their passages
+(`displayable_detail_text`, which the completed-result validator also applies), is one
+footer line (no whitespace and no Unicode line break, which the detail check alone
+would admit), and its footer alone fits the 600-character footer budget. Other sources and their passages
 are left out of the input, the render and every attested count and hash; the full
 captured catalog still decides `source_changed`. No displayable source refuses as
 `insufficient`. Native draft prose is omitted
