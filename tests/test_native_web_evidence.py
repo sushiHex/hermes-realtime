@@ -450,7 +450,9 @@ async def test_malformed_observation_preserves_native_result_and_refuses_groundi
     assert calls == 1
     assert observer.rows[RUN_ID]["disposition"] == "refused"
     assert capsys.readouterr().out == (
-        '[web-evidence] {"category":"refused","count":1,"reason":"capture"}\n'
+        '[web-evidence] {"category":"refused","cause":"native-result-json","count":1,'
+        '"error_class":"ValueError","phase":"capture","reason":"capture",'
+        '"rendered_detail_length":null,"selected_source_count":null,"stage":"none"}\n'
     )
 
 
@@ -1108,7 +1110,9 @@ async def test_unobserved_web_only_final_is_refused_not_delivered(
     assert attestation_outcome(raw, GENERATION, RUN_ID, UNOBSERVED_FINAL) == (
         "refused", "unobserved")
     assert capsys.readouterr().out == (
-        '[web-evidence] {"category":"refused","count":1,"reason":"unobserved"}\n'
+        '[web-evidence] {"category":"refused","cause":"none","count":1,"error_class":"none",'
+        '"phase":"status","reason":"unobserved","rendered_detail_length":null,'
+        '"selected_source_count":null,"stage":"none"}\n'
     )
 
 
@@ -1175,7 +1179,9 @@ async def test_unobserved_terminal_answer_is_delivered_ungrounded_and_bound(
     assert report["catalog_count"] == report["passage_count"] == 0
     assert not attestation_valid(raw, GENERATION, RUN_ID, UNOBSERVED_FINAL + " ")
     assert capsys.readouterr().out == (
-        '[web-evidence] {"category":"ungrounded","count":1,"reason":"unobserved"}\n'
+        '[web-evidence] {"category":"ungrounded","cause":"none","count":1,"error_class":"none",'
+        '"phase":"status","reason":"unobserved","rendered_detail_length":null,'
+        '"selected_source_count":null,"stage":"none"}\n'
     )
 
 
@@ -1271,6 +1277,28 @@ class _RefusalScenario:
                     .choices[0].message.content)
 
 
+# reason -> (phase, cause, error_class[, stage, selected_source_count, rendered_detail_length])
+_REFUSAL_CAUSES: dict[str, tuple[Any, ...]] = {
+    "binding": ("tool-binding", "web-evidence-binding", "ValueError"),
+    "capture": ("capture", "native-result-json", "ValueError"),
+    "closed": ("tool-binding", "web-evidence-closed", "ValueError"),
+    "deadline": ("final", "web-evidence-deadline", "ValueError"),
+    "final_response": ("final", "native-final-response", "ValueError"),
+    "input_bound": ("final", "web-evidence-input-bound", "ValueError"),
+    "insufficient": ("final", "web-evidence-insufficient", "ValueError"),
+    "internal": ("final", "none", "RuntimeError"),
+    "presentation_failed": ("presentation", "undeclared", "ValueError"),
+    "route": ("route", "presentation-route", "ValueError"),
+    "source_changed": ("publish", "web-evidence-source-changed", "ValueError",
+                       "terminal-contract", 1, 117),
+    "unobserved": ("status", "none", "none"),
+}
+
+
+def test_refusal_cause_table_covers_every_reason() -> None:
+    assert set(_REFUSAL_CAUSES) == REFUSED_REASONS
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reason", sorted(REFUSED_REASONS))
 async def test_each_refusal_reason_reaches_attestation_and_marker(
@@ -1299,9 +1327,14 @@ async def test_each_refusal_reason_reaches_attestation_and_marker(
         assert report["reason"] == reason
         markers = [line for line in capsys.readouterr().out.splitlines()
                    if line.startswith("[web-evidence] ")]
+        phase, cause, error_class, *presenter = _REFUSAL_CAUSES[reason]
+        stage, selected, length = presenter or ("none", None, None)
         assert markers == [
             "[web-evidence] " + json.dumps(
-                {"category": "refused", "count": 1, "reason": reason}, separators=(",", ":"))
+                {"category": "refused", "cause": cause, "count": 1, "error_class": error_class,
+                 "phase": phase, "reason": reason, "rendered_detail_length": length,
+                 "selected_source_count": selected, "stage": stage},
+                separators=(",", ":"))
         ]
     finally:
         if scenario.foreign is not None:
@@ -1331,7 +1364,9 @@ async def test_deterministic_render_failure_is_internal_not_retryable(
     assert attestation_outcome(observer.reports[RUN_ID], GENERATION, RUN_ID, published) == (
         "refused", "internal")
     assert capsys.readouterr().out == (
-        '[web-evidence] {"category":"refused","count":1,"reason":"internal"}\n'
+        '[web-evidence] {"category":"refused","cause":"presentation-json","count":1,'
+        '"error_class":"ValueError","phase":"render","reason":"internal",'
+        '"rendered_detail_length":null,"selected_source_count":null,"stage":"json"}\n'
     )
 
 
