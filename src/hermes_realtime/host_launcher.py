@@ -2757,6 +2757,8 @@ def build_local_host_launcher(
         ledger=DeliveredSpeechLedger(),
         task_status=work_surface.task_status,
         task_proposals=proposals,
+        # The natural cancel shares the natural-work binding, as status does.
+        task_cancellation=work_surface if natural_work_tools else None,
         observer=observe,
         max_segments=DEFAULT_MAX_RESPONSE_SEGMENTS,
         cleanup_timeout_seconds=10.0,

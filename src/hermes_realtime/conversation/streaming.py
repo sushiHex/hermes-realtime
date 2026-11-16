@@ -54,6 +54,7 @@ from .foreground import (
     ForegroundTurnCoordinator,
     ForegroundTurnLease,
 )
+from .natural_cancel import HostCancelRequest, NaturalCancellation, unaccepted_cancel_speech
 from .task_proposals import (
     ConversationTaskProposals,
     HostTaskProposalRequest,
@@ -63,7 +64,7 @@ from .task_proposals import (
 from .task_status import HostSpeechRequest, TaskStatusSnapshot
 from .tasks import TaskTerminalOutcome
 from .updates import UpdateDecision, UpdateDecisionKind
-from .work_tools import _validate_task_id
+from .work_tools import WorkCancelResult, _validate_identifier, _validate_task_id
 
 _MAX_SEGMENT_CHARS_LIMIT = 65_536
 _MAX_SEGMENTS_LIMIT = 4096
@@ -283,12 +284,21 @@ class ConversationPromptUpdate:
 
 @dataclass(frozen=True, slots=True)
 class ConversationInferenceRequest(ConversationContextSnapshot):
-    """Immutable context snapshot plus separately framed proactive updates."""
+    """Immutable context snapshot plus separately framed proactive updates.
+
+    ``cancel_offered`` records that the host froze the one active task as this turn's
+    natural cancel target; the target itself stays with the host.
+    """
 
     updates: tuple[ConversationPromptUpdate, ...] = ()
+    cancel_offered: bool = False
 
     def __post_init__(self) -> None:
         ConversationContextSnapshot.__post_init__(self)
+        if type(self.cancel_offered) is not bool:
+            raise TypeError("cancel_offered must be an exact boolean")
+        if self.cancel_offered and len(self.active_tasks) != 1:
+            raise ValueError("a natural cancel is offered only with exactly one active task")
         if type(self.updates) is not tuple:
             raise TypeError("inference request updates must be an exact tuple")
         if len(self.updates) > _MAX_PROMPT_UPDATES:
@@ -334,6 +344,21 @@ class AcceptedStartInferenceRequest(ConversationContextSnapshot):
             raise ValueError("accepted start must match one active task")
 
 
+@dataclass(frozen=True, slots=True)
+class AcceptedCancelInferenceRequest(ConversationContextSnapshot):
+    """A dedicated tool-free response for an accepted, not yet finished, cancellation."""
+
+    task_id: str = ""
+
+    def __post_init__(self) -> None:
+        ConversationContextSnapshot.__post_init__(self)
+        _validate_task_id(self.task_id)
+        if sum(
+            task.task_id == self.task_id for task in self.active_tasks
+        ) != 1:
+            raise ValueError("accepted cancel must match one active task")
+
+
 @runtime_checkable
 class _AsyncClosable(Protocol):
     async def aclose(self) -> None: ...
@@ -347,7 +372,7 @@ class StreamingInference(Protocol):
         snapshot: ConversationContextSnapshot,
         *,
         turn_id: str,
-    ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]: ...
+    ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest | HostCancelRequest]: ...
 
     async def cancel(self, turn_id: str) -> None: ...
 
@@ -387,6 +412,7 @@ class StreamingSpeechLoop:
         observer: _Observer | None = None,
         task_status: Callable[[], TaskStatusSnapshot] | None = None,
         task_proposals: ConversationTaskProposals | None = None,
+        task_cancellation: NaturalCancellation | None = None,
         max_segment_chars: int = 4096,
         max_segments: int = DEFAULT_MAX_RESPONSE_SEGMENTS,
         cleanup_timeout_seconds: float = 1.0,
@@ -394,6 +420,11 @@ class StreamingSpeechLoop:
     ) -> None:
         if observer is not None and not callable(observer):
             raise TypeError("observer must be callable")
+        if task_cancellation is not None and not (
+            callable(getattr(task_cancellation, "natural_cancel_target", None))
+            and callable(getattr(task_cancellation, "cancel_work", None))
+        ):
+            raise TypeError("task_cancellation must provide natural_cancel_target and cancel_work")
         if (
             evidence_admission is not None
             and type(evidence_admission)
@@ -425,6 +456,7 @@ class StreamingSpeechLoop:
             raise ValueError("cleanup_timeout_seconds must be finite and positive")
         self._task_status = task_status
         self._task_proposals = task_proposals
+        self._task_cancellation = task_cancellation
         self._context = context
         self._foreground = foreground
         self._inference = inference
@@ -989,7 +1021,10 @@ class StreamingSpeechLoop:
                 generated_segments.append(publication)
 
             try:
-                inference: AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]
+                cancel_target: str | None = None
+                inference: AsyncIterator[
+                    str | HostSpeechRequest | HostTaskProposalRequest | HostCancelRequest
+                ]
                 if segments is not None:
                     inference = self._segments_stream(segments)
                 elif transcript is None:
@@ -998,6 +1033,9 @@ class StreamingSpeechLoop:
                 else:
                     self._context.record_user_transcript(transcript)
                     source_snapshot = self._context.snapshot()
+                    # Frozen here, with no suspension since the input was recorded; the
+                    # selection below cancels this task or nothing.
+                    cancel_target = self._natural_cancel_target(source_snapshot)
                     snapshot = ConversationInferenceRequest(
                         revision=source_snapshot.revision,
                         messages=source_snapshot.messages,
@@ -1006,6 +1044,7 @@ class StreamingSpeechLoop:
                         memory=source_snapshot.memory,
                         recent_task_results=source_snapshot.recent_task_results,
                         updates=updates,
+                        cancel_offered=cancel_target is not None,
                     )
                     committed_conversation_context_snapshot = (
                         _committed_conversation_context_snapshot_bytes(
@@ -1043,6 +1082,7 @@ class StreamingSpeechLoop:
                 segment_count = 0
                 host_item_seen = False
                 automatic_proposal: HostTaskProposalRequest | None = None
+                cancel_selected = False
                 iteration_error: BaseException | None = None
                 pending_initial_segment: str | None = None
                 coalesce_initial_segment = transcript is not None and segments is None
@@ -1051,6 +1091,17 @@ class StreamingSpeechLoop:
                         if host_item_seen:
                             self._refuse_host_speech("after_terminal")
                         source = "conversation"
+                        if type(segment) is HostCancelRequest:
+                            # Only the target frozen for this turn; never resolved now.
+                            if cancel_target is None:
+                                self._refuse_host_speech("unadvertised_cancel", kind="cancel_work")
+                            if not lease.is_current:
+                                break
+                            host_item_seen = True
+                            cancel_selected = True
+                            coalesce_initial_segment = False
+                            pending_initial_segment = None
+                            continue
                         if type(segment) is HostTaskProposalRequest:
                             if transcript is None or self._task_proposals is None:
                                 self._refuse_host_speech("unadvertised_proposal")
@@ -1162,6 +1213,61 @@ class StreamingSpeechLoop:
                     close_error,
                     producer_after_text=text_seen,
                 )
+                async def speak_host_refusal(refusal: str) -> None:
+                    # A fixed host sentence chosen by result category, never the
+                    # result's reason; spoken only under this still-current lease.
+                    nonlocal segment_count, text_seen
+                    if not lease.is_current:
+                        return
+                    segment_count += 1
+                    if (segment_count > self._max_segments
+                            or len(refusal) > self._max_segment_chars):
+                        raise ValueError("host refusal speech capacity exceeded")
+                    text_seen = True
+                    await lease.publish(
+                        refusal, on_admit=admit_generated, source="host_task_status",
+                    )
+
+                async def acknowledge(
+                    acknowledged: AcceptedStartInferenceRequest | AcceptedCancelInferenceRequest,
+                    *,
+                    stop_when_inactive: bool,
+                ) -> None:
+                    # A tool-free continuation whose only new fact is the typed
+                    # accepted result; it cannot start or cancel work.
+                    nonlocal segment_count, text_seen
+                    continuation = self._inference.stream(acknowledged, turn_id=turn_id)
+                    continuation_error: BaseException | None = None
+                    continuation_close_error: BaseException | None = None
+                    try:
+                        async for segment in continuation:
+                            if stop_when_inactive and not any(
+                                task.task_id == acknowledged.task_id
+                                for task in self._context.snapshot().active_tasks
+                            ):
+                                break
+                            if type(segment) is not str or not segment.strip():
+                                raise TypeError("acknowledgment must be nonblank text")
+                            text_seen = True
+                            segment_count += 1
+                            if (segment_count > self._max_segments
+                                    or len(segment) > self._max_segment_chars):
+                                raise ValueError("acknowledgment capacity exceeded")
+                            if not await lease.publish(segment, on_admit=admit_generated):
+                                break
+                    except BaseException as error:
+                        if not isinstance(error, asyncio.CancelledError):
+                            producer_failed.set()
+                            lease.invalidate_publications()
+                        continuation_error = error
+                    finally:
+                        continuation_close_error = await self._close_stream(continuation)
+                    self._raise_iteration_or_close_error(
+                        "acknowledgment iteration and close failed",
+                        continuation_error, continuation_close_error,
+                        producer_after_text=text_seen,
+                    )
+
                 if automatic_proposal is not None and lease.is_current:
                     assert self._task_proposals is not None
                     # The acknowledgment below speaks under this lease's turn, so the
@@ -1171,17 +1277,7 @@ class StreamingSpeechLoop:
                     )
                     refusal = unaccepted_start_speech(accepted)
                     if refusal is not None:
-                        # A fixed host sentence chosen by result category, never the
-                        # result's reason; spoken only under this still-current lease.
-                        if lease.is_current:
-                            segment_count += 1
-                            if (segment_count > self._max_segments
-                                    or len(refusal) > self._max_segment_chars):
-                                raise ValueError("host refusal speech capacity exceeded")
-                            text_seen = True
-                            await lease.publish(
-                                refusal, on_admit=admit_generated, source="host_task_status",
-                            )
+                        await speak_host_refusal(refusal)
                     elif (accepted is not None and accepted.accepted and accepted.state == "active"
                             and accepted.task_id is not None and lease.is_current):
                         current = self._context.snapshot()
@@ -1190,43 +1286,45 @@ class StreamingSpeechLoop:
                             if task.task_id == accepted.task_id
                         )
                         if len(accepted_tasks) == 1:
-                            acknowledged = AcceptedStartInferenceRequest(
-                                revision=current.revision, messages=current.messages,
-                                active_tasks=accepted_tasks,
-                                terminal_task_count=current.terminal_task_count,
-                                memory=current.memory, task_id=accepted.task_id,
-                                recent_task_results=current.recent_task_results,
+                            await acknowledge(
+                                AcceptedStartInferenceRequest(
+                                    revision=current.revision, messages=current.messages,
+                                    active_tasks=accepted_tasks,
+                                    terminal_task_count=current.terminal_task_count,
+                                    memory=current.memory, task_id=accepted.task_id,
+                                    recent_task_results=current.recent_task_results,
+                                ),
+                                stop_when_inactive=True,
                             )
-                            continuation = self._inference.stream(acknowledged, turn_id=turn_id)
-                            continuation_error: BaseException | None = None
-                            continuation_close_error: BaseException | None = None
-                            try:
-                                async for segment in continuation:
-                                    if not any(
-                                        task.task_id == accepted.task_id
-                                        for task in self._context.snapshot().active_tasks
-                                    ):
-                                        break
-                                    if type(segment) is not str or not segment.strip():
-                                        raise TypeError("acknowledgment must be nonblank text")
-                                    text_seen = True
-                                    segment_count += 1
-                                    if (segment_count > self._max_segments
-                                            or len(segment) > self._max_segment_chars):
-                                        raise ValueError("acknowledgment capacity exceeded")
-                                    if not await lease.publish(segment, on_admit=admit_generated):
-                                        break
-                            except BaseException as error:
-                                if not isinstance(error, asyncio.CancelledError):
-                                    producer_failed.set()
-                                    lease.invalidate_publications()
-                                continuation_error = error
-                            finally:
-                                continuation_close_error = await self._close_stream(continuation)
-                            self._raise_iteration_or_close_error(
-                                "acknowledgment iteration and close failed",
-                                continuation_error, continuation_close_error,
-                                producer_after_text=text_seen,
+                if cancel_selected and lease.is_current:
+                    owner = self._task_cancellation
+                    assert owner is not None and cancel_target is not None
+                    cancelled = await owner.cancel_work(
+                        task_id=cancel_target,
+                        invocation_id=self._natural_cancel_invocation_id(),
+                    )
+                    if type(cancelled) is not WorkCancelResult:
+                        raise TypeError("natural cancel returned the wrong result")
+                    refusal = unaccepted_cancel_speech(cancelled)
+                    if refusal is not None:
+                        await speak_host_refusal(refusal)
+                    elif cancelled.task_id == cancel_target and lease.is_current:
+                        current = self._context.snapshot()
+                        cancelling_tasks = tuple(
+                            task for task in current.active_tasks
+                            if task.task_id == cancel_target
+                        )
+                        # Once the task has ended, its terminal update speaks instead.
+                        if len(cancelling_tasks) == 1:
+                            await acknowledge(
+                                AcceptedCancelInferenceRequest(
+                                    revision=current.revision, messages=current.messages,
+                                    active_tasks=cancelling_tasks,
+                                    terminal_task_count=current.terminal_task_count,
+                                    memory=current.memory, task_id=cancel_target,
+                                    recent_task_results=current.recent_task_results,
+                                ),
+                                stop_when_inactive=False,
                             )
             except asyncio.CancelledError:
                 producer_result.cancel()
@@ -2478,12 +2576,31 @@ class StreamingSpeechLoop:
         return None
 
     @staticmethod
-    def _refuse_host_speech(category: str) -> None:
+    def _refuse_host_speech(category: str, *, kind: str = "task_status") -> None:
         try:
             raise ValueError("host speech refused: " + category)
         finally:
-            print("[host-speech] " + json.dumps({"category": category, "kind": "task_status"},
+            print("[host-speech] " + json.dumps({"category": category, "kind": kind},
                   separators=(",", ":")), flush=True)
+
+    def _natural_cancel_target(self, snapshot: ConversationContextSnapshot) -> str | None:
+        """Freeze the turn's cancel target from the owner and this exact snapshot, or none."""
+        owner = self._task_cancellation
+        if owner is None:
+            return None
+        target = owner.natural_cancel_target()
+        if target is None:
+            return None
+        _validate_task_id(target)
+        if tuple(task.task_id for task in snapshot.active_tasks) != (target,):
+            return None
+        return target
+
+    @staticmethod
+    def _natural_cancel_invocation_id() -> str:
+        invocation_id = "natural_cancel_" + uuid4().hex
+        _validate_identifier(invocation_id, "invocation_id")
+        return invocation_id
 
     @staticmethod
     async def _segments_stream(

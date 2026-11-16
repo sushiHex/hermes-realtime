@@ -26,7 +26,7 @@ import re
 
 # The static superset of tool names any foreground turn advertises. Tests keep it equal
 # to the Codex dynamic tools and a superset of the Ollama work decision kinds.
-ADVERTISED_TOOL_NAMES = frozenset({"start_work", "task_status", "search_knowledge"})
+ADVERTISED_TOOL_NAMES = frozenset({"start_work", "task_status", "search_knowledge", "cancel_work"})
 
 _NAMES = "|".join(sorted(re.escape(name) for name in ADVERTISED_TOOL_NAMES))
 _QUOTE = r"""\\{0,3}["']"""

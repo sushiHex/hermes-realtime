@@ -44,7 +44,9 @@ def _advertised_functions(request):
     return functions
 
 
-@pytest.mark.parametrize("tool", ("cancel_active_work", "cancel_work", "approve_work"))
+# cancel_work is now the host-targeted natural cancel; its unadvertised and argument
+# refusals are in test_natural_cancel_providers.py.
+@pytest.mark.parametrize("tool", ("cancel_active_work", "approve_work"))
 def test_codex_removed_controls_are_not_valid_dynamic_semantics(tool, capsys) -> None:
     inference = provider.CodexAppServerStreamingInference(
         model="gpt-5.6-terra",
@@ -95,7 +97,7 @@ async def test_codex_advertises_start_without_model_cancellation(active: bool) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool", ("cancel_active_work", "cancel_work", "approve_work"))
+@pytest.mark.parametrize("tool", ("cancel_active_work", "approve_work"))
 @pytest.mark.parametrize("arguments", ({}, {"task_id": "task_public"}))
 async def test_codex_model_cancellation_is_refused_before_effect(tool, arguments, capsys) -> None:
     transport = DynamicStartCodexTransport(
@@ -141,7 +143,7 @@ def test_codex_repeated_control_validation_does_not_repeat_failure_evidence(phas
         model="gpt-5.6-terra", effort="low", transport_factory=FakeCodexTransport,
     )
     identity = ("thread_synthetic", "turn_synthetic")
-    arguments = {"tool": "cancel_work", "arguments": {"task_id": "task_public"}}
+    arguments = {"tool": "cancel_active_work", "arguments": {"task_id": "task_public"}}
     with pytest.raises(RuntimeError, match="not allowlisted") as refused:
         inference._dynamic_semantics(arguments, turn_identity=identity)
     if phase == "registered":

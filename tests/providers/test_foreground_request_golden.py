@@ -61,6 +61,7 @@ from hermes_realtime.conversation.context import (
 )
 from hermes_realtime.conversation.knowledge import KnowledgeConsumeResult
 from hermes_realtime.conversation.streaming import (
+    AcceptedCancelInferenceRequest,
     AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
     ConversationPromptUpdate,
@@ -101,6 +102,8 @@ class Cell:
     updates: int = 0
     results: int = 0
     tasks: int = 0
+    # The host froze the one active task as this turn's natural cancel target (#237).
+    cancel: bool = False
     clock: str = "morning"
     # The host.
     handler: int | None = 2048
@@ -191,6 +194,16 @@ def _matrix() -> tuple[Cell, ...]:
         Cell(history=history, results=results)
         for history, results in product(_CONTENT_AXES["history"], _CONTENT_AXES["results"])
     ]
+    # The natural cancel route: offered with one frozen task, then its acknowledgment.
+    # Every other cell offers no target, so none of them may render the route.
+    cells += [
+        replace(anchor, tasks=1, cancel=True)
+        for anchor in _ANCHORS if anchor.purpose == "user"
+    ]
+    cells += [
+        replace(Cell(tasks=1, cancel=True), lookup=lookup) for lookup in _LOOKUPS
+    ]
+    cells += [Cell(purpose="cancel_ack"), Cell(purpose="cancel_ack", handler=None)]
     return tuple(dict.fromkeys(cell for cell in cells if _coherent(cell)))
 
 
@@ -337,6 +350,10 @@ def _request(cell: Cell) -> ConversationContextSnapshot:
             task_id="task_earlier", run_id="deleg_earlier",
             objective="Collect the example weekly notes.",
         )
+    if cell.purpose == "cancel_ack":
+        store.record_task_accepted(
+            task_id=_ACCEPTED_TASK, run_id="deleg_golden", objective=_ACCEPTED_OBJECTIVE,
+        )
     if cell.purpose != "ends_assistant":
         store.record_user_transcript(Transcript(_SAY[cell.say], True))
     if cell.purpose == "ack":
@@ -344,6 +361,18 @@ def _request(cell: Cell) -> ConversationContextSnapshot:
             task_id=_ACCEPTED_TASK, run_id="deleg_golden", objective=_ACCEPTED_OBJECTIVE,
         )
     snapshot = store.snapshot()
+    if cell.purpose == "cancel_ack":
+        return AcceptedCancelInferenceRequest(
+            revision=snapshot.revision,
+            messages=snapshot.messages,
+            active_tasks=tuple(
+                task for task in snapshot.active_tasks if task.task_id == _ACCEPTED_TASK
+            ),
+            terminal_task_count=snapshot.terminal_task_count,
+            memory=snapshot.memory,
+            task_id=_ACCEPTED_TASK,
+            recent_task_results=snapshot.recent_task_results,
+        )
     if cell.purpose == "ack":
         return AcceptedStartInferenceRequest(
             revision=snapshot.revision,
@@ -366,6 +395,7 @@ def _request(cell: Cell) -> ConversationContextSnapshot:
         memory=snapshot.memory,
         recent_task_results=snapshot.recent_task_results,
         updates=_UPDATES[: cell.updates],
+        cancel_offered=cell.cancel,
     )
 
 
@@ -429,7 +459,7 @@ class _Lines:
 async def _ollama_request(cell: Cell) -> dict[str, Any]:
     sent: list[Request] = []
     # A bound adapter answers with one structured decision, except on the acknowledgment.
-    structured = cell.handler is not None and cell.purpose != "ack"
+    structured = cell.handler is not None and cell.purpose not in ("ack", "cancel_ack")
     record: dict[str, object] = (
         {"message": {"content": json.dumps({"kind": "reply", "text": "Okay."})},
          "done": True, "done_reason": "stop"}

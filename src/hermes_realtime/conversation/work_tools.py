@@ -37,8 +37,7 @@ WORK_OBJECTIVE_CONTEXT_POLICY = (
     "required detail is neither supplied nor discoverable from an identified resource, ask "
     "one clarifying question instead of starting work."
 )
-# Offered whenever the provider advertises a work proposal tool.
-WORK_ROUTING_POLICY = (
+_WORK_ROUTING_HEAD = (
     "Read the latest user turn in context. Supplied details continue an unresolved user request "
     "without repetition. Once sufficient, propose work, not promises. Assistant offers, social "
     "acknowledgments, status questions, or failed or completed tasks alone do not request work. "
@@ -46,13 +45,27 @@ WORK_ROUTING_POLICY = (
     "quoted, or negated requests. For unresolved references (our, the pinned, that one), "
     "ask a clarifying question in an ordinary reply before proposing work; objectives never "
     "hold questions. "
-    "For cancellation or approval, direct the user to the controls; "
-    "do not select task_status or propose work. "
+)
+_WORK_ROUTING_TAIL = (
     "If supplied evidence or an available foreground lookup can answer the question, "
     "use it and reply. Otherwise, propose work when the current request needs current external "
     "information, background research, tools, inspection, commands, builds, changes, audits, "
     "verification, or a multi-step briefing. Do not require explicit background-task wording "
     "to propose work. Never claim you lack research or current-information access."
+)
+# Offered whenever the provider advertises a work proposal tool; exactly one of the two,
+# chosen by whether the host offers the cancel route this turn (#317).
+WORK_ROUTING_POLICY = (
+    _WORK_ROUTING_HEAD
+    + "For cancellation or approval, direct the user to the controls; "
+    "do not select task_status or propose work. "
+    + _WORK_ROUTING_TAIL
+)
+WORK_ROUTING_POLICY_WITH_CANCEL = (
+    _WORK_ROUTING_HEAD
+    + "To stop the running task, select cancel_work; for approval, direct the user to the "
+    "controls; for either, do not select task_status or propose work. "
+    + _WORK_ROUTING_TAIL
 )
 
 _MAX_REASON_CHARS = 1024
@@ -303,6 +316,23 @@ class ConversationWorkControlSurface:
     @property
     def can_cancel_work(self) -> bool:
         return bool(self._pending_starts) or bool(self._context.snapshot().active_tasks)
+
+    def natural_cancel_target(self) -> str | None:
+        """The one task a natural cancel may name, read synchronously; otherwise ``None``.
+
+        Only open control with exactly one running task, no start awaiting acknowledgment and
+        no cancellation already requested has a target. The caller freezes the answer when the
+        user's final input is admitted; it is never re-resolved when the model selects.
+        """
+
+        if self._health is not WorkControlHealth.OPEN or self._pending_starts:
+            return None
+        active_tasks = self._context.snapshot().active_tasks
+        if len(active_tasks) != 1:
+            return None
+        if self.task_status() != TaskStatusSnapshot(active=1):
+            return None
+        return active_tasks[0].task_id
 
     @staticmethod
     def _logical_work_count(
