@@ -628,6 +628,8 @@ class StreamingSpeechLoop:
         """Run one final transcript until its incremental speech is delivered."""
 
         self._validate_transcript(transcript)
+        # Final-input admission: freeze before the first suspension.
+        cancel_target = self.freeze_natural_cancel_target()
         self._priority_admissions += 1
         try:
             await self._run_turn(
@@ -636,9 +638,24 @@ class StreamingSpeechLoop:
                 announcement=None,
                 updates=(),
                 update_operation=None,
+                cancel_target=cancel_target,
             )
         finally:
             self._priority_admissions -= 1
+
+    def freeze_natural_cancel_target(self) -> str | None:
+        """Read the one natural cancel target at final-input admission; never later.
+
+        The caller passes the answer, unchanged, to the turn it admits. The producer only
+        checks it again; it never resolves a target of its own.
+        """
+        owner = self._task_cancellation
+        if owner is None:
+            return None
+        target = owner.natural_cancel_target()
+        if target is not None:
+            _validate_task_id(target)
+        return target
 
     async def record_user_input(self, transcript: Transcript) -> None:
         """Record one final user input that starts no turn, such as an explicit command.
@@ -748,12 +765,15 @@ class StreamingSpeechLoop:
         updates: tuple[UpdateDecision, ...],
         evidence_lease: EvidenceTurnLease | None = None,
         *, typed_input: tuple[int, int] | None = None,
+        cancel_target: str | None = None,
     ) -> None:
         self._require_update_authority(authority)
         self._require_update_operation(operation, turn_id)
         if evidence_lease is not None and type(evidence_lease) is not EvidenceTurnLease:
             raise TypeError("evidence_lease must be exact or None")
         self._validate_transcript(transcript)
+        if cancel_target is not None:
+            _validate_task_id(cancel_target)
         prompt_updates = self._prompt_updates(updates)
         self._priority_admissions += 1
         try:
@@ -765,6 +785,7 @@ class StreamingSpeechLoop:
                 update_operation=operation,
                 evidence_lease=evidence_lease,
                 typed_input=typed_input,
+                cancel_target=cancel_target,
                 replay_identity=(
                     None
                     if evidence_lease is None
@@ -957,7 +978,10 @@ class StreamingSpeechLoop:
         evidence_lease: EvidenceTurnLease | None = None,
         yield_to_live_speech: bool = False,
         typed_input: tuple[int, int] | None = None,
+        cancel_target: str | None = None,
     ) -> bool:
+        # The natural cancel target frozen at final-input admission, if any.
+        intake_cancel_target = cancel_target if transcript is not None else None
         if sum(value is not None for value in (transcript, announcement, segments)) != 1:
             raise ValueError("exactly one turn input must be present")
 
@@ -1033,9 +1057,12 @@ class StreamingSpeechLoop:
                 else:
                     self._context.record_user_transcript(transcript)
                     source_snapshot = self._context.snapshot()
-                    # Frozen here, with no suspension since the input was recorded; the
-                    # selection below cancels this task or nothing.
-                    cancel_target = self._natural_cancel_target(source_snapshot)
+                    # The target was frozen at final-input admission. Here it is only
+                    # checked against this snapshot; the selection below cancels exactly
+                    # it or nothing, and nothing is resolved again.
+                    cancel_target = self._natural_cancel_target(
+                        source_snapshot, intake_cancel_target,
+                    )
                     snapshot = ConversationInferenceRequest(
                         revision=source_snapshot.revision,
                         messages=source_snapshot.messages,
@@ -2586,17 +2613,23 @@ class StreamingSpeechLoop:
             print("[host-speech] " + json.dumps({"category": category, "kind": kind},
                   separators=(",", ":")), flush=True)
 
-    def _natural_cancel_target(self, snapshot: ConversationContextSnapshot) -> str | None:
-        """Freeze the turn's cancel target from the owner and this exact snapshot, or none."""
+    def _natural_cancel_target(
+        self, snapshot: ConversationContextSnapshot, frozen: str | None,
+    ) -> str | None:
+        """Offer the target frozen at admission only if it is still this snapshot's one task.
+
+        Never resolves a target: an owner that now names a different task, or none, means
+        no route for this turn.
+        """
         owner = self._task_cancellation
-        if owner is None:
+        if owner is None or frozen is None:
             return None
-        target = owner.natural_cancel_target()
-        if target is None:
+        _validate_task_id(frozen)
+        if owner.natural_cancel_target() != frozen:
             return None
-        _validate_task_id(target)
-        if tuple(task.task_id for task in snapshot.active_tasks) != (target,):
+        if tuple(task.task_id for task in snapshot.active_tasks) != (frozen,):
             return None
+        target = frozen
         # An answer to a heard proposal readback ("no, cancel that") is about the
         # proposal, not the running task.
         messages = snapshot.messages

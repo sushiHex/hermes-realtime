@@ -599,6 +599,153 @@ async def test_a_superseded_turn_never_reaches_the_cancellation_owner(when) -> N
         await loop.close()
 
 
+class _SupersedeOnClose:
+    """One cancel selection; the lease is superseded inside the loop's aclose await."""
+
+    def __init__(self, supersede) -> None:
+        self._supersede = supersede
+        self._sent = False
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._sent:
+            raise StopAsyncIteration
+        self._sent = True
+        return HostCancelRequest()
+
+    async def aclose(self) -> None:
+        self.closed = True
+        self._supersede()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_superseded_while_its_stream_closes_never_reaches_the_owner() -> None:
+    # The selection is observed while the lease is current; the lease is superseded
+    # only inside the stream's aclose. Mutation: drop only the lease predicate on the
+    # host call after the stream closes.
+    context = ConversationContextStore()
+    _accept(context, "a")
+    owner = _Owner("task_a")
+    foreground = ForegroundTurnCoordinator()
+    streams: list[_SupersedeOnClose] = []
+
+    def supersede() -> None:
+        foreground._is_current = lambda _lease: False  # type: ignore[method-assign]
+
+    class CloseInference:
+        def stream(self, snapshot, *, turn_id):
+            assert snapshot.cancel_offered is True
+            stream = _SupersedeOnClose(supersede)
+            streams.append(stream)
+            return stream
+
+        async def cancel(self, turn_id):
+            pass
+
+    loop, synth = _loop(context, owner, CloseInference(), foreground=foreground)
+    try:
+        await _respond(loop)
+        assert [stream.closed for stream in streams] == [True]
+        assert owner.cancels == [] and synth.texts == []
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_target_is_frozen_at_final_admission_not_when_the_producer_runs() -> None:
+    # The final is admitted while A is the one task; the turn then waits before its
+    # producer runs. A ends and B starts in that wait. Mutation: freeze the target when
+    # the producer runs (B gets cancelled).
+    context = ConversationContextStore()
+    _accept(context, "a")
+    surface, controller, events = _surface(context)
+    inference = Inference()
+    loop, synth = _loop(context, surface, inference)
+    try:
+        await loop._lifecycle_lock.acquire()
+        turn = asyncio.create_task(_respond(loop))
+        async with asyncio.timeout(1):
+            while not getattr(loop._lifecycle_lock, "_waiters", None):
+                await asyncio.sleep(0)
+        context.record_task_completed(
+            task_id="task_a", run_id="deleg_private_a",
+            result_status="completed", result_text="Done.",
+        )
+        _accept(context, "b")
+        loop._lifecycle_lock.release()
+        with pytest.raises(ValueError, match="unadvertised_cancel"):
+            async with asyncio.timeout(1):
+                await turn
+        assert inference.calls[0].cancel_offered is False
+        assert controller.cancellations == [] and events == []
+        assert [task.task_id for task in context.snapshot().active_tasks] == ["task_b"]
+        assert synth.texts == []
+    finally:
+        if loop._lifecycle_lock.locked():
+            loop._lifecycle_lock.release()
+        await loop.close()
+        await surface.close()
+
+
+def _executor(context, surface, inference):
+    from hermes_realtime.conversation import ConversationUpdateExecutor
+    from hermes_realtime.conversation.tasks import TaskTerminalOutcome
+    from tests.conversation.test_actions import CompletionSource, director_for_test
+
+    loop, synth = _loop(context, surface, inference)
+    director = director_for_test(context, CompletionSource(TaskTerminalOutcome(
+        task_id="task_unrelated", status="completed", summary="Unrelated.",
+    )))
+    executor = ConversationUpdateExecutor(director=director, speech=loop)
+    executor.start()
+    return executor, loop, synth
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("swap", [False, True], ids=["one_task", "a_ends_b_starts"])
+async def test_executor_freezes_at_final_admission(swap: bool) -> None:
+    # The update executor's response path admits the final and only later runs the
+    # producer. Mutations: freeze when the producer runs (swap: B gets cancelled), or
+    # drop the intake freeze (one_task: the route is never offered).
+    context = ConversationContextStore()
+    _accept(context, "a")
+    surface, controller, _events = _surface(context)
+    inference = Inference()
+    executor, loop, synth = _executor(context, surface, inference)
+    try:
+        await loop._lifecycle_lock.acquire()
+        turn = asyncio.create_task(
+            executor.respond("turn_stop", Transcript(text="Stop that.", final=True))
+        )
+        async with asyncio.timeout(1):
+            while not getattr(loop._lifecycle_lock, "_waiters", None):
+                await asyncio.sleep(0)
+        if swap:
+            context.record_task_completed(
+                task_id="task_a", run_id="deleg_private_a",
+                result_status="completed", result_text="Done.",
+            )
+            _accept(context, "b")
+        loop._lifecycle_lock.release()
+        async with asyncio.timeout(1):
+            await asyncio.gather(turn, return_exceptions=True)
+        if swap:
+            assert controller.cancellations == []
+            assert inference.calls[0].cancel_offered is False
+            assert [task.task_id for task in context.snapshot().active_tasks] == ["task_b"]
+        else:
+            assert controller.cancellations == [("task_a", "user requested task cancellation")]
+            assert synth.texts == [_ACK]
+    finally:
+        if loop._lifecycle_lock.locked():
+            loop._lifecycle_lock.release()
+        await executor.close()
+        await surface.close()
+
+
 def test_refusal_sentence_is_chosen_by_typed_category_only() -> None:
     assert unaccepted_cancel_speech(
         WorkCancelResult(accepted=True, state="cancelling", task_id="task_a")

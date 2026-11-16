@@ -356,7 +356,10 @@ The host decides whether the route exists and which task it names, at one instan
 when the user's final input is admitted, before inference. It offers the route only
 when work control is open, exactly one task is running in both the context and the
 controller, no start awaits acknowledgment, and no cancellation is already requested.
-It freezes that task for the turn. Zero tasks, several tasks or a pending start offer
+It freezes that task for the turn, with no suspension since the final was admitted, and
+carries it unchanged through cleanup and inference. When the turn's request is built,
+the frozen task must still be the snapshot's one task and the owner's current target;
+otherwise the turn offers no route. Nothing is resolved again. Zero tasks, several tasks or a pending start offer
 no route, and the instructions keep directing the user to the task card's **Cancel**
 control. The route and that direction are never rendered together (#317). Readiness,
 announcements, acknowledgments, assistant-ending turns and other non-user turns never
