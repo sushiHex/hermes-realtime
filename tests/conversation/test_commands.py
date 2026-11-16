@@ -66,7 +66,7 @@ def _probe(context: ConversationContextStore | None = None) -> TaskControllerPro
     )
 
 
-def _spoken_router(context: ConversationContextStore, *, record=None):
+def _surface_router(context: ConversationContextStore, *, record=None):
     controller = _probe(context)
     events = []
     surface = ConversationWorkControlSurface(
@@ -92,21 +92,21 @@ async def _settle_surface(router: ConversationTaskCommandRouter) -> None:
 
 
 @pytest.mark.asyncio
-async def test_spoken_start_uses_existing_acknowledged_work_surface() -> None:
-    router, controller, events = _spoken_router(ConversationContextStore())
-    assert await router.route("Start task Inspect release evidence.") is True
+async def test_typed_start_uses_existing_acknowledged_work_surface() -> None:
+    router, controller, events = _surface_router(ConversationContextStore())
+    assert await router.route("Task: Inspect release evidence.") is True
     await _settle_surface(router)
     assert controller.dispatches[0][0] == "Inspect release evidence."
     assert events == [("task_state", {"status": "active", "taskId": "task_release_check"})]
 
 
 @pytest.mark.asyncio
-async def test_spoken_start_emits_no_active_state_before_accepted_ack() -> None:
-    router, controller, events = _spoken_router(ConversationContextStore())
+async def test_typed_start_emits_no_active_state_before_accepted_ack() -> None:
+    router, controller, events = _surface_router(ConversationContextStore())
     controller.dispatch_outcome = TaskDispatchOutcome(
         task_id="task_release_check", accepted=False, reason="dispatch refused"
     )
-    assert await router.route("start task Inspect release evidence") is True
+    assert await router.route("task: Inspect release evidence") is True
     await _settle_surface(router)
     assert events == [
         (
@@ -121,110 +121,33 @@ async def test_spoken_start_emits_no_active_state_before_accepted_ack() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", ("start task", "Start task.", "start task!", "start task?"))
-async def test_spoken_start_without_objective_returns_fixed_guidance(text: str) -> None:
-    router, controller, events = _spoken_router(ConversationContextStore())
-    assert await router.route(text) is True
+async def test_typed_invalid_command_emits_the_content_free_refusal_marker(capsys) -> None:
+    router, controller, events = _surface_router(ConversationContextStore())
+    assert await router.route("task:") is True
     assert controller.dispatches == []
     assert events == [
         (
             "task_state",
-            {
-                "status": "rejected",
-                "taskId": None,
-                "reason": "Provide an objective after Start task.",
-            },
-        )
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("text", ("cancel task", "Cancel task.", "cancel task!", "cancel task?"))
-async def test_spoken_cancel_freezes_the_sole_public_task(text: str) -> None:
-    context = ConversationContextStore()
-    context.record_task_accepted(
-        task_id="task_release_check", run_id="deleg_fixture", objective="Inspect release evidence"
-    )
-    router, controller, events = _spoken_router(context)
-    assert await router.route(text) is True
-    await _settle_surface(router)
-    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
-    assert events == [("task_state", {"status": "cancelling", "taskId": "task_release_check"})]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("count", (0, 2))
-async def test_spoken_cancel_refuses_missing_or_ambiguous_identity(count: int, capsys) -> None:
-    context = ConversationContextStore()
-    for index in range(count):
-        context.record_task_accepted(
-            task_id=f"task_fixture_{index}",
-            run_id=f"deleg_fixture_{index}",
-            objective=f"Work {index}",
-        )
-    router, controller, events = _spoken_router(context)
-    assert await router.route("cancel task") is True
-    assert controller.cancellations == []
-    assert events == [
-        (
-            "task_state",
-            {
-                "status": "rejected",
-                "taskId": None,
-                "reason": "No active task to cancel."
-                if count == 0
-                else "Several tasks are active. Use Cancel on the task you want to stop.",
-            },
+            {"status": "rejected", "taskId": None, "reason": "invalid explicit task command"},
         )
     ]
     marker = capsys.readouterr().out
     assert marker.startswith("[task-command-refusal] ")
     assert json.loads(marker.removeprefix("[task-command-refusal] ")) == {
         "kind": "explicit-command",
-        "category": "no-active-task" if count == 0 else "ambiguous-task",
-        "candidate_count": count,
+        "category": "invalid-command",
     }
 
 
 @pytest.mark.asyncio
-async def test_spoken_cancel_never_retargets_after_recording_await() -> None:
-    context = ConversationContextStore()
-    context.record_task_accepted(
-        task_id="task_release_check", run_id="deleg_fixture", objective="Original work"
-    )
-
-    async def record(_text: str) -> None:
-        await asyncio.sleep(0)
-        context.record_task_completed(task_id="task_release_check", run_id="deleg_fixture")
-        context.record_task_accepted(
-            task_id="task_replacement", run_id="deleg_replacement", objective="Replacement work"
-        )
-
-    router, controller, events = _spoken_router(context, record=record)
-    assert await router.route("cancel task") is True
-    await _settle_surface(router)
-    assert controller.cancellations == []
-    assert events == [
-        (
-            "task_state",
-            {
-                "status": "rejected",
-                "taskId": "task_release_check",
-                "reason": "task is not active",
-            },
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_spoken_exact_identity_cancels_only_named_task_among_several() -> None:
+async def test_typed_exact_identity_cancels_only_named_task_among_several() -> None:
     context = ConversationContextStore()
     for task_id in ("task_release_check", "task_other"):
         context.record_task_accepted(
             task_id=task_id, run_id=f"deleg_{task_id}", objective=f"Work for {task_id}"
         )
-    router, controller, _events = _spoken_router(context)
-    assert await router.route("cancel task task_release_check") is True
+    router, controller, _events = _surface_router(context)
+    assert await router.route("cancel task: task_release_check") is True
     await _settle_surface(router)
     assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
     assert tuple(task.task_id for task in context.snapshot().active_tasks) == (
@@ -245,13 +168,59 @@ async def test_spoken_exact_identity_cancels_only_named_task_among_several() -> 
         "start tasks Inspect release evidence",
         "cancel tasks",
         "start tasking Inspect release evidence",
+        # The removed spoken grammar, typed: ordinary text, not a command.
+        "start task Inspect release evidence",
+        "Start task.",
+        "cancel task",
+        "Cancel task?",
+        "cancel task task_release_check",
     ),
 )
-async def test_spoken_command_grammar_does_not_infer_authority(text: str) -> None:
-    router, controller, _events = _spoken_router(ConversationContextStore())
+async def test_text_without_a_typed_command_prefix_grants_no_authority(text: str) -> None:
+    context = ConversationContextStore()
+    context.record_task_accepted(
+        task_id="task_release_check", run_id="deleg_fixture", objective="Inspect release evidence"
+    )
+    router, controller, events = _surface_router(context)
     assert await router.route(text) is False
+    await _settle_surface(router)
     assert controller.dispatches == []
     assert controller.cancellations == []
+    assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    (
+        "task: Inspect release evidence",
+        "cancel task: task_release_check",
+        "start task Inspect release evidence",
+        "cancel task",
+    ),
+)
+async def test_spoken_input_never_reaches_the_command_grammar(text: str) -> None:
+    context = ConversationContextStore()
+    context.record_task_accepted(
+        task_id="task_release_check", run_id="deleg_fixture", objective="Inspect release evidence"
+    )
+    router, controller, events = _surface_router(context)
+    assert await router.route_spoken(text) is False
+    await _settle_surface(router)
+    assert controller.dispatches == []
+    assert controller.cancellations == []
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_spoken_input_declines_its_authority_to_an_ordinary_turn() -> None:
+    owner, authority = _lifecycle_owner()
+    router, controller, _events = _surface_router(ConversationContextStore())
+    router._lifecycle_owner = owner.conversation_authority
+    result = await router.route_spoken("task: Inspect release evidence", authority)
+    assert result.outcome is CommandRoutingOutcome.NOT_COMMAND
+    assert result.user_turn_authority is not None
+    assert controller.dispatches == []
 
 
 def _lifecycle_owner() -> tuple[EvidenceLifecycleOwner, object]:
@@ -568,13 +537,13 @@ async def test_shared_work_surface_cancel_preserves_evidence_outcome(
 async def test_closed_surface_command_is_rejected_with_fixed_guidance_and_no_turn() -> None:
     owner, authority = _lifecycle_owner()
     context = ConversationContextStore()
-    router, controller, events = _spoken_router(context)
+    router, controller, events = _surface_router(context)
     surface = router._surface
     assert isinstance(surface, ConversationWorkControlSurface)
     await surface.close()
     router._lifecycle_owner = owner.conversation_authority
     router._on_command_accepted = lambda _command: CommandDisposition.ADMITTED
-    result = await router.route("start task Synthetic work", authority)
+    result = await router.route("task: Synthetic work", authority)
     assert result.outcome is CommandRoutingOutcome.REJECTED
     assert result.user_turn_authority is None
     assert controller.dispatches == []
@@ -588,12 +557,12 @@ async def test_closed_surface_command_is_rejected_with_fixed_guidance_and_no_tur
 
 @pytest.mark.asyncio
 async def test_surface_command_admission_rejects_wrong_runtime_type() -> None:
-    router, _, _ = _spoken_router(ConversationContextStore())
+    router, _, _ = _surface_router(ConversationContextStore())
     async def wrong(**_kwargs):
         return "admitted"
     router._surface.submit_start_command = wrong
     with pytest.raises(TypeError, match="wrong command admission"):
-        await router.route("start task Synthetic work")
+        await router.route("task: Synthetic work")
 
 
 @pytest.mark.parametrize("missing", ("submit_start_command", "submit_cancel_command"))
@@ -764,8 +733,6 @@ def _ordered_probe(order: list[str]) -> _OrderedControllerProbe:
     ("text", "action"),
     [
         pytest.param("task: Inspect the release evidence", "dispatch", id="task"),
-        pytest.param("start task Inspect the release evidence", "dispatch", id="spoken-start"),
-        pytest.param("cancel task", None, id="spoken-no-context"),
         pytest.param("  Task: padded utterance  ", "dispatch", id="exact-utterance"),
         pytest.param("cancel task: task_release_check", "cancel", id="cancel"),
         pytest.param("task:", None, id="invalid-task"),
@@ -849,7 +816,6 @@ async def test_surface_commands_are_recorded_before_the_work_surface_acts() -> N
     "text",
     [
         pytest.param("task: " + "x" * 12, id="over-the-context-item-bound"),
-        pytest.param("start task " + "x" * 12, id="spoken-context-item-bound"),
         pytest.param("cancel task: task_deleg_private", id="private-run-token"),
         pytest.param("task: lone \ud800", id="not-utf8-encodable"),
     ],

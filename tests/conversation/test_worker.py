@@ -9,6 +9,10 @@ import pytest
 
 from hermes_realtime.conversation import ConversationUpdateExecutor
 from hermes_realtime.conversation.ingress import BoundedPcmIngress, IngressRecord
+from hermes_realtime.conversation.task_proposals import (
+    ConversationTaskProposals,
+    HostTaskProposalRequest,
+)
 from hermes_realtime.conversation.telemetry import UtteranceTicket
 from hermes_realtime.conversation.worker import (
     ConversationSessionWorker,
@@ -275,6 +279,8 @@ class CommandRouterProbe:
         self.texts.append(text)
         return self.handled
 
+    route_spoken = route
+
 
 class EvidenceCommandRouterProbe:
     def __init__(self, owner: EvidenceLifecycleOwner) -> None:
@@ -295,6 +301,8 @@ class EvidenceCommandRouterProbe:
             command_disposition=None,
             user_turn_authority=user_authority,
         )
+
+    route_spoken = route
 
 
 def action_executor_probe() -> tuple[
@@ -2943,22 +2951,32 @@ async def test_explicit_task_command_bypasses_foreground_inference() -> None:
     await worker.close()
 
 
+def _confirmable_proposal(
+    surface: Any, participant_identity: str, generation: int
+) -> ConversationTaskProposals:
+    """A pending proposal whose readback was fully delivered, awaiting a spoken yes."""
+
+    proposals = ConversationTaskProposals(
+        surface=surface, observer=lambda *_: None, speech_projection=lambda text: text
+    )
+    proposals.bind(participant_identity, generation)
+    proposal = proposals.offer(HostTaskProposalRequest("Synthetic work"))
+    proposals.complete_readback(proposal, proposal.readback, queued_chunks=1, confirmed_chunks=1)
+    return proposals
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command_kind", ("start", "cancel"))
-async def test_held_task_acknowledgment_does_not_hold_pcm_consumption(command_kind: str) -> None:
+async def test_held_spoken_confirmation_acknowledgment_does_not_hold_pcm_consumption() -> None:
+    """Speech reaches work only by confirming a proposal; its held ack must not stall PCM."""
+
     from hermes_realtime.conversation import (
         ConversationContextStore,
         ConversationTaskCommandRouter,
         ConversationWorkControlSurface,
-        TaskCancelOutcome,
         TaskDispatchOutcome,
     )
 
     context = ConversationContextStore()
-    if command_kind == "cancel":
-        context.record_task_accepted(
-            task_id="task_fixture", run_id="deleg_fixture", objective="Synthetic work"
-        )
     acknowledgment_started, release_acknowledgment = asyncio.Event(), asyncio.Event()
     projected = []
 
@@ -2972,13 +2990,8 @@ async def test_held_task_acknowledgment_does_not_hold_pcm_consumption(command_ki
             )
             return TaskDispatchOutcome(task_id="task_fixture", accepted=True)
 
-        async def request_cancel(
-            self, task_id: str, *, reason: str | None = None
-        ) -> TaskCancelOutcome:
-            del reason
-            acknowledgment_started.set()
-            await release_acknowledgment.wait()
-            return TaskCancelOutcome(task_id=task_id, accepted=True)
+        async def request_cancel(self, task_id: str, *, reason: str | None = None) -> object:
+            raise AssertionError("a spoken confirmation never cancels")
 
     class Transcriber:
         push_calls = 0
@@ -2989,10 +3002,7 @@ async def test_held_task_acknowledgment_does_not_hold_pcm_consumption(command_ki
             return ()
 
         async def finish_utterance(self) -> Transcript:
-            return Transcript(
-                text="start task Synthetic work" if command_kind == "start" else "cancel task",
-                final=True,
-            )
+            return Transcript(text="yes", final=True)
 
         async def cancel(self) -> None:
             return None
@@ -3003,12 +3013,16 @@ async def test_held_task_acknowledgment_does_not_hold_pcm_consumption(command_ki
         observer=lambda kind, data: projected.append((kind, data)),
         reserve_observer_capacity=lambda: None,
     )
+    proposals = _confirmable_proposal(surface, "browser_user", 1)
     router = ConversationTaskCommandRouter(
         surface=surface,
         observer=lambda kind, data: projected.append((kind, data)),
         reserve_observer_capacity=lambda: None,
+        task_proposals=proposals,
     )
     executor, _, responses = action_executor_probe()
+    # A clean capture needs no foreground speech to interrupt.
+    executor._speech.foreground_active = False
     transcriber = Transcriber()
     worker = ConversationSessionWorker(
         participant_identity="browser_user",
@@ -3019,6 +3033,8 @@ async def test_held_task_acknowledgment_does_not_hold_pcm_consumption(command_ki
         stt=transcriber,
         actions=executor,
         command_router=router,
+        task_proposals=proposals,
+        echo_guard=ScriptedEchoGuard(*([False] * 8)),
     )
     worker.start()
     frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
@@ -3040,20 +3056,14 @@ async def test_held_task_acknowledgment_does_not_hold_pcm_consumption(command_ki
             await subsequent
         await surface.close()
         await worker.close()
-    assert projected == [
-        (
-            "task_state",
-            {
-                "status": "active" if command_kind == "start" else "cancelling",
-                "taskId": "task_fixture",
-            },
-        )
-    ]
+    assert projected == [("task_state", {"status": "active", "taskId": "task_fixture"})]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("input_path", ("microphone", "typed"))
-@pytest.mark.parametrize("command_kind", ("start", "cancel"))
+@pytest.mark.parametrize(
+    ("command_kind", "input_path"),
+    (("start", "microphone"), ("start", "typed"), ("cancel", "typed")),
+)
 async def test_held_command_acknowledgment_does_not_stall_source_pcm_ingress(
     command_kind: str,
     input_path: str,
@@ -3063,7 +3073,8 @@ async def test_held_command_acknowledgment_does_not_stall_source_pcm_ingress(
 
     Drives the real ``run_source`` pump and its ``BoundedPcmIngress``, so a command
     acknowledgment awaited under ``_audio_lock`` (on either input path) would leave the
-    following frames queued until the 2 s age bound faults the binding.
+    following frames queued until the 2 s age bound faults the binding. Speech reaches
+    work only by confirming a pending proposal, so the microphone path says "yes".
     """
 
     from hermes_realtime.conversation import (
@@ -3079,7 +3090,13 @@ async def test_held_command_acknowledgment_does_not_stall_source_pcm_ingress(
         context.record_task_accepted(
             task_id="task_fixture", run_id="deleg_fixture", objective="Synthetic work"
         )
-    command_text = "start task Synthetic work" if command_kind == "start" else "cancel task"
+    command_text = (
+        "yes"
+        if input_path == "microphone"
+        else "task: Synthetic work"
+        if command_kind == "start"
+        else "cancel task: task_fixture"
+    )
     acknowledgment_started, release_acknowledgment = asyncio.Event(), asyncio.Event()
     projected: list[tuple[str, Any]] = []
 
@@ -3144,11 +3161,6 @@ async def test_held_command_acknowledgment_does_not_stall_source_pcm_ingress(
         observer=lambda kind, data: projected.append((kind, data)),
         reserve_observer_capacity=lambda: None,
     )
-    router = ConversationTaskCommandRouter(
-        surface=surface,
-        observer=lambda kind, data: projected.append((kind, data)),
-        reserve_observer_capacity=lambda: None,
-    )
     command_activities = (
         (VoiceActivity.SPEECH_STARTED, VoiceActivity.SPEECH_ENDED)
         if input_path == "microphone"
@@ -3166,6 +3178,17 @@ async def test_held_command_acknowledgment_does_not_stall_source_pcm_ingress(
         generation: int,
         actions: ConversationUpdateExecutor,
     ) -> ConversationSessionWorker:
+        proposals = (
+            _confirmable_proposal(surface, participant_identity, generation)
+            if input_path == "microphone"
+            else None
+        )
+        router = ConversationTaskCommandRouter(
+            surface=surface,
+            observer=lambda kind, data: projected.append((kind, data)),
+            reserve_observer_capacity=lambda: None,
+            task_proposals=proposals,
+        )
         return ConversationSessionWorker(
             participant_identity=participant_identity,
             session_generation=generation,
@@ -3173,9 +3196,13 @@ async def test_held_command_acknowledgment_does_not_stall_source_pcm_ingress(
             stt=transcriber,
             actions=actions,
             command_router=router,
+            task_proposals=proposals,
+            echo_guard=ScriptedEchoGuard(*([False] * 16)) if proposals is not None else None,
         )
 
     executor, _, responses = action_executor_probe()
+    # A clean spoken confirmation capture needs no foreground speech to interrupt.
+    executor._speech.foreground_active = False
     worker = ReconnectSafeConversationWorker(actions=executor, binding_factory=binding_factory)
     generation = await worker.bind("browser_user")
     frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)

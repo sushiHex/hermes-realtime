@@ -26,8 +26,8 @@ from .work_tools import WORK_CONTROL_UNAVAILABLE_NOTICE, WorkCommandAdmission
 
 _COMMAND_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,110}\Z")
 _MAX_OBJECTIVE_CHARS = 1024
-_SPOKEN_START = re.compile(r"start task(?:\s+(.*)|[.!?])?\Z", re.IGNORECASE | re.DOTALL)
-_SPOKEN_CANCEL = re.compile(r"cancel task[.!?]?\Z", re.IGNORECASE)
+_START_PREFIX = "task:"
+_CANCEL_PREFIX = "cancel task:"
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
 _CommandAcceptedHook = Callable[[CommandAdmissionAuthorityV1], CommandDisposition]
@@ -48,9 +48,6 @@ class _WorkControlSurface(Protocol):
     @property
     def max_objective_chars(self) -> int: ...
 
-    @property
-    def active_task_ids(self) -> tuple[str, ...]: ...
-
     async def submit_start_command(
         self,
         *,
@@ -70,7 +67,10 @@ class _WorkControlSurface(Protocol):
 class ConversationTaskCommandRouter:
     """Consume only explicit task commands before foreground inference.
 
-    A command starts no turn, so ``record_user_input`` records its exact text as
+    Commands are typed bytes; speech is always a turn. ``route`` admits a typed
+    final to the command grammar. ``route_spoken`` admits a microphone final and
+    never reaches that grammar: only a pending proposal confirmation can consume
+    it. A command starts no turn, so ``record_user_input`` records its exact text as
     the user row before the command acts; every other final input becomes a
     user row through the turn it starts. ``validate_user_input`` is the store's
     pure check: only its refusal makes a command invalid. A recording failure
@@ -163,59 +163,22 @@ class ConversationTaskCommandRouter:
         text: str,
         authority: FinalInputAuthorityV1 | None = None,
     ) -> bool | CommandRoutingResultV1:
-        """Route one explicit command and return whether it was consumed."""
+        """Route one typed final: a proposal confirmation, else the command grammar."""
 
-        if type(text) is not str:
-            raise TypeError("command text must be an exact built-in string")
-        proposals = self._task_proposals
-        if proposals is not None and proposals.has_pending:
-            confirmation = proposals.confirmation_target(text)
-            if confirmation is not None:
-                if not await self._recorded(text):
-                    return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
-                admission = await proposals.consume_input(text, expected_proposal=confirmation)
-                return self._surface_admission_result(admission, authority)
-            proposals.intervening_input()
+        confirmed = await self._route_confirmation(text, authority)
+        if confirmed is not None:
+            return confirmed
         stripped = text.strip()
         folded = stripped.casefold()
-        spoken_start = _SPOKEN_START.fullmatch(stripped)
-        spoken_cancel = _SPOKEN_CANCEL.fullmatch(stripped) is not None
-        start_command = folded.startswith("task:") or spoken_start is not None
-        cancel_command = folded.startswith(("cancel task:", "cancel task ")) or spoken_cancel
-        # Freeze before even the history recording await. Never resolve a later
-        # active task after the original work has finished or been replaced.
-        candidates = (
-            self._surface.active_task_ids if spoken_cancel and self._surface is not None else ()
-        )
-        task_id = candidates[0] if len(candidates) == 1 else None
+        start_command = folded.startswith(_START_PREFIX)
+        cancel_command = folded.startswith(_CANCEL_PREFIX)
         if (start_command or cancel_command) and not await self._recorded(text):
             self._publish_invalid()
             return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
-        if spoken_cancel and task_id is None:
-            self._publish_invalid(
-                reason=(
-                    "No active task to cancel."
-                    if not candidates
-                    else "Several tasks are active. Use Cancel on the task you want to stop."
-                ),
-                category="no-active-task" if not candidates else "ambiguous-task",
-                candidate_count=len(candidates),
-            )
-            return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.REJECTED)
         if start_command:
-            objective = (
-                (spoken_start.group(1) or "").strip()
-                if spoken_start is not None
-                else stripped[len("task:") :].strip()
-            )
+            objective = stripped[len(_START_PREFIX) :].strip()
             if not self._valid_objective(objective):
-                self._publish_invalid(
-                    reason=(
-                        "Provide an objective after Start task."
-                        if spoken_start is not None and not objective
-                        else "invalid explicit task command"
-                    )
-                )
+                self._publish_invalid()
                 return self._closed_nonaccepted_result(
                     authority,
                     CommandRoutingOutcome.INVALID,
@@ -278,11 +241,7 @@ class ConversationTaskCommandRouter:
                 )
             return True
         if cancel_command:
-            if not spoken_cancel:
-                prefix = "cancel task:" if folded.startswith("cancel task:") else "cancel task "
-                task_id = stripped[len(prefix) :].strip()
-            if task_id is None:
-                raise RuntimeError("explicit cancellation has no frozen task identity")
+            task_id = stripped[len(_CANCEL_PREFIX) :].strip()
             if _TASK_ID.fullmatch(task_id) is None or _PRIVATE_AUTHORITY.search(task_id):
                 self._publish_invalid()
                 return self._closed_nonaccepted_result(
@@ -340,6 +299,56 @@ class ConversationTaskCommandRouter:
                 authority,
                 CommandRoutingOutcome.REJECTED,
             )
+        return self._not_command_result(authority)
+
+    @overload
+    async def route_spoken(self, text: str) -> bool: ...
+
+    @overload
+    async def route_spoken(self, text: str, authority: None) -> bool: ...
+
+    @overload
+    async def route_spoken(
+        self,
+        text: str,
+        authority: FinalInputAuthorityV1,
+    ) -> CommandRoutingResultV1: ...
+
+    async def route_spoken(
+        self,
+        text: str,
+        authority: FinalInputAuthorityV1 | None = None,
+    ) -> bool | CommandRoutingResultV1:
+        """Route one microphone final: a proposal confirmation, else an ordinary turn."""
+
+        confirmed = await self._route_confirmation(text, authority)
+        return self._not_command_result(authority) if confirmed is None else confirmed
+
+    async def _route_confirmation(
+        self,
+        text: str,
+        authority: FinalInputAuthorityV1 | None,
+    ) -> bool | CommandRoutingResultV1 | None:
+        """Consume a pending proposal confirmation; None when the input is not one."""
+
+        if type(text) is not str:
+            raise TypeError("command text must be an exact built-in string")
+        proposals = self._task_proposals
+        if proposals is None or not proposals.has_pending:
+            return None
+        confirmation = proposals.confirmation_target(text)
+        if confirmation is None:
+            proposals.intervening_input()
+            return None
+        if not await self._recorded(text):
+            return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
+        admission = await proposals.consume_input(text, expected_proposal=confirmation)
+        return self._surface_admission_result(admission, authority)
+
+    def _not_command_result(
+        self,
+        authority: FinalInputAuthorityV1 | None,
+    ) -> bool | CommandRoutingResultV1:
         if authority is None:
             return False
         owner = self._lifecycle_owner
@@ -417,7 +426,6 @@ class ConversationTaskCommandRouter:
         *,
         reason: str = "invalid explicit task command",
         category: str = "invalid-command",
-        candidate_count: int = 0,
     ) -> None:
         try:
             self._reserve()
@@ -428,13 +436,7 @@ class ConversationTaskCommandRouter:
         finally:
             print(
                 "[task-command-refusal] "
-                + json.dumps(
-                    {
-                        "kind": "explicit-command",
-                        "category": category,
-                        "candidate_count": candidate_count,
-                    }
-                )
+                + json.dumps({"kind": "explicit-command", "category": category})
             )
 
 

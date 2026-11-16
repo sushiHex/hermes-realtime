@@ -78,6 +78,12 @@ class _TaskCommandRouter(Protocol):
         authority: FinalInputAuthorityV1,
     ) -> CommandRoutingResultV1: ...
 
+    async def route_spoken(
+        self,
+        text: str,
+        authority: FinalInputAuthorityV1,
+    ) -> CommandRoutingResultV1: ...
+
 
 class _ParticipantAudioSource(Protocol):
     async def receive_participant_audio(
@@ -153,6 +159,10 @@ class ConversationSessionWorker:
             raise TypeError("actions must be an exact ConversationUpdateExecutor")
         if command_router is not None and not callable(getattr(command_router, "route", None)):
             raise TypeError("command_router must provide route()")
+        if command_router is not None and not callable(
+            getattr(command_router, "route_spoken", None)
+        ):
+            raise TypeError("command_router must provide route_spoken()")
         if (
             evidence_lifecycle is not None
             and type(evidence_lifecycle) is not EvidenceConversationAuthorityV1
@@ -583,7 +593,7 @@ class ConversationSessionWorker:
                                 media_incarnation=media_incarnation,
                                 typed_sequence=None,
                             )
-                        await self._route_final(router, transcript, authority)
+                        await self._route_final(router, transcript, authority, typed=False)
                     else:
                         await self._observe_partial_transcript(transcript)
             except BaseException as error:
@@ -847,7 +857,7 @@ class ConversationSessionWorker:
                         media_incarnation=None,
                         typed_sequence=typed_sequence,
                     )
-                await self._route_final(router, transcript, authority)
+                await self._route_final(router, transcript, authority, typed=True)
             except BaseException as error:
                 self._latch_terminal_error(error)
                 raise
@@ -857,17 +867,25 @@ class ConversationSessionWorker:
         router: _TaskCommandRouter | None,
         transcript: Transcript,
         authority: FinalInputAuthorityV1 | None,
+        *,
+        typed: bool,
     ) -> None:
+        """Commands are typed bytes; speech reaches only proposal confirmation."""
+
+        if type(typed) is not bool:
+            raise TypeError("typed must be an exact bool")
         user_authority: UserTurnAuthorityV1 | None = None
-        if router is not None and authority is not None:
-            routing = await router.route(transcript.text, authority)
-            if type(routing) is not CommandRoutingResultV1:
-                raise TypeError("command router returned the wrong result")
-            handled = routing.outcome is not CommandRoutingOutcome.NOT_COMMAND
-            user_authority = routing.user_turn_authority
-        else:
-            legacy_router = cast(Any, router)
-            handled = router is not None and bool(await legacy_router.route(transcript.text))
+        handled = False
+        if router is not None:
+            route = router.route if typed else router.route_spoken
+            if authority is None:
+                handled = bool(await cast(Any, route)(transcript.text))
+            else:
+                routing = await route(transcript.text, authority)
+                if type(routing) is not CommandRoutingResultV1:
+                    raise TypeError("command router returned the wrong result")
+                handled = routing.outcome is not CommandRoutingOutcome.NOT_COMMAND
+                user_authority = routing.user_turn_authority
         self._raise_if_closed()
         if handled:
             await self._revoke_active_ticket("command_routed")
