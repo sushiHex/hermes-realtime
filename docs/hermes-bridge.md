@@ -591,8 +591,10 @@ hermes-realtime-host `
 ```
 
 `--no-natural-work-tools`, or omitting both natural-work flags, leaves only the explicit-prefix
-path enabled. With the flag, the model can request `start_work`; it cannot cancel tasks or
-grant approvals. Explicit commands and task-specific Cancel controls retain cancellation.
+path enabled. With the flag, the model can request `start_work`, and, only when exactly one
+task is running and no start awaits acknowledgment, select a no-argument `cancel_work` for
+the task the host fixed when the user's input was admitted. It cannot name a task or grant
+approvals. Explicit commands and task-specific Cancel controls retain cancellation.
 The unsandboxed-task acknowledgment is required in either mode. See
 [ADR 0004](adr/0004-model-action-authority.md) for the model-trust limit and qualification.
 
@@ -600,7 +602,7 @@ Codex uses native tool calls. Ollama uses one schema-constrained response that i
 either reply text or a start objective, validated completely before speech or
 dispatch. Non-user turns receive only the reply shape. This replaces native tool
 framing for Ollama; malformed responses are not retried through another parser.
-The model supplies no cancellation, approval or run identity. Only the host's
+The model supplies no cancellation target, approval or run identity. Only the host's
 accepted dispatch result permits started speech. Complete buffering adds latency;
 valid structure alone does not establish correct task intent or reply quality.
 
