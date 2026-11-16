@@ -125,7 +125,8 @@ testpaths = ["tests"]
 addopts = "-ra"
 # Every test, including its fixtures, gets one wall-clock bound so a hang aborts the run with a
 # stack dump instead of stalling it. "thread" is the only method Windows supports; set it so Linux
-# CI behaves alike.
+# CI behaves alike. pytest-timeout drops the bound after a failed phase;
+# tests/support/failed_phase_timeout.py restores it for the phases that remain.
 timeout = 300
 timeout_method = "thread"
 

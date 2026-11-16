@@ -7,6 +7,8 @@ import pytest
 from hermes_realtime.providers.ollama_models import OllamaModelClient
 from tests.support import native_git_selection
 
+# pytest-timeout drops its per-test bound after any failed phase; keep it for the rest (#554).
+pytest_plugins = ("tests.support.failed_phase_timeout",)
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--native-git-executable", type=Path, default=None)
