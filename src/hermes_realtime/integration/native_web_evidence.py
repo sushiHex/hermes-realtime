@@ -116,7 +116,7 @@ _CAUSES = frozenset({
     "responses-publication-item", "responses-publication-part", "responses-publication-target",
     "responses-reasoning-incomplete", "responses-refusal", "responses-stream-content-part",
     "responses-stream-output-item", "responses-stream-text-bound", "responses-terminal-count",
-    "responses-terminal-failure", "responses-terminal-missing", "responses-text-bound",
+    "responses-terminal-failure", "responses-terminal-missing",
     "web-evidence-binding", "web-evidence-capture-refused", "web-evidence-catalog-bound",
     "web-evidence-closed", "web-evidence-deadline", "web-evidence-extract-request",
     "web-evidence-input-bound", "web-evidence-insufficient", "web-evidence-late-result",
@@ -756,7 +756,10 @@ class NativeWebEvidence:
                 ).hexdigest()
             evidence = {
                 "wire_requests": 0,
-                "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                # A local diagnostic, never attested: a lone surrogate in the native draft
+                # must not refuse a presentable run.
+                "source_sha256": hashlib.sha256(
+                    text.encode("utf-8", errors="surrogatepass")).hexdigest(),
             }
             stage, phase = "presentation_failed", "presentation"
             formatted = await self.presentation.complete(self, run_id, row, source_input, evidence)

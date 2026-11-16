@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -160,17 +161,119 @@ async def test_presenter_json_failure_is_named_not_a_subclass(
         "presentation-json", "ValueError", "json")
 
 
-@pytest.mark.asyncio
-async def test_codex_native_final_over_bound_names_responses_text_bound(capsys: Any) -> None:
-    observer = _observer()
-    await _refused_codex(observer, _codex_final(_codex_message("x" * 8193)))
+class _CodexFormatted(_Presentation):
+    """A presenter that answers as a completed codex response and keeps its evidence."""
 
-    assert _markers(capsys) == [{
-        "category": "refused", "count": 1, "reason": "internal", "phase": "final",
-        "cause": "responses-text-bound", "error_class": "ValueError", "stage": "none",
-        "selected_source_count": None, "rendered_detail_length": None,
-    }]
-    assert observer.presentation.calls == 0  # type: ignore[attr-defined]
+    def __init__(self) -> None:
+        super().__init__()
+        self.evidence: dict[str, Any] | None = None
+
+    async def complete(self, *args: Any, **_kwargs: Any) -> Any:
+        self.calls += 1
+        self.evidence = dict(args[4])
+        return SimpleNamespace(status="completed", usage=None, output=[
+            _codex_message(_answer(LEAD, "The retrieved report supports this result.", [0]))])
+
+
+async def _codex_run(observer: NativeWebEvidence, response: Any, shape: str) -> Any:
+    task = asyncio.current_task()
+    assert task is not None
+    _bind_run(observer, task)
+    if shape in {"web", "mixed"}:
+        _web_turn(observer)
+    if shape == "mixed":
+        observer.tool_execution(tool_name="terminal", args={"command": "..."},
+                                next_call=lambda _args: "tool output")
+    return await asyncio.to_thread(_codex_turn, observer, response)
+
+
+# The shared codex parser checks shape only; every presenter path keeps its own bound.
+LONG_FINAL = "x" * 8193
+
+
+@pytest.mark.asyncio
+async def test_codex_web_only_long_native_final_is_presented(capsys: Any) -> None:
+    presentation = _CodexFormatted()
+    observer = _observer(presentation)
+    returned = await _codex_run(observer, _codex_final(_codex_message(LONG_FINAL)), "web")
+
+    assert presentation.calls == 1
+    assert returned.output[0].content[0].text.startswith("<voice>" + LEAD + "</voice>")
+    assert json.loads(observer.reports[RUN_ID])["disposition"] == "presented"
+    assert not [marker for marker in _markers(capsys) if marker["category"] == "refused"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [None, "final_answer"])
+async def test_codex_intermediate_turn_with_long_message_returns_its_calls(
+    phase: str | None, capsys: Any,
+) -> None:
+    presentation = _CodexFormatted()
+    observer = _observer(presentation)
+    call = SimpleNamespace(type="function_call", status="completed", call_id="call_1",
+                           name="web_search", arguments='{"query": "more"}')
+    message = _codex_message(LONG_FINAL)
+    message.phase = phase
+    response = _codex_final(message, call)
+    returned = await _codex_run(observer, response, "web")
+
+    assert returned is response
+    assert presentation.calls == 0
+    assert observer.rows[RUN_ID]["disposition"] is None
+    assert _markers(capsys) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("shape", "disposition"), [
+    ("no_web", "no_web"), ("mixed", "mixed_ungrounded")])
+async def test_codex_long_native_final_keeps_unpresented_disposition(
+    shape: str, disposition: str, capsys: Any,
+) -> None:
+    presentation = _CodexFormatted()
+    observer = _observer(presentation)
+    response = _codex_final(_codex_message(LONG_FINAL))
+    returned = await _codex_run(observer, response, shape)
+
+    assert returned is response
+    assert presentation.calls == 0
+    assert json.loads(observer.reports[RUN_ID])["disposition"] == disposition
+    assert not [marker for marker in _markers(capsys) if marker["category"] == "refused"]
+
+
+LONE_SURROGATE = "Native draft \ud800 with a lone surrogate."
+
+
+@pytest.mark.asyncio
+async def test_codex_web_only_lone_surrogate_final_is_presented() -> None:
+    # The native text feeds only the local diagnostic hash on a presented run.
+    presentation = _CodexFormatted()
+    observer = _observer(presentation)
+    returned = await _codex_run(
+        observer, _codex_final(_codex_message(LONE_SURROGATE)), "web")
+
+    assert returned.output[0].content[0].text.startswith("<voice>" + LEAD + "</voice>")
+    assert presentation.evidence is not None
+    assert presentation.evidence["source_sha256"] == hashlib.sha256(
+        LONE_SURROGATE.encode("utf-8", errors="surrogatepass")).hexdigest()
+    assert json.loads(observer.reports[RUN_ID])["disposition"] == "presented"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["no_web", "mixed"])
+async def test_codex_lone_surrogate_unpresented_final_stays_strict(
+    shape: str, capsys: Any,
+) -> None:
+    # The host strict-encodes the output when it checks the attestation, so these stay strict.
+    presentation = _CodexFormatted()
+    observer = _observer(presentation)
+    returned = await _codex_run(
+        observer, _codex_final(_codex_message(LONE_SURROGATE)), shape)
+
+    assert returned.output_text == '{"error": "policy_refused"}'
+    assert presentation.calls == 0
+    [marker] = _markers(capsys)
+    assert (marker["category"], marker["reason"], marker["phase"]) == (
+        "refused", "internal", "final")
 
 
 @pytest.mark.asyncio
