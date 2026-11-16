@@ -61,6 +61,29 @@ ID**. A task that already completed cannot qualify active cancellation. Start a
 distinct authorized task for that case; do not repeatedly ask an answered
 research question merely to force dispatch.
 
+A `natural_cancel` step has exactly `label`, `kind`, `task`, and `text`. It
+submits the natural-language `text`, which must not begin with the typed
+`cancel task:` or `task:` grammar (that route is the `cancel` kind). It passes
+only when all of these hold: the bound task is `active` at step start; a
+`cancelling` or `interrupted` task state for exactly that task, and no other,
+arrives after this step's own input admission (compared by browser event
+sequence) and during the step, never from earlier state or the cleanup
+`cancel task:`; the turn completes on its exact identity; and the native witness
+for that task ends `cancelled`. Turn completion alone is never task success.
+
+A turn's completion binds through its first-token pair or, when the product
+emits no token (a natural-cancel selection, acknowledgment, or refusal), through
+the exact admitted `inputSequence`/`bindingGeneration` of this step's input,
+excluding any pair seen before the step. Each turn row records which in
+`terminalBinding` (`token` or `admittedInput`). A tokenless completion never
+satisfies `status`, `recall`, or `conversation` (`journey_turn_tokenless`).
+
+If the native witness says `completed` but the task failed with one of the
+host's exact fixed web-refusal notices for that task, the failure is
+`journey_task_failed` and the receipt's `taskFailures` records
+`classification: host_refused` with the refusal category. Without that exact
+evidence the mismatch stays `journey_terminal_binding`. Both are failures.
+
 `conversation` has exactly `label`, `kind`, and `text`, with no task reference,
 wait option, or tool assertion. Use it for an ordinary fixed-text turn, including
 speech timing comparisons. It waits for the identity-bound foreground turn to
