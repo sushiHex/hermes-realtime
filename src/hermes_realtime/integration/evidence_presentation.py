@@ -314,8 +314,6 @@ def _raw_responses_result(
         # Commentary-only output is not a final answer. Never publish it.
         raise ValueError("responses-no-final-answer" if commentary_seen else "responses-no-message")
     final_text: str | None = final_items[0][1].text if final_items else None
-    if final_text is not None and len(final_text) > MAX_CODEX_STREAM_TEXT_CHARS:
-        raise ValueError("responses-text-bound")
     return calls, final_text, (final_items[0] if final_items else None)
 
 def _codex_usage(usage: Any) -> dict[str, int]:
