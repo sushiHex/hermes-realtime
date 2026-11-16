@@ -201,7 +201,9 @@ def test_a_field_at_its_schema_bound_is_cut_and_refused_before_other_checks(fiel
     else:
         ids = [0, 0, 7][: limits["sources"] + 1]
         assert len(ids) == limits["sources"] + 1
-    with pytest.raises(ValueError, match="^presentation-content-length$"):
+    cause = {"lead": "presentation-lead-length", "support": "presentation-support-length",
+             "sources": "presentation-source-count"}[field]
+    with pytest.raises(ValueError, match=f"^{cause}$"):
         _render(CATALOG, _answer(lead, support, ids))
 
 
@@ -214,7 +216,7 @@ def test_a_cut_list_is_refused_before_type_range_or_evidence_checks() -> None:
     catalog = ("https://example.com/a",)
     passages = MappingProxyType({catalog[0]: ()})
     response = _chat(_answer("Lead.", "", ["x", 5]))
-    with pytest.raises(ValueError, match="^presentation-content-length$"):
+    with pytest.raises(ValueError, match="^presentation-source-count$"):
         presenter.render_presentation_response(
             response, catalog, "chat_completions", {}, passages=passages)
 
@@ -228,7 +230,7 @@ def test_bounds_count_code_points_so_an_astral_character_at_the_bound_is_accepte
     assert _render(CATALOG, raw).startswith("<voice>" + at_bound + "</voice>")
 
     cut = json.dumps({"answer": {"lead": at_bound + "y", "support": ""}, "source_ids": [0]})
-    with pytest.raises(ValueError, match="^presentation-content-length$"):
+    with pytest.raises(ValueError, match="^presentation-lead-length$"):
         _render(CATALOG, cut)
 
 
@@ -238,7 +240,7 @@ def test_a_lone_surrogate_is_a_cut(field: str) -> None:
     value["answer"][field] = "A split character \ud83d"
     raw = json.dumps(value)
     assert "\\ud83d" in raw
-    with pytest.raises(ValueError, match="^presentation-content-length$"):
+    with pytest.raises(ValueError, match="^presentation-result-unicode$"):
         _render(CATALOG, raw)
 
 
@@ -274,8 +276,9 @@ async def test_a_cut_reaches_the_attestation_as_too_long(
         "refused", "too_long")
     [marker] = _markers(capsys)
     stage = "content" if finish_reason == "stop" else "response-envelope"
-    assert (marker["reason"], marker["cause"], marker["stage"]) == (
-        "too_long", "presentation-content-length", stage)
+    cause = "presentation-lead-length" if finish_reason == "stop" else (
+        "presentation-content-length")
+    assert (marker["reason"], marker["cause"], marker["stage"]) == ("too_long", cause, stage)
 
 
 def test_too_long_is_a_refusal_reason() -> None:
@@ -409,7 +412,7 @@ def test_every_admitted_selection_renders_and_passes_the_host_contract() -> None
                 assert HermesApiTaskSession._completed_result_text(content) == content
                 checked += 1
         if count < len(shown):
-            with pytest.raises(ValueError, match="^presentation-content-length$"):
+            with pytest.raises(ValueError, match="^presentation-source-count$"):
                 presenter.render_presentation_response(
                     _chat(_answer("Lead.", "", longest[: count + 1])), shown,
                     "chat_completions", {}, passages=shown_passages)

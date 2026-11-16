@@ -121,8 +121,8 @@ async def test_rendered_detail_over_bound_names_length_stage_and_detail_length(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("lead", "support", "cause", "reason"), [
-    ("x" * 221, "", "presentation-content-length", "too_long"),
-    (LEAD, "s" * 1790, "presentation-content-length", "too_long"),
+    ("x" * 221, "", "presentation-lead-length", "too_long"),
+    (LEAD, "s" * 1790, "presentation-support-length", "too_long"),
     ("two\nlines", "", "presentation-content-shape", "internal"),
     (LEAD, "<detail>", "presentation-content-shape", "internal"),
     (" ", "", "presentation-content-shape", "internal"),

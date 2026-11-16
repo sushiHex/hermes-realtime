@@ -545,11 +545,20 @@ def render_presentation_response(
     # Each schema bound is one past its accepted bound, and the backend lands on a bound
     # rather than overflow it: a field past its accepted bound was cut. Bounds count code
     # points, as ``len`` does; a lone surrogate is a split character. Refused first.
+    # Each predicate names itself so the refusal marker says which one fired; all four
+    # still map to the same user-visible reason (``too_long``). Fixed evaluation order,
+    # so an input violating several is named by the first: lead length, support length,
+    # source count, then Unicode. The order does not change what is refused, only the
+    # name given to it.
     limits = presentation_limits(catalog)
-    if (len(lead) > limits["lead"] or len(support) > limits["support"]
-            or not has_valid_result_unicode(lead) or not has_valid_result_unicode(support)
-            or (type(ids) is list and len(ids) > limits["sources"])):
-        raise ValueError("presentation-content-length")
+    if len(lead) > limits["lead"]:
+        raise ValueError("presentation-lead-length")
+    if len(support) > limits["support"]:
+        raise ValueError("presentation-support-length")
+    if type(ids) is list and len(ids) > limits["sources"]:
+        raise ValueError("presentation-source-count")
+    if not has_valid_result_unicode(lead) or not has_valid_result_unicode(support):
+        raise ValueError("presentation-result-unicode")
     if (
         not lead.strip()
         or "\n" in lead
