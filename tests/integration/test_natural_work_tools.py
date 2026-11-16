@@ -1021,7 +1021,9 @@ async def test_direct_cancel_stops_exact_run_once_and_waits_for_terminal() -> No
         assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
         await runtime.settle()
         await asyncio.wait_for(runtime.stub.events_connected.wait(), timeout=1)
-        result = await runtime.surface.cancel_active_work(invocation_id="direct_cancel")
+        result = await runtime.surface.cancel_work(
+            task_id="task_cross1", invocation_id="direct_cancel",
+        )
         assert result.accepted and result.state == "cancelling" and result.task_id == "task_cross1"
         assert runtime.stub.stop_calls == 1
         assert len(runtime.context.snapshot().active_tasks) == 1
@@ -1045,52 +1047,6 @@ async def test_direct_cancel_stops_exact_run_once_and_waits_for_terminal() -> No
             accepted.task_id,
         ]
     finally:
-        await runtime.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("mode", "expected_stop_calls", "expected_start_state"),
-    [("accepted", 1, "cancelling"), ("rejected", 0, "rejected")],
-)
-async def test_cancel_while_dispatch_pending_settles_after_late_ack(
-    mode: str, expected_stop_calls: int, expected_start_state: str,
-) -> None:
-    runtime = await _runtime(mode=mode)
-    runtime.stub.create_gate.clear()
-    try:
-        parts, transport = await runtime.invoke("Please inspect the release evidence.")
-        _assert_proposal_only(parts, transport)
-        assert runtime.stub.posts == []
-        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
-        await asyncio.wait_for(runtime.stub.create_entered.wait(), timeout=1)
-        assert runtime.context.snapshot().active_tasks == ()
-        assert not any(kind == "task_state" for kind, _ in runtime.browser_events)
-        cancel_task = asyncio.create_task(
-            runtime.surface.cancel_active_work(invocation_id="direct_pending_cancel"),
-        )
-
-        async def wait_for_pending_cancel() -> None:
-            while True:
-                pending = tuple(runtime.surface._pending_starts.values())
-                if len(pending) == 1 and pending[0].cancel_after_ack:
-                    return
-                await asyncio.sleep(0)
-
-        await asyncio.wait_for(wait_for_pending_cancel(), timeout=1)
-        assert runtime.stub.stop_calls == 0
-        runtime.stub.create_gate.set()
-        started, cancelled = await asyncio.gather(runtime.settle(), cancel_task)
-        assert started.state == cancelled.state == expected_start_state
-        assert started.accepted is cancelled.accepted is (mode == "accepted")
-        assert runtime.stub.stop_calls == expected_stop_calls
-        if mode == "accepted":
-            runtime.stub.complete(status="cancelled")
-            await asyncio.wait_for(runtime.controller.next_completion(), timeout=1)
-        else:
-            assert runtime.context.snapshot().active_tasks == ()
-    finally:
-        runtime.stub.create_gate.set()
         await runtime.close()
 
 
@@ -1368,8 +1324,11 @@ async def test_stale_codex_evidence_cannot_route_through_replacement_runtime() -
     try:
         _, old_transport = await old.invoke("Start the old runtime work.")
         assert await old.confirm() is WorkCommandAdmission.ADMITTED
-        await old.settle()
-        old_cancel = await old.surface.cancel_active_work(invocation_id="old_direct_cancel")
+        old_started = await old.settle()
+        assert old_started.task_id is not None
+        old_cancel = await old.surface.cancel_work(
+            task_id=old_started.task_id, invocation_id="old_direct_cancel",
+        )
         assert old_cancel.accepted
         old.stub.complete(status="cancelled")
         terminal = await asyncio.wait_for(old.controller.next_completion(), timeout=1)

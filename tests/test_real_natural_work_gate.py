@@ -67,7 +67,7 @@ class _FakeWorkHandler:
         assert invocation_id == "tool_0123456789abcdef0123456789abcdef"
         return WorkStartResult(accepted=True, state="active", task_id="task_public")
 
-    async def cancel_active_work(self, *, invocation_id: str) -> WorkCancelResult:
+    async def cancel_work(self, *, task_id: str, invocation_id: str) -> WorkCancelResult:
         assert invocation_id == "tool_abcdef0123456789abcdef0123456789"
         return WorkCancelResult(accepted=True, state="cancelling", task_id="task_public")
 
@@ -94,7 +94,7 @@ class _RejectedWorkHandler:
         del objective, invocation_id
         return WorkStartResult(accepted=False, state="rejected", reason="not accepted")
 
-    async def cancel_active_work(self, *, invocation_id: str) -> WorkCancelResult:
+    async def cancel_work(self, *, task_id: str, invocation_id: str) -> WorkCancelResult:
         del invocation_id
         return WorkCancelResult(accepted=False, state="rejected", reason="not accepted")
 
@@ -107,7 +107,7 @@ class _RaisingWorkHandler:
         del objective, invocation_id
         raise RuntimeError("delegate failed")
 
-    async def cancel_active_work(self, *, invocation_id: str) -> WorkCancelResult:
+    async def cancel_work(self, *, task_id: str, invocation_id: str) -> WorkCancelResult:
         del invocation_id
         raise RuntimeError("delegate failed")
 
@@ -1004,7 +1004,9 @@ async def test_recording_work_handler_retains_only_counts_and_ack_latency() -> N
         objective="private objective text",
         invocation_id="tool_0123456789abcdef0123456789abcdef",
     )
-    cancel = await handler.cancel_active_work(invocation_id="tool_abcdef0123456789abcdef0123456789")
+    cancel = await handler.cancel_work(
+        task_id="task_public", invocation_id="tool_abcdef0123456789abcdef0123456789",
+    )
 
     assert start.accepted is True
     assert cancel.accepted is True
@@ -1026,7 +1028,7 @@ async def test_recording_work_handler_counts_attempts_before_failed_delegation()
     with pytest.raises(RuntimeError, match="delegate failed"):
         await handler.start_work(objective="private", invocation_id="private-start")
     with pytest.raises(RuntimeError, match="delegate failed"):
-        await handler.cancel_active_work(invocation_id="private-cancel")
+        await handler.cancel_work(task_id="task_public", invocation_id="private-cancel")
 
     assert handler.start_attempts == 1
     assert handler.cancel_attempts == 1
@@ -1042,7 +1044,7 @@ async def test_recording_work_handler_does_not_acknowledge_rejected_results() ->
     handler = RecordingWorkHandler(_RejectedWorkHandler(), clock=lambda: 1.0)
 
     await handler.start_work(objective="private", invocation_id="private-start")
-    await handler.cancel_active_work(invocation_id="private-cancel")
+    await handler.cancel_work(task_id="task_public", invocation_id="private-cancel")
 
     assert handler.start_attempts == 1
     assert handler.cancel_attempts == 1
@@ -1060,7 +1062,7 @@ async def test_present_unused_handler_counts_every_unexpected_invocation() -> No
     with pytest.raises(RuntimeError, match="unexpectedly requested work"):
         await handler.start_work(objective="do not retain me", invocation_id="inv-1")
     with pytest.raises(RuntimeError, match="unexpectedly requested cancellation"):
-        await handler.cancel_active_work(invocation_id="inv-2")
+        await handler.cancel_work(task_id="task_public", invocation_id="inv-2")
 
     assert handler.invocations == 2
     assert "do not retain me" not in repr(handler)

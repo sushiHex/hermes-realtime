@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 
-from hermes_realtime.client import BrowserEventProjection
 from hermes_realtime.conversation import (
     ActiveTaskIdentityError,
     ConversationContextStore,
@@ -666,7 +665,7 @@ async def test_conflicting_invocation_fails_closed_without_second_side_effect() 
         objective="Different objective",
         invocation_id="same_call",
     )
-    later = await surface.cancel_active_work(invocation_id="later_call")
+    later = await surface.cancel_work(task_id="task_release_check", invocation_id="later_call")
 
     assert conflict.reason == "work control unavailable; restart required"
     assert later.reason == "work control unavailable; restart required"
@@ -676,36 +675,23 @@ async def test_conflicting_invocation_fails_closed_without_second_side_effect() 
 
 
 @pytest.mark.asyncio
-async def test_cancel_active_rejects_zero_and_requires_identity_for_multiple() -> None:
+async def test_cancel_of_an_inactive_task_is_stale_and_selects_no_replacement() -> None:
     context = ConversationContextStore(max_active_tasks=3)
+    context.record_task_accepted(
+        task_id="task_other", run_id="deleg_private_other", objective="other",
+    )
     surface, controller, events = _surface(context=context)
 
-    empty = await surface.cancel_active_work(invocation_id="cancel_empty")
-    assert empty == WorkCancelResult(
-        accepted=False,
-        state="rejected",
-        reason="no active work",
+    stale = await surface.cancel_work(task_id="task_gone", invocation_id="cancel_gone")
+    assert stale == WorkCancelResult(
+        accepted=False, state="rejected", task_id="task_gone", reason="task is not active",
     )
     assert controller.cancellations == []
-    assert events[-1] == (
+    assert events == [(
         "task_state",
-        {"reason": "no active work", "status": "rejected", "taskId": None},
-    )
-
-    context.record_task_accepted(
-        task_id="task_one",
-        run_id="deleg_private_one",
-        objective="one",
-    )
-    context.record_task_accepted(
-        task_id="task_two",
-        run_id="deleg_private_two",
-        objective="two",
-    )
-    multiple = await surface.cancel_active_work(invocation_id="cancel_multiple")
-    assert multiple.reason == "multiple active tasks; specify task_id"
+        {"status": "rejected", "taskId": "task_gone", "reason": "task is not active"},
+    )]
     assert surface.health == "open"
-    assert controller.cancellations == []
 
 
 @pytest.mark.asyncio
@@ -732,269 +718,6 @@ async def test_exact_cancel_isolated_to_one_of_multiple_active_tasks() -> None:
     )
     assert controller.cancellations == [("task_two", "user requested task cancellation")]
     assert events == [("task_state", {"status": "cancelling", "taskId": "task_two"})]
-
-
-@pytest.mark.asyncio
-async def test_cancel_active_targets_exact_single_public_task() -> None:
-    context = ConversationContextStore()
-    context.record_task_accepted(
-        task_id="task_release_check",
-        run_id="deleg_private_run",
-        objective="Inspect evidence",
-    )
-    surface, controller, events = _surface(context=context)
-
-    result = await surface.cancel_active_work(invocation_id="cancel_one")
-
-    assert result == WorkCancelResult(
-        accepted=True,
-        state="cancelling",
-        task_id="task_release_check",
-    )
-    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
-    assert events == [("task_state", {"status": "cancelling", "taskId": "task_release_check"})]
-
-
-@pytest.mark.asyncio
-async def test_pending_start_cancel_waits_for_ack_and_cancels_exact_acceptance() -> None:
-    gate = asyncio.Event()
-    surface, controller, events = _surface(dispatch_gate=gate)
-    start = asyncio.create_task(
-        surface.start_work(objective="Inspect evidence", invocation_id="start_pending")
-    )
-    await controller.dispatch_started.wait()
-    cancel = asyncio.create_task(surface.cancel_active_work(invocation_id="cancel_pending"))
-    await asyncio.sleep(0)
-    assert controller.cancellations == []
-
-    gate.set()
-
-    assert await start == WorkStartResult(
-        accepted=True,
-        state="cancelling",
-        task_id="task_release_check",
-    )
-    assert await cancel == WorkCancelResult(
-        accepted=True,
-        state="cancelling",
-        task_id="task_release_check",
-    )
-    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
-    assert events == [("task_state", {"status": "cancelling", "taskId": "task_release_check"})]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("accepted", (False, True))
-async def test_joined_pending_cancel_projects_one_outcome_after_accepted_start(
-    accepted: bool,
-) -> None:
-    gate = asyncio.Event()
-    context = ConversationContextStore()
-    projection = BrowserEventProjection(capacity=8)
-    events = []
-
-    def observe(kind, data):
-        events.append((kind, data))
-        projection.publish(kind, data)
-
-    surface, controller, _events = _surface(
-        context=context, dispatch_gate=gate,
-        observer=observe, reserve=projection.ensure_capacity,
-    )
-    controller.cancel_outcome = TaskCancelOutcome(
-        task_id="task_release_check", accepted=accepted,
-        reason=None if accepted else "Hermes declined cancellation",
-    )
-    start = asyncio.create_task(
-        surface.start_work(objective="Synthetic work", invocation_id="start_pending")
-    )
-    await controller.dispatch_started.wait()
-    first = asyncio.create_task(surface.cancel_active_work(invocation_id="cancel_first"))
-    second = asyncio.create_task(surface.cancel_active_work(invocation_id="cancel_second"))
-    await asyncio.sleep(0)
-    assert controller.cancellations == []
-    gate.set()
-    start_result, first_result, second_result = await asyncio.gather(start, first, second)
-    assert start_result == WorkStartResult(
-        accepted=True, state="cancelling" if accepted else "active", task_id="task_release_check",
-    )
-    assert first_result == second_result == WorkCancelResult(
-        accepted=accepted, state="cancelling" if accepted else "rejected",
-        task_id="task_release_check", reason=None if accepted else "Hermes declined cancellation",
-    )
-    assert await surface.start_work(
-        objective="Synthetic work", invocation_id="start_pending",
-    ) == start_result
-    assert await surface.cancel_active_work(invocation_id="cancel_first") == first_result
-    assert await surface.cancel_active_work(invocation_id="cancel_second") == second_result
-    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
-    assert tuple(task.task_id for task in context.snapshot().active_tasks) == (
-        "task_release_check",
-    )
-    assert surface.health == "open"
-    assert events == (
-        [("task_state", {"status": "cancelling", "taskId": "task_release_check"})]
-        if accepted else [
-            ("task_state", {"status": "active", "taskId": "task_release_check"}),
-            ("task_state", {
-                "status": "rejected", "taskId": "task_release_check",
-                "reason": "Hermes declined cancellation",
-            }),
-        ]
-    )
-    projection.reset()
-    projection.republish_open_state()
-    assert [(event.kind, dict(event.data)) for event in projection.events_after(0)] == [
-        ("task_state", {
-            "status": "cancelling" if accepted else "active", "taskId": "task_release_check",
-        }),
-    ]
-    await surface.close()
-
-
-@pytest.mark.asyncio
-async def test_pending_cancel_projection_capacity_refuses_before_cancel_effect() -> None:
-    gate = asyncio.Event()
-    projection = BrowserEventProjection(capacity=1)
-    surface, controller, _events = _surface(
-        dispatch_gate=gate, observer=projection.publish, reserve=projection.ensure_capacity,
-    )
-    start = asyncio.create_task(
-        surface.start_work(objective="Synthetic work", invocation_id="start_pending")
-    )
-    await controller.dispatch_started.wait()
-    projection.publish("notification_queued", {})
-    try:
-        with pytest.raises(RuntimeError, match="projection capacity"):
-            await asyncio.wait_for(
-                surface.cancel_active_work(invocation_id="cancel_pending"), timeout=0.1,
-            )
-        assert controller.cancellations == []
-    finally:
-        projection.reset()
-        gate.set()
-        result = await start
-        await surface.close()
-    assert result == WorkStartResult(accepted=True, state="active", task_id="task_release_check")
-    assert controller.cancellations == []
-    assert [dict(event.data) for event in projection.events_after(0)] == [
-        {"status": "active", "taskId": "task_release_check"},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_pending_cancel_refusal_projection_overflow_is_owned_and_fail_closed(capsys) -> None:
-    gate = asyncio.Event()
-    projection = BrowserEventProjection(capacity=1)
-    context = ConversationContextStore()
-    surface, controller, _events = _surface(
-        context=context, dispatch_gate=gate,
-        observer=projection.publish, reserve=projection.ensure_capacity,
-    )
-    controller.cancel_outcome = TaskCancelOutcome(
-        task_id="task_release_check", accepted=False, reason="Hermes declined cancellation",
-    )
-    assert await surface.submit_start_command(
-        objective="Synthetic work", invocation_id="start_pending",
-    ) is WorkCommandAdmission.ADMITTED
-    await controller.dispatch_started.wait()
-    cancel = asyncio.create_task(surface.cancel_active_work(invocation_id="cancel_pending"))
-    await asyncio.sleep(0)
-    gate.set()
-    assert await cancel == WorkCancelResult(
-        accepted=False, state="rejected", task_id="task_release_check",
-        reason="Hermes declined cancellation",
-    )
-    await asyncio.gather(*surface._owned_operations, return_exceptions=True)
-    await asyncio.sleep(0)
-    assert surface.health == "uncertain"
-    assert await surface.submit_start_command(
-        objective="Synthetic other work", invocation_id="start_after_overflow",
-    ) is WorkCommandAdmission.UNAVAILABLE
-    await surface.close()
-    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
-    assert tuple(task.task_id for task in context.snapshot().active_tasks) == (
-        "task_release_check",
-    )
-    assert surface.health == "closed"
-    assert [dict(event.data) for event in projection.events_after(0)] == [
-        {"status": "active", "taskId": "task_release_check"},
-    ]
-    assert capsys.readouterr().out == (
-        '[task-command-settlement] {"kind":"start","category":"uncertainty-projection-failed"}\n'
-    )
-
-
-@pytest.mark.asyncio
-async def test_repeated_stop_joins_one_task_during_pending_active_overlap() -> None:
-    dispatch_gate = asyncio.Event()
-    cancel_entered = asyncio.Event()
-    release_cancel = asyncio.Event()
-    surface, controller, _events = _surface(dispatch_gate=dispatch_gate)
-    original_cancel = controller.request_cancel
-
-    async def slow_cancel(
-        task_id: str,
-        *,
-        reason: str | None = None,
-    ) -> TaskCancelOutcome:
-        cancel_entered.set()
-        await release_cancel.wait()
-        return await original_cancel(task_id, reason=reason)
-
-    controller.request_cancel = slow_cancel  # type: ignore[method-assign]
-    start = asyncio.create_task(
-        surface.start_work(objective="Inspect evidence", invocation_id="start_overlap")
-    )
-    await controller.dispatch_started.wait()
-    first_stop = asyncio.create_task(
-        surface.cancel_active_work(invocation_id="cancel_overlap_first")
-    )
-    dispatch_gate.set()
-    await asyncio.wait_for(cancel_entered.wait(), timeout=1)
-
-    second_stop = asyncio.create_task(
-        surface.cancel_active_work(invocation_id="cancel_overlap_second")
-    )
-    await asyncio.sleep(0)
-    assert not second_stop.done()
-    release_cancel.set()
-
-    first_result, second_result, start_result = await asyncio.gather(
-        first_stop,
-        second_stop,
-        start,
-    )
-    assert first_result.accepted is True
-    assert second_result == first_result
-    assert start_result.state == "cancelling"
-    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
-
-
-@pytest.mark.asyncio
-async def test_pending_start_cancel_propagates_authoritative_rejection_without_stop() -> None:
-    gate = asyncio.Event()
-    surface, controller, events = _surface(accepted=False, dispatch_gate=gate)
-    start = asyncio.create_task(
-        surface.start_work(objective="Inspect evidence", invocation_id="start_pending")
-    )
-    await controller.dispatch_started.wait()
-    cancel = asyncio.create_task(surface.cancel_active_work(invocation_id="cancel_pending"))
-    gate.set()
-
-    assert (await start).accepted is False
-    assert (await cancel).accepted is False
-    assert controller.cancellations == []
-    assert events == [
-        (
-            "task_state",
-            {
-                "reason": "Hermes declined the request",
-                "status": "rejected",
-                "taskId": "task_release_check",
-            },
-        )
-    ]
 
 
 @pytest.mark.asyncio
@@ -1049,12 +772,12 @@ async def test_post_ack_projection_and_rollback_failure_preserves_both() -> None
 async def test_completed_replay_retention_evicts_without_poisoning() -> None:
     surface, controller, _events = _surface(max_invocations=1)
 
-    first = await surface.cancel_active_work(invocation_id="first_call")
-    replay = await surface.cancel_active_work(invocation_id="first_call")
-    second = await surface.cancel_active_work(invocation_id="second_call")
+    first = await surface.cancel_work(task_id="task_gone", invocation_id="first_call")
+    replay = await surface.cancel_work(task_id="task_gone", invocation_id="first_call")
+    second = await surface.cancel_work(task_id="task_gone", invocation_id="second_call")
 
     assert first == replay
-    assert second.reason == "no active work"
+    assert second.reason == "task is not active"
     assert surface.health == "open"
     assert controller.cancellations == []
 
@@ -1071,7 +794,7 @@ async def test_close_is_cancellation_resistant_and_permanently_closes_admission(
     await asyncio.sleep(0)
 
     assert surface.health == "closed"
-    rejected = await surface.cancel_active_work(invocation_id="stale_call")
+    rejected = await surface.cancel_work(task_id="task_release_check", invocation_id="stale_call")
     assert rejected.reason == "work control unavailable; restart required"
     close.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1147,59 +870,9 @@ async def test_cancel_completion_race_is_bounded_and_keeps_surface_open() -> Non
 
     controller.request_cancel = completed_before_cancel  # type: ignore[method-assign]
 
-    result = await surface.cancel_active_work(invocation_id="cancel_race")
+    result = await surface.cancel_work(task_id="task_release_check", invocation_id="cancel_race")
 
     assert result == WorkCancelResult(
-        accepted=False,
-        state="rejected",
-        task_id="task_release_check",
-        reason="task is not active",
-    )
-    assert surface.health == "open"
-    assert events == [
-        (
-            "task_state",
-            {
-                "reason": "task is not active",
-                "status": "rejected",
-                "taskId": "task_release_check",
-            },
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_pending_cancel_completion_race_is_bounded_and_keeps_surface_open() -> None:
-    gate = asyncio.Event()
-    surface, controller, events = _surface(dispatch_gate=gate)
-
-    async def completed_before_cancel(
-        task_id: str,
-        *,
-        reason: str | None = None,
-    ) -> TaskCancelOutcome:
-        del task_id, reason
-        raise ActiveTaskIdentityError("task is no longer active")
-
-    controller.request_cancel = completed_before_cancel  # type: ignore[method-assign]
-    start = asyncio.create_task(
-        surface.start_work(objective="Inspect evidence", invocation_id="pending_race_start")
-    )
-    await controller.dispatch_started.wait()
-    cancel = asyncio.create_task(surface.cancel_active_work(invocation_id="pending_race_cancel"))
-    await asyncio.sleep(0)
-    gate.set()
-
-    start_result = await start
-    cancel_result = await cancel
-
-    assert start_result == WorkStartResult(
-        accepted=False,
-        state="rejected",
-        task_id="task_release_check",
-        reason="task is not active",
-    )
-    assert cancel_result == WorkCancelResult(
         accepted=False,
         state="rejected",
         task_id="task_release_check",
@@ -1237,7 +910,7 @@ async def test_run_prefixed_rejection_reason_is_bounded_and_keeps_surface_open()
 
 
 @pytest.mark.asyncio
-async def test_cancelled_dispatch_settles_pending_cancel_and_close() -> None:
+async def test_cancelled_dispatch_closes_admission_and_close_completes() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
     surface, controller, _events = _surface()
@@ -1253,15 +926,13 @@ async def test_cancelled_dispatch_settles_pending_cancel_and_close() -> None:
         surface.start_work(objective="Inspect evidence", invocation_id="cancelled_start")
     )
     await started.wait()
-    cancel = asyncio.create_task(surface.cancel_active_work(invocation_id="cancel_cancelled_start"))
     release.set()
 
     with pytest.raises(asyncio.CancelledError):
         await start
+    assert surface.health == "uncertain"
     async with asyncio.timeout(1):
-        cancel_result = await cancel
         await surface.close()
-    assert cancel_result.reason == "work control unavailable; restart required"
 
 
 @pytest.mark.asyncio

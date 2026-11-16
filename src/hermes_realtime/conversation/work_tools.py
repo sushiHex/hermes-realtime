@@ -60,9 +60,9 @@ _UNAVAILABLE_REASON = "work control unavailable; restart required"
 # What the user is shown for it. The health below belongs to the host and is not resettable,
 # so the sentence must not promise that restarting a session clears it.
 WORK_CONTROL_UNAVAILABLE_NOTICE = "Task control is unavailable until the host restarts."
-_NO_ACTIVE_REASON = "no active work"
+# The one reason for a cancel whose named task is no longer active.
+INACTIVE_TASK_REASON = "task is not active"
 _CAPACITY_REASON = "background task capacity exhausted"
-_AMBIGUOUS_ACTIVE_REASON = "multiple active tasks; specify task_id"
 _DUPLICATE_OBJECTIVE_REASON = "matching work is already active"
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
@@ -71,8 +71,6 @@ _CommandRefusalCategory = Literal[
     "duplicate_objective",
     "capacity_exhausted",
     "stale_target",
-    "no_active_task",
-    "ambiguous_active_tasks",
 ]
 
 
@@ -198,8 +196,6 @@ class _TaskController(Protocol):
 class _PendingStart:
     invocation_id: str
     objective_identity: str
-    cancel_after_ack: bool
-    cancel_result: asyncio.Future[WorkCancelResult]
     task_id: str | None = None
 
 
@@ -413,8 +409,6 @@ class ConversationWorkControlSurface:
                     pending = _PendingStart(
                         invocation_id=invocation_id,
                         objective_identity=objective_identity,
-                        cancel_after_ack=False,
-                        cancel_result=asyncio.get_running_loop().create_future(),
                     )
                     self._pending_starts[invocation_id] = pending
                     operation = self._create_operation_locked(
@@ -434,15 +428,6 @@ class ConversationWorkControlSurface:
                 self._bindings[invocation_id] = binding
         return binding
 
-    async def cancel_active_work(self, *, invocation_id: str) -> WorkCancelResult:
-        _validate_identifier(invocation_id, "invocation_id")
-        return await self._cancel_work(
-            invocation_id=invocation_id,
-            expected_task_id=None,
-            reason="user requested task cancellation",
-            semantic_kind="cancel_active",
-        )
-
     async def cancel_work(
         self,
         *,
@@ -450,7 +435,11 @@ class ConversationWorkControlSurface:
         invocation_id: str,
         reason: str = "user requested task cancellation",
     ) -> WorkCancelResult:
-        """Cancel an exact public task for the deterministic command fallback."""
+        """Cancel an exact public task: a trusted control, or a host-frozen natural target.
+
+        The target is always named by the host. A task that is no longer active is refused as
+        ``stale_target``; no other task is ever selected in its place.
+        """
 
         _validate_task_id(task_id)
         _validate_identifier(invocation_id, "invocation_id")
@@ -507,7 +496,7 @@ class ConversationWorkControlSurface:
         self,
         *,
         invocation_id: str,
-        expected_task_id: str | None,
+        expected_task_id: str,
         reason: str,
         semantic_kind: str,
     ) -> WorkCancelResult:
@@ -525,15 +514,11 @@ class ConversationWorkControlSurface:
         self,
         *,
         invocation_id: str,
-        expected_task_id: str | None,
+        expected_task_id: str,
         reason: str,
         semantic_kind: str,
     ) -> _InvocationBinding | WorkCancelResult:
-        semantics = (
-            semantic_kind,
-            "" if expected_task_id is None else expected_task_id,
-            reason,
-        )
+        semantics = (semantic_kind, expected_task_id, reason)
         async with self._lock:
             unavailable = self._unavailable_cancel_locked()
             if unavailable is not None:
@@ -548,52 +533,18 @@ class ConversationWorkControlSurface:
                 if not self._admit_binding_locked():
                     return self._unavailable_cancel()
                 active_tasks = self._context.snapshot().active_tasks
-                pending_starts = tuple(self._pending_starts.values())
                 refusal_category: _CommandRefusalCategory | None = None
-                if expected_task_id is not None:
-                    matching = tuple(
-                        task for task in active_tasks if task.task_id == expected_task_id
-                    )
-                    if not matching:
-                        refusal_category = "stale_target"
-                        operation = self._new_cancel_rejection_locked(
-                            invocation_id,
-                            task_id=expected_task_id,
-                            reason="task is not active",
-                        )
-                    else:
-                        self._reserve()
-                        operation = self._create_operation_locked(
-                            self._settle_cancel(task_id=expected_task_id, reason=reason),
-                            name=f"conversation-work-cancel:{invocation_id}",
-                        )
-                elif self._logical_work_count(active_tasks, pending_starts) == 0:
-                    refusal_category = "no_active_task"
+                if not any(task.task_id == expected_task_id for task in active_tasks):
+                    refusal_category = "stale_target"
                     operation = self._new_cancel_rejection_locked(
                         invocation_id,
-                        task_id=None,
-                        reason=_NO_ACTIVE_REASON,
-                    )
-                elif self._logical_work_count(active_tasks, pending_starts) > 1:
-                    refusal_category = "ambiguous_active_tasks"
-                    operation = self._new_cancel_rejection_locked(
-                        invocation_id,
-                        task_id=None,
-                        reason=_AMBIGUOUS_ACTIVE_REASON,
-                    )
-                elif pending_starts:
-                    self._reserve()
-                    pending = pending_starts[0]
-                    pending.cancel_after_ack = True
-                    operation = self._create_operation_locked(
-                        self._await_pending_cancel(pending),
-                        name=f"conversation-work-pending-cancel:{invocation_id}",
+                        task_id=expected_task_id,
+                        reason=INACTIVE_TASK_REASON,
                     )
                 else:
-                    task_id = active_tasks[0].task_id
                     self._reserve()
                     operation = self._create_operation_locked(
-                        self._settle_cancel(task_id=task_id, reason=reason),
+                        self._settle_cancel(task_id=expected_task_id, reason=reason),
                         name=f"conversation-work-cancel:{invocation_id}",
                     )
                 binding = _InvocationBinding(
@@ -681,21 +632,9 @@ class ConversationWorkControlSurface:
             )
             if type(dispatch) is not TaskDispatchOutcome:
                 raise TypeError("task controller returned the wrong dispatch outcome")
-        except asyncio.CancelledError:
-            async with self._lock:
-                self._mark_uncertain_locked()
-            self._settle_pending_cancel_result(
-                pending,
-                self._unavailable_cancel(),
-            )
-            raise
         except BaseException:
             async with self._lock:
                 self._mark_uncertain_locked()
-            self._settle_pending_cancel_result(
-                pending,
-                self._unavailable_cancel(),
-            )
             raise
         try:
             if not dispatch.accepted:
@@ -703,96 +642,26 @@ class ConversationWorkControlSurface:
                 dispatch = TaskDispatchOutcome(
                     task_id=dispatch.task_id, accepted=dispatch.accepted, reason=dispatch.reason,
                 )
-                public_reason = dispatch.reason or DISPATCH_REJECTED_REASON
-                start_result = WorkStartResult(
-                    accepted=False,
-                    state="rejected",
-                    task_id=dispatch.task_id,
-                    reason=public_reason,
-                )
-                self._settle_pending_cancel_result(
-                    pending,
-                    WorkCancelResult(
+                return await self._project_start(
+                    WorkStartResult(
                         accepted=False,
                         state="rejected",
                         task_id=dispatch.task_id,
-                        reason=public_reason,
-                    ),
+                        reason=dispatch.reason or DISPATCH_REJECTED_REASON,
+                    )
                 )
-                return await self._project_start(start_result)
 
             async with self._lock:
                 pending.task_id = dispatch.task_id
-                cancel_after_ack = pending.cancel_after_ack
-                if not cancel_after_ack:
-                    self._remove_pending_start_locked(pending)
-            if cancel_after_ack:
-                try:
-                    cancellation = await self._request_cancel(
-                        dispatch.task_id,
-                        reason="user requested task cancellation",
-                    )
-                except ActiveTaskIdentityError:
-                    cancel_result = WorkCancelResult(
-                        accepted=False,
-                        state="rejected",
-                        task_id=dispatch.task_id,
-                        reason="task is not active",
-                    )
-                    self._settle_pending_cancel_result(pending, cancel_result)
-                    return await self._project_start(
-                        WorkStartResult(
-                            accepted=False,
-                            state="rejected",
-                            task_id=dispatch.task_id,
-                            reason="task is not active",
-                        )
-                    )
-                except BaseException:
-                    async with self._lock:
-                        self._mark_uncertain_locked()
-                    self._settle_pending_cancel_result(
-                        pending,
-                        self._unavailable_cancel(),
-                    )
-                    raise
-                cancel_result = self._cancel_result(cancellation)
-                self._settle_pending_cancel_result(pending, cancel_result)
-                if cancel_result.accepted:
-                    return await self._project_start(
-                        WorkStartResult(
-                            accepted=True,
-                            state="cancelling",
-                            task_id=dispatch.task_id,
-                        )
-                    )
-                start_result = await self._project_accepted_start(
-                    dispatch.task_id, anchor_turn_id=anchor_turn_id,
-                )
-                # Establish the live card before attaching cancellation feedback.
-                # A later active projection would clear that feedback in the UI.
-                await self._project_cancel(cancel_result)
-                return start_result
+                self._remove_pending_start_locked(pending)
             return await self._project_accepted_start(
                 dispatch.task_id, anchor_turn_id=anchor_turn_id,
             )
         except _ProjectionRolledBack as rolled_back:
             raise rolled_back.error from None
-        except asyncio.CancelledError:
-            async with self._lock:
-                self._mark_uncertain_locked()
-            self._settle_pending_cancel_result(
-                pending,
-                self._unavailable_cancel(),
-            )
-            raise
         except BaseException:
             async with self._lock:
                 self._mark_uncertain_locked()
-            self._settle_pending_cancel_result(
-                pending,
-                self._unavailable_cancel(),
-            )
             raise
         finally:
             async with self._lock:
@@ -836,7 +705,7 @@ class ConversationWorkControlSurface:
                     accepted=False,
                     state="rejected",
                     task_id=task_id,
-                    reason="task is not active",
+                    reason=INACTIVE_TASK_REASON,
                 )
             )
         except asyncio.CancelledError:
@@ -859,12 +728,6 @@ class ConversationWorkControlSurface:
         if type(outcome) is not TaskCancelOutcome:
             raise TypeError("task controller returned the wrong cancel outcome")
         return outcome
-
-    async def _await_pending_cancel(
-        self,
-        pending: _PendingStart,
-    ) -> WorkCancelResult:
-        return await asyncio.shield(pending.cancel_result)
 
     async def _project_start(
         self, result: WorkStartResult, *, anchor_turn_id: str | None = None
@@ -1020,14 +883,6 @@ class ConversationWorkControlSurface:
     def _mark_uncertain_locked(self) -> None:
         if self._health is WorkControlHealth.OPEN:
             self._health = WorkControlHealth.UNCERTAIN
-
-    @staticmethod
-    def _settle_pending_cancel_result(
-        pending: _PendingStart,
-        result: WorkCancelResult,
-    ) -> None:
-        if not pending.cancel_result.done():
-            pending.cancel_result.set_result(ConversationWorkControlSurface._copy_cancel(result))
 
     @staticmethod
     def _cancel_result(outcome: TaskCancelOutcome) -> WorkCancelResult:
