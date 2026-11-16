@@ -437,18 +437,14 @@ record only pass/fail status and non-secret latency values.
 ## Full loopback host and constrained desktop human gate
 
 `hermes-realtime-host` is the Milestone 6.1b launcher. It keeps the browser, LiveKit,
-Hermes API, inference, STT, and TTS surfaces on loopback. Explicit
-`start task <objective>` starts background work through the deterministic command router.
-The whole final utterance must begin with those exact words (case does not matter); no colon
-or other STT punctuation is required. The objective is bounded by the existing work surface.
-`cancel task` (optionally ending in `.`, `!` or `?`) cancels only when exactly one acknowledged
-task exists at command intake. Its public identity is frozen before any await; if that task
-ends meanwhile, cancellation is refused instead of selecting newer work. With no task the
-browser says there is no active task; with several it asks the operator to use the intended
-task card's **Cancel** control. Pending dispatches are not selected by this spoken command.
-`cancel task <public-task-id>` names an exact task. The legacy `task: <objective>` and
-`cancel task: <public-task-id>` forms remain supported. Negated, quoted or prefaced commands
-are not direct commands, and bare `stop` grants no task cancellation. A dispatch remains
+Hermes API, inference, STT, and TTS surfaces on loopback. Commands are typed bytes; speech is
+always a turn. A typed `task: <objective>` starts background work through the deterministic
+command router, and the task card's **Cancel** control sends the typed
+`cancel task: <public-task-id>` for that exact task. The objective is bounded by the existing
+work surface. A microphone final never reaches the command grammar, whatever its words: even
+STT text that begins `Task:` is an ordinary turn. The only spoken input that can consume a
+final is a confirmation of a pending task proposal. Negated, quoted or prefaced typed
+commands are not direct commands, and bare `stop` grants no task cancellation. A dispatch remains
 pending until Hermes accepts it; cancellation acknowledgment means stopping was requested,
 while a terminal event establishes that the task ended.
 
