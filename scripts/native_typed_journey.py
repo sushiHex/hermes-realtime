@@ -521,11 +521,18 @@ class Journey:
             # The task's cancelling projection precedes the turn's completion, and
             # only this step's post-admission projections count: never pre-step
             # state, and never the cleanup `cancel task:` after the step.
-            cancels, admission = self.tracker.step_cancels, self.tracker.admission_event
-            require(task in cancels, "journey_cancel_unobserved")
-            require(admission is not None and cancels[task] > admission, "journey_cancel_stale")
-            require(set(cancels) == {task}, "journey_cancel_foreign")
+            def require_cancel_scope() -> None:
+                cancels, admission = self.tracker.step_cancels, self.tracker.admission_event
+                require(task in cancels, "journey_cancel_unobserved")
+                require(admission is not None and cancels[task] > admission,
+                        "journey_cancel_stale")
+                require(set(cancels) == {task}, "journey_cancel_foreign")
+
+            require_cancel_scope()
             await self.collect(step["task"])
+            # collect() keeps consuming events while the task settles; a known
+            # foreign task cancelled in that window must still fail the step.
+            require_cancel_scope()
             require(
                 self.results[step["task"]]["terminal"] == "cancelled", "journey_cancel_unproven"
             )

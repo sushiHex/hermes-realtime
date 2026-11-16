@@ -1420,6 +1420,19 @@ def test_an_additional_foreign_cancel_fails_the_natural_cancel(tmp_path, monkeyp
         run_step(journey)
 
 
+@pytest.mark.parametrize("status", ["cancelling", "interrupted"])
+def test_foreign_cancel_during_settlement_fails_the_natural_cancel(tmp_path, monkeypatch, status):
+    # A known foreign task cancels in the batch collect() consumes, after the
+    # pre-collect scope check passed; the identity-set check cannot see it.
+    rows = tokenless_cancel_turn()
+    journey, _ = natural_cancel_journey(
+        tmp_path, monkeypatch, [rows, [task_state(status, "task_other"), *settled()]],
+        prior=[task_state("active", "task_other")],
+    )
+    with pytest.raises(ValueError, match="journey_cancel_foreign"):
+        run_step(journey)
+
+
 @pytest.mark.parametrize("prior", ["cancelling", "interrupted", "completed"])
 def test_task_not_active_at_step_start_cannot_be_naturally_cancelled(
     tmp_path, monkeypatch, prior,
