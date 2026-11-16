@@ -1732,7 +1732,8 @@ async def test_nonadmitted_evidence_result_continues_response_without_fake_lease
         *, typed_input: tuple[int, int] | None = None, cancel_target: str | None = None,
     ) -> None:
         del self, speech_authority, operation, turn_id, transcript, updates
-        assert typed_input is None
+        # Typed lineage is advisory and independent of capture (#237); the lease is not.
+        assert typed_input == (1, 1)
         observed.append(evidence_lease)
 
     monkeypatch.setattr(EvidenceAdmissionControllerV1, "try_reserve_user_turn", reserve)

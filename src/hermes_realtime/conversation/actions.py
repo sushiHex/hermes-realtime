@@ -445,11 +445,14 @@ class ConversationUpdateExecutor:
         # Final-input admission: freeze the natural cancel target with no suspension
         # since the final was admitted, and carry it unchanged to the producer (#237).
         cancel_target = self._speech.freeze_natural_cancel_target()
+        # Advisory typed lineage comes from the admitted user authority alone; it must
+        # not depend on evidence capture, which is off by default (#237).
         typed_input = None
-        if (evidence_lease is not None and authority is not None
+        if (authority is not None
                 and authority.source is InputSource.TYPED
                 and type(authority.typed_sequence) is int
                 and 1 <= authority.typed_sequence < (1 << 53)
+                and type(authority.binding_generation) is int
                 and 1 <= authority.binding_generation < (1 << 53)):
             typed_input = (authority.typed_sequence, authority.binding_generation)
         coroutine = self._execute_response(
