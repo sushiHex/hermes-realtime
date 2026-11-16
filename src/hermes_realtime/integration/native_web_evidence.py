@@ -272,8 +272,17 @@ def _extract_text_result(
     return result, cast(list[dict[str, Any]], items)
 
 
+def _codex_completed(response: Any) -> bool:
+    status = getattr(response, "status", None)
+    return type(status) is str and status == "completed"
+
+
 def _terminal_text(response: Any, api_mode: str) -> str:
     if api_mode == "codex_responses":
+        # An unfinished native final is the same fact as chat's finish_reason != stop, so it
+        # gets the same cause; the shared parser's literal stays for the presenter path.
+        if not _codex_completed(response):
+            raise ValueError("native-final-response")
         calls, text, _final = _raw_responses_result(response)
         if calls or type(text) is not str or not text.strip():
             raise ValueError("native-final-response")
@@ -296,6 +305,8 @@ def _terminal_text(response: Any, api_mode: str) -> str:
 
 def _has_tool_calls(response: Any, api_mode: str) -> bool:
     if api_mode == "codex_responses":
+        if not _codex_completed(response):
+            return False  # no completed calls to forward; _terminal_text names the refusal
         calls, _text, _final = _raw_responses_result(response)
         return bool(calls)
     choices = getattr(response, "choices", None)

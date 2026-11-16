@@ -332,3 +332,69 @@ async def test_undeclared_value_error_literal_is_not_emitted(
     assert set(marker) == FIELDS
     assert (marker["reason"], marker["phase"], marker["cause"], marker["error_class"]) == (
         "presentation_failed", "presentation", "undeclared", "ValueError")
+
+
+# A native final that did not finish is one fact; both routes name it the same way (#557).
+def _incomplete_chat_final() -> Any:
+    response = _final_response()
+    response.choices[0].finish_reason = "length"
+    return response
+
+
+@pytest.mark.asyncio
+async def test_codex_incomplete_native_final_names_final_response(capsys: Any) -> None:
+    response = SimpleNamespace(status="incomplete", output=[_codex_message("Native draft.")])
+    await _refused_codex(_observer(), response)
+
+    [marker] = _markers(capsys)
+    assert (marker["reason"], marker["cause"], marker["phase"]) == (
+        "final_response", "native-final-response", "final")
+
+
+@pytest.mark.asyncio
+async def test_chat_unfinished_native_final_keeps_final_response(
+    monkeypatch: Any, capsys: Any,
+) -> None:
+    _install_fake_openai_models(monkeypatch)
+    observer = _observer()
+    task = asyncio.current_task()
+    assert task is not None
+    _bind_run(observer, task)
+    _web_turn(observer)
+    returned = await asyncio.to_thread(_final_turn, observer, _incomplete_chat_final())
+
+    assert returned.choices[0].message.content == '{"error": "policy_refused"}'
+    [marker] = _markers(capsys)
+    assert (marker["reason"], marker["cause"]) == ("final_response", "native-final-response")
+
+
+class _IncompletePresenter(_Presentation):
+    async def complete(self, *_args: Any, **_kwargs: Any) -> Any:
+        self.calls += 1
+        return SimpleNamespace(status="incomplete", usage=None, output=[
+            _codex_message(_answer(LEAD, "The retrieved report supports this result.", [0]))])
+
+
+@pytest.mark.asyncio
+async def test_codex_incomplete_presenter_response_keeps_its_own_category(
+    capsys: Any,
+) -> None:
+    observer = _observer(_IncompletePresenter())
+    returned = await _codex_run(observer, _codex_final(_codex_message("Native draft.")), "web")
+
+    assert returned.output_text == '{"error": "policy_refused"}'
+    [marker] = _markers(capsys)
+    assert marker["reason"] != "final_response"
+    assert (marker["cause"], marker["phase"]) == ("responses-not-completed", "render")
+
+
+@pytest.mark.asyncio
+async def test_codex_incomplete_intermediate_turn_is_refused_as_a_final(capsys: Any) -> None:
+    # An unfinished turn carries no completed calls to forward.
+    call = SimpleNamespace(type="function_call", status="completed", call_id="call_1",
+                           name="web_search", arguments='{"query": "more"}')
+    response = SimpleNamespace(status="incomplete", output=[call])
+    await _refused_codex(_observer(), response)
+
+    [marker] = _markers(capsys)
+    assert marker["cause"] == "native-final-response"
