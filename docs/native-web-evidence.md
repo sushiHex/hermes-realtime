@@ -123,11 +123,18 @@ an `enum` of the shown IDs), because the formatter backend cuts a field at its b
 rather than overflow it. A field past its accepted bound, a lone surrogate, a chat
 `finish_reason` of `length`, or a Codex `incomplete` stop for `max_output_tokens` is
 therefore a cut, refused as `too_long` before any other content or source check. Bounds
-count code points, as Python `len` does. The instructions stay one constant and refer
-to the top-level `limits` object; the schema is a per-request copy. Support
-can be empty when the lead fully answers the request, including honest uncertainty;
-its explicit slot retains requested supporting dates and qualifications for richer
-answers. Overlong leads are refused, never truncated or independently summarized.
+count code points, as Python `len` does. The instructions are one fixed text followed
+by this request's numeric budgets (lead, support and source count), rendered by
+`presentation_instructions` from the same validated top-level `limits` object that sets
+the schema bounds, so instructions, schema and input always agree; evidence and
+objective text cannot change a stated budget. The schema is likewise a per-request
+copy. The Codex route attests the exact rendered instructions; chat records their
+hash. Support is written concisely in priority order: requested findings first, then
+material qualifications and uncertainty, then requested dates, context and
+attribution. When the requested findings cannot all fit, the presenter gives a bounded
+summary and states its scope (for example, the main points) rather than claiming
+completeness or weakening uncertainty. Support can be empty when the lead fully
+answers the request, including honest uncertainty. Overlong leads are refused, never truncated or independently summarized.
 Normal speech normalization still applies after this projection. An empty source
 list is permitted for uncertainty and produces no sources footer. Shared wording
 and a required support slot do not prove agreement or factual completeness.
