@@ -374,7 +374,10 @@ stopped. An accepted cancel, whose task is still running, gets the accepted-star
 continuation pattern: one tool-free model request whose new fact is the accepted
 cancellation, instructed to say the task is being stopped and not that it stopped. A
 cancellation acknowledgment means stopping was requested; only the terminal state
-shows the task ended.
+shows the task ended. Speech the model emits before it selects cannot be undone, and
+no phrase guard checks either it or the acknowledgment for a stopped claim; that
+wording remains a manual truthfulness check. A turn answering a heard proposal
+readback offers no cancel, so "no, cancel that" cannot reach the running task.
 
 Invariant: the model never names a task, so a wrong-task cancel is impossible. The
 residual risk is a cancel of the one running task on a turn that did not ask for it,

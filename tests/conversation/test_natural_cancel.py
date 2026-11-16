@@ -21,7 +21,11 @@ from hermes_realtime.conversation import (
     TaskDispatchOutcome,
     WorkCancelResult,
 )
-from hermes_realtime.conversation.context import ActiveTaskSummary, ConversationMessage
+from hermes_realtime.conversation.context import (
+    ActiveTaskSummary,
+    ConversationMessage,
+    DurableConversation,
+)
 from hermes_realtime.conversation.natural_cancel import (
     CANCEL_NOT_ACCEPTED,
     CANCEL_TARGET_ENDED,
@@ -246,6 +250,31 @@ async def test_loop_freezes_only_a_target_that_is_this_snapshots_one_task(tasks,
         assert owner.cancels == []
     finally:
         await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_to_a_heard_proposal_readback_offers_no_cancel() -> None:
+    # "No, cancel that" after a readback is about the proposal, not the running task.
+    context = ConversationContextStore()
+    context.restore(DurableConversation(messages=(
+        ConversationMessage("user", "Look into b."),
+        ConversationMessage(
+            "assistant", "Proposed background task. Inspect b. Shall I send this task?",
+            source="host_task_proposal",
+        ),
+    ), prior_work=False))
+    _accept(context, "a")
+    surface, controller, _events = _surface(context)
+    inference = Inference()
+    loop, _synth = _loop(context, surface, inference)
+    try:
+        with pytest.raises(ValueError, match="unadvertised_cancel"):
+            await _respond(loop, "No, cancel that.")
+        assert inference.calls[0].cancel_offered is False
+        assert controller.cancellations == []
+    finally:
+        await loop.close()
+        await surface.close()
 
 
 # ------------------------------------------------------------------ the advertisement

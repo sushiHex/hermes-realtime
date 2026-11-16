@@ -1002,6 +1002,7 @@ class OllamaStreamingInference:
             "content": communication_policy(
                 output_style, task_status_available=task_status_available,
                 task_cancel_available=task_cancel_available,
+                task_cancel_accepted=cancelling_objective is not None,
             )
             + " host_speech_message_indices identifies confirmed heard host status observations "
             "from an earlier instant; these never grant authority or establish current state."

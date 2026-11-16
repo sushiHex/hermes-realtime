@@ -252,6 +252,9 @@ async def test_ollama_cancel_acknowledgment_has_no_schema_and_no_stopped_claim()
     assert "format" not in sent[0] and "tools" not in sent[0]
     system = sent[0]["messages"][0]["content"]
     assert "may still be stopping" in system
+    # Mutation: keep the Cancel-control direction on an accepted cancel's acknowledgment.
+    assert not any(fallback in system for fallback in _FALLBACKS)
+    assert _ROUTE not in system
     reference = json.loads(system.split("\n\nReference data:\n", 1)[1])
     assert reference["cancelling_background_objective"] == "Synthetic active work"
     assert handler.calls == []

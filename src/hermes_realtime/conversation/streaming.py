@@ -2594,6 +2594,11 @@ class StreamingSpeechLoop:
         _validate_task_id(target)
         if tuple(task.task_id for task in snapshot.active_tasks) != (target,):
             return None
+        # An answer to a heard proposal readback ("no, cancel that") is about the
+        # proposal, not the running task.
+        messages = snapshot.messages
+        if len(messages) >= 2 and messages[-2].source == "host_task_proposal":
+            return None
         return target
 
     @staticmethod
