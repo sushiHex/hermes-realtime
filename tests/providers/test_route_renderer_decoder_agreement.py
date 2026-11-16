@@ -20,6 +20,7 @@ import pytest
 
 import hermes_realtime.providers.codex_app_server as codex_app_server
 import hermes_realtime.providers.ollama as ollama
+from hermes_realtime.conversation.natural_cancel import HostCancelRequest
 from hermes_realtime.conversation.streaming import ModelOutputRefused
 from hermes_realtime.conversation.task_proposals import (
     MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
@@ -68,7 +69,7 @@ async def _ollama_select(cell: Any, decision: dict[str, object]) -> tuple[Any, A
     """Send the cell's request and answer it with one decision; return (format, outcome)."""
 
     sent: list[Request] = []
-    structured = cell.handler is not None and cell.purpose != "ack"
+    structured = cell.handler is not None and cell.purpose not in ("ack", "cancel_ack")
     record: dict[str, object] = {"message": {"content": json.dumps(decision)}, "done": True}
     if structured:
         record["done_reason"] = "stop"
@@ -145,6 +146,9 @@ async def test_the_local_adapter_accepts_exactly_the_kinds_its_schema_names(
             (proposal,) = outcome
             assert type(proposal) is HostTaskProposalRequest
             assert proposal.objective == "x" * bound
+        elif kind == "cancel_work":
+            (cancel,) = outcome
+            assert type(cancel) is HostCancelRequest
         else:
             (status,) = outcome
             assert type(status) is HostSpeechRequest
@@ -162,7 +166,10 @@ def test_the_local_matrix_reaches_every_schema_shape() -> None:
         for request in _fixture_requests("ollama").values()
     }
 
-    assert kinds == {(), ("reply",), ("reply", "start_work", "task_status")}
+    assert kinds == {
+        (), ("reply",), ("reply", "start_work", "task_status"),
+        ("cancel_work", "reply", "start_work", "task_status"),
+    }
 
 
 # --------------------------------------------------------------------------- Codex adapter
@@ -300,4 +307,7 @@ def test_the_codex_matrix_reaches_every_tool_set_it_can_offer() -> None:
         ("search_knowledge", "start_work"),
         ("start_work", "task_status"),
         ("search_knowledge", "start_work", "task_status"),
+        # Only a host-frozen cancel target adds the cancel route, always beside status.
+        ("cancel_work", "start_work", "task_status"),
+        ("cancel_work", "search_knowledge", "start_work", "task_status"),
     }

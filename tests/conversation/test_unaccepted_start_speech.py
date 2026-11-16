@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import pytest
 
 from hermes_realtime.conversation import (
-    ActiveTaskIdentityError,
     ConversationContextStore,
     ForegroundTurnCoordinator,
     StreamingSpeechLoop,
@@ -169,39 +168,8 @@ async def test_expired_selection_never_dispatched_speaks_the_general_sentence():
 
 
 @pytest.mark.asyncio
-async def test_accepted_then_inactive_never_claims_it_did_not_start():
-    # Hermes accepted the run; a pending cancel then found it no longer active. The
-    # result is rejected with a task identity, so "not started" would be false here.
-    gate = asyncio.Event()
-    context = ConversationContextStore()
-    surface, controller, _ = _surface(context=context, dispatch_gate=gate)
-
-    async def inactive(task_id, *, reason=None):
-        controller.cancellations.append((task_id, reason))
-        raise ActiveTaskIdentityError("task is not active")
-
-    controller.request_cancel = inactive
-    loop, synth = _loop(context, _proposals(surface), Inference())
-    operation = asyncio.create_task(_respond(loop))
-    try:
-        await controller.dispatch_started.wait()
-        cancel = asyncio.create_task(surface.cancel_active_work(invocation_id="cancel_1"))
-        await asyncio.sleep(0)
-        gate.set()
-        await operation
-        await cancel
-        assert len(controller.cancellations) == 1
-        _assert_one_host_sentence(context, synth, NOT_RUNNING)
-    finally:
-        gate.set()
-        await loop.close()
-        await surface.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cancelled", [False, True], ids=["active", "cancelling"])
-async def test_accepted_start_has_no_host_refusal_sentence(cancelled):
-    # Mutation: speak the sentence for every result, or for accepted cancelling.
+async def test_accepted_start_has_no_host_refusal_sentence():
+    # Mutation: speak the sentence for every result.
     gate = asyncio.Event()
     context = ConversationContextStore()
     surface, controller, _ = _surface(context=context, dispatch_gate=gate)
@@ -210,17 +178,11 @@ async def test_accepted_start_has_no_host_refusal_sentence(cancelled):
     operation = asyncio.create_task(_respond(loop))
     try:
         await controller.dispatch_started.wait()
-        cancel = None
-        if cancelled:
-            cancel = asyncio.create_task(surface.cancel_active_work(invocation_id="cancel_1"))
-            await asyncio.sleep(0)
         gate.set()
         await operation
-        if cancel is not None:
-            await cancel
         assert _host_messages(context) == []
         assert NOT_RUNNING not in synth.texts and UNAVAILABLE not in synth.texts
-        assert synth.texts == ([] if cancelled else ["I have started the work."])
+        assert synth.texts == ["I have started the work."]
     finally:
         gate.set()
         await loop.close()

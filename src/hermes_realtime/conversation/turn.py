@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from .context import ConversationContextSnapshot, ConversationRole
 from .streaming import (
+    AcceptedCancelInferenceRequest,
     AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
     ConversationPromptUpdate,
@@ -23,7 +24,7 @@ def _require_bool(name: str, value: object) -> None:
 class ForegroundTurn:
     """One request for foreground inference, in the only form an adapter renders.
 
-    Built from one of the three exact request types; anything else, a subclass included,
+    Built from one of the four exact request types; anything else, a subclass included,
     is refused. ``request`` is rebuilt here, once, so what an adapter reads was validated
     by this type and not by the caller. Everything else is read from that one copy, so a
     purpose cannot be claimed apart from the request that carries it.
@@ -41,12 +42,20 @@ class ForegroundTurn:
                 terminal_task_count=request.terminal_task_count, memory=request.memory,
                 recent_task_results=request.recent_task_results, task_id=request.task_id,
             )
+        elif type(request) is AcceptedCancelInferenceRequest:
+            rebuilt = AcceptedCancelInferenceRequest(
+                revision=request.revision, messages=request.messages,
+                active_tasks=request.active_tasks,
+                terminal_task_count=request.terminal_task_count, memory=request.memory,
+                recent_task_results=request.recent_task_results, task_id=request.task_id,
+            )
         elif type(request) is ConversationInferenceRequest:
             rebuilt = ConversationInferenceRequest(
                 revision=request.revision, messages=request.messages,
                 active_tasks=request.active_tasks,
                 terminal_task_count=request.terminal_task_count, memory=request.memory,
                 recent_task_results=request.recent_task_results, updates=request.updates,
+                cancel_offered=request.cancel_offered,
             )
         elif type(request) is ConversationContextSnapshot:
             rebuilt = ConversationContextSnapshot(
@@ -83,6 +92,27 @@ class ForegroundTurn:
         )
 
     @property
+    def cancelling_objective(self) -> str | None:
+        """The objective whose cancellation was accepted, on that acknowledgment only."""
+        request = self.request
+        if type(request) is not AcceptedCancelInferenceRequest:
+            return None
+        return next(
+            task.objective for task in request.active_tasks if task.task_id == request.task_id
+        )
+
+    @property
+    def acknowledgment(self) -> bool:
+        """Whether this is a tool-free acknowledgment of an accepted start or cancel."""
+        return self.accepted_objective is not None or self.cancelling_objective is not None
+
+    @property
+    def cancel_offered(self) -> bool:
+        """Whether the host froze a natural cancel target for this admitted user turn."""
+        request = self.request
+        return type(request) is ConversationInferenceRequest and request.cancel_offered
+
+    @property
     def awaiting_reply(self) -> bool:
         """Whether the last heard row is the user's."""
         messages = self.request.messages
@@ -95,10 +125,14 @@ class TurnRoutes:
 
     start_work: bool
     task_status: bool
+    cancel_work: bool = False
 
     def __post_init__(self) -> None:
         _require_bool("start_work", self.start_work)
         _require_bool("task_status", self.task_status)
+        _require_bool("cancel_work", self.cancel_work)
+        if self.cancel_work and not self.task_status:
+            raise ValueError("cancel_work is offered only where task_status is")
 
 
 def turn_routes(
@@ -111,9 +145,10 @@ def turn_routes(
 ) -> TurnRoutes:
     """Decide the work routes for one turn.
 
-    Both routes need a bound work handler, a user row to answer, a turn that is not an
+    Every route needs a bound work handler, a user row to answer, a turn that is not an
     acknowledgment, and no private material. A lookup already attempted for the turn
-    withdraws only the start. The status route also needs an admitted user turn.
+    withdraws only the start. The status route also needs an admitted user turn, and the
+    cancel route needs that plus a cancel target the host froze for this turn.
 
     ``start_requires_admission`` records the one point on which the two adapters differ
     today: whether an unadmitted request may still be offered the start.
@@ -128,7 +163,7 @@ def turn_routes(
     offered = (
         work_bound
         and turn.awaiting_reply
-        and turn.accepted_objective is None
+        and not turn.acknowledgment
         and not private_material
     )
     return TurnRoutes(
@@ -138,4 +173,5 @@ def turn_routes(
             and (turn.admitted or not start_requires_admission)
         ),
         task_status=offered and turn.admitted,
+        cancel_work=offered and turn.admitted and turn.cancel_offered,
     )

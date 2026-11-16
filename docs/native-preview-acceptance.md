@@ -152,38 +152,52 @@ correct, current or complete.
   words in your transcript yes or no; every `[speech-stop]` line; the task state
   before, after and at the end.
 
-### 8. Explicit task commands
+### 8. Task control by natural speech
 
-Run these in order and record each part separately. A task card shows its state as
-**Running** (active), **Stopping** (cancelling), **Stopped after** (interrupted),
-**Completed in**, **Failed after** or **Not started**.
+Speech has no command words: every spoken turn is an ordinary turn, and the model
+decides whether it asks to start or stop work. Run these in order and record each part
+separately. A task card shows its state as **Running** (active), **Stopping**
+(cancelling), **Stopped after** (interrupted), **Completed in**, **Failed after** or
+**Not started**.
 
-1. **Spoken start.** Say `start task` and a short harmless objective without pausing
-   after the words. Expect one new task card that reads **Running** and then
-   **Completed in**. The command is recognized only when the final transcript begins
-   with `start task` followed by a space, so a transcript with a comma after `task` is
-   an ordinary turn. If that happens, record the punctuation category, not the words.
-2. **Typed start.** Type `task: ` followed by a short harmless objective. Expect the
-   same.
-3. **Cancel with no task.** With no active task, say `cancel task`. Expect the page to
-   say there is no active task to cancel, and nothing else to change.
-4. **Cancel with one task.** Start one longer harmless task, then say `cancel task`.
-   Expect exactly that task to read **Stopping** and then **Stopped after**.
-5. **Ambiguous cancel.** Start two longer harmless tasks with different objectives,
-   then say `cancel task`.
-   Expect the page to say several tasks are active and to point to the task card's
-   **Cancel** control, with neither task changing. Press **Cancel** on one card and
-   expect only that task to read **Stopping** and then **Stopped after**. Then press
-   **Cancel** on the other card and expect the same for it.
+1. **Natural start.** Ask in ordinary words for a short harmless piece of background
+   work. Expect one new task card that reads **Running** and then **Completed in**.
+2. **Old words are ordinary.** Say `start task` followed by a short harmless
+   objective, and later, with no task running, say `cancel task`. Expect no command
+   guidance on the page for either. The first is handled like any other spoken
+   request, so it may start one task the way part 1 does; the second changes nothing.
+3. **Natural cancel with no task.** With no task running, ask in ordinary words to stop
+   the background work. Expect a truthful spoken reply that nothing is running, and no
+   card to change.
+4. **Natural cancel with one task.** Start one longer harmless task. While it reads
+   **Running**, ask in ordinary words to stop it. Expect exactly that task to read
+   **Stopping** and then **Stopped after**. The spoken reply may say the task is being
+   stopped; before the card reads **Stopped after** it must not say the task has
+   stopped.
+5. **Natural cancel with several tasks.** Start two longer harmless tasks with
+   different objectives, then ask in ordinary words to stop the work. Expect a spoken
+   reply pointing to the task card's **Cancel** control, with neither task changing.
+6. **Card Cancel.** Press **Cancel** on one of the two cards from part 5. Expect only
+   that task to read **Stopping** and then **Stopped after**. Then press **Cancel** on
+   the other card and expect the same for it.
+7. **Typed start.** Type `task: ` followed by a short harmless objective. Expect one new
+   task card that reads **Running** and then **Completed in**.
 
 - **Record:** for each part, the state sequence and task-card count; seconds from the
-  command to **Running**, **Completed in** or **Stopped after**; for parts 3 and 5,
-  guidance shown yes or no and tasks changed by the bare command (expect 0).
+  request to **Running**, **Completed in** or **Stopped after**; for parts 2, 3 and 5,
+  command guidance shown yes or no and tasks changed (expect 0 for part 2's
+  `cancel task`, part 3 and part 5); for part 4, whether the reply claimed the task had
+  stopped before the card read **Stopped after**.
 
-A cancellation acknowledgment means stopping was requested. Only the terminal state
-shows that the task ended. The card's **Cancel** sends the typed
-`cancel task: <task-id>` command for that card. The card does not display the
-identifier, so typing that form by hand is not part of this step.
+The host offers the model a cancel only when exactly one task is running and no start
+awaits acknowledgment, and it fixes that task when your final words are admitted, so
+the model never chooses which task to stop. Whether a turn asked to stop at all is
+still the model's judgment: a cancel on a turn that did not ask for one is the known
+residual risk, so record any such cancel in parts 1 to 3. A cancellation acknowledgment
+means stopping was requested. Only the terminal state shows that the task ended. The
+card's **Cancel** sends the typed `cancel task: <task-id>` command for that card. The
+card does not display the identifier, so typing that form by hand is not part of this
+step.
 
 ### 9. Disconnect and reconnect
 

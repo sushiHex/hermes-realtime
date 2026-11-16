@@ -15,11 +15,15 @@ from hermes_realtime.providers._call_imitation import (
 
 def test_registry_matches_the_codex_dynamic_tools() -> None:
     assert ADVERTISED_TOOL_NAMES == codex_app_server._DYNAMIC_TOOL_NAMES
-    assert sorted(ADVERTISED_TOOL_NAMES) == ["search_knowledge", "start_work", "task_status"]
+    assert sorted(ADVERTISED_TOOL_NAMES) == [
+        "cancel_work", "search_knowledge", "start_work", "task_status",
+    ]
 
 
 def test_ollama_work_kinds_are_advertised_names() -> None:
-    schema = ollama.OllamaStreamingInference._work_response_schema(256, can_start=True)
+    schema = ollama.OllamaStreamingInference._work_response_schema(
+        256, can_start=True, can_cancel=True,
+    )
     kinds = {
         branch["properties"]["kind"]["const"]  # type: ignore[index]
         for branch in schema["oneOf"]  # type: ignore[attr-defined]

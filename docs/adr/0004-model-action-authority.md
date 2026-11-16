@@ -1,6 +1,7 @@
-# ADR 0004: Host-authorized natural task starts, explicit task cancellation
+# ADR 0004: Host-authorized natural task starts, host-targeted task cancellation
 
-Status: Accepted by owner decision on 2026-10-10, amended on 2026-10-16 and 2026-10-27;
+Status: Accepted by owner decision on 2026-10-10, amended on 2026-10-16, 2026-10-27 and
+2026-11-15;
 implementation tracked in
 [#226](https://github.com/sushiHex/hermes-realtime/issues/226).
 [Decision record](https://github.com/sushiHex/hermes-realtime/issues/205#issuecomment-6096188370).
@@ -25,6 +26,15 @@ The host retains `confirm` as the compatibility default; an authorized compositi
 selects `task_start_policy="automatic"`. This policy does not mutate running
 sessions, qualify model routing, or authorize model cancellation or downstream
 tool approvals. Prior decisions and failed semantic observations remain evidence.
+
+The [2026-11-15 owner decision](https://github.com/sushiHex/hermes-realtime/issues/237)
+approves a host-targeted natural cancel, because voice task control is natural speech
+only and removing the spoken `cancel task` command would otherwise leave no way to
+cancel by voice. The model may select a no-argument cancel; the host alone names the
+task, and only when exactly one task is running and no start awaits acknowledgment
+(see [Host-targeted natural cancel](#host-targeted-natural-cancel)). This amends the
+exclusion of model cancellation below. It grants no approval authority, and the
+#205 and #280 observations remain counter-evidence.
 
 ## Context
 
@@ -79,9 +89,11 @@ is available; tool-less readiness does not. This documents the existing handoff,
 not a new semantic validator or a guarantee of model obedience. It does not
 forward history or change explicit-command admission.
 
-The model has no cancellation or approval tool. Explicit admitted user commands
-and trusted task-specific controls retain cancellation and their exact-target
-and ambiguity checks. Model text is never routed back as a user command.
+The model has no approval tool, and it never names a task to cancel. Its only
+cancellation is the host-targeted selection below, offered when exactly one task
+is running. Explicit admitted user commands and trusted task-specific controls
+retain cancellation and their exact-target checks. Model text is never routed
+back as a user command.
 Speaking interrupts speech and the foreground turn, not background tasks.
 Interruption after work admission must not cancel independently owned work.
 
@@ -189,8 +201,9 @@ identity, capacity, replay and acknowledgment checks. A confirmed card or comman
 is not active work. The existing task card reports active only after Hermes's
 validated accepted acknowledgment; rejection and uncertainty remain distinct.
 This slice adds no spoken-start acknowledgment. Existing completion speech and
-explicit task commands/cancellation remain available. Confirmation grants neither
-realtime task cancellation nor downstream approval authority; Hermes policy still
+explicit task commands/cancellation remain available. Confirmation grants no
+downstream approval authority and no cancellation beyond the host-targeted route
+below; Hermes policy still
 governs delegated effects. Natural routing remains off by default and requires
 an explicit candidate configuration and its independent promotion gates.
 
@@ -219,7 +232,8 @@ Duplicate keys, extra fields, invalid types, incomplete or truncated responses,
 and unexpected native calls are refused. No textual-call recovery, second model
 call, or fallback transport is attempted. Selection returns a typed proposal to
 the host; only host-authorized admission can reach the existing controller.
-Disabling natural work preserves explicit commands. This decision does not
+Disabling natural work removes the natural cancel with the start and status
+routes, and preserves explicit commands. This decision does not
 silently change an already running session.
 
 The bound Ollama decision is decoded deterministically (`temperature` 0). With
@@ -236,8 +250,13 @@ shared routing rule (`WORK_ROUTING_POLICY`, #280, aligned for the confirmed prop
   background work provides;
 - questions about whether work is running or done select task status when supplied,
   otherwise an ordinary truthful status reply;
-- cancellation and approval requests receive a truthful ordinary reply directing
-  the user to existing explicit controls, never task status or a new proposal;
+- when the host offers the natural cancel, a request to stop the running task
+  selects `cancel_work`; otherwise cancellation requests, and approval requests
+  always, receive a truthful ordinary reply directing the user to existing explicit
+  controls, never task status or a new proposal. Exactly one of the two cancellation
+  rules is rendered for a turn (`WORK_ROUTING_POLICY_WITH_CANCEL` or
+  `WORK_ROUTING_POLICY`), because a fallback beside an advertised route competes
+  with it (#317);
 - supplied evidence or an available foreground lookup takes precedence for a
   question it can answer. Otherwise requests needing current external information,
   research, tools or sustained work propose an objective. Codex retains its bounded
@@ -323,6 +342,55 @@ still make false lifecycle claims, and the model may never select status.
 Retain that counterexample and measure selection and unsupported claims
 separately. No phrase filter, routing model or semantic guarantee is added.
 
+## Host-targeted natural cancel
+
+Amended by owner decision on 2026-11-15
+([#237](https://github.com/sushiHex/hermes-realtime/issues/237)). An admitted user
+turn may select `cancel_work`, shaped like task status: Ollama uses the exact object
+`{"kind":"cancel_work"}`; Codex uses the native tool with exact empty arguments. The
+selection carries no task, text or reason. It is terminal and shares the
+one-host-selection-per-turn rule with status, so a second status, cancel or start in
+the same turn is refused.
+
+The host decides whether the route exists and which task it names, at one instant:
+when the user's final input is admitted, before inference. It offers the route only
+when work control is open, exactly one task is running in both the context and the
+controller, no start awaits acknowledgment, and no cancellation is already requested.
+It freezes that task for the turn, with no suspension since the final was admitted, and
+carries it unchanged through cleanup and inference. When the turn's request is built,
+the frozen task must still be the snapshot's one task and the owner's current target;
+otherwise the turn offers no route. Nothing is resolved again. Zero tasks, several tasks or a pending start offer
+no route, and the instructions keep directing the user to the task card's **Cancel**
+control. The route and that direction are never rendered together (#317). Readiness,
+announcements, acknowledgments, assistant-ending turns and other non-user turns never
+offer it, and it shares the natural-work binding with status.
+
+The host executes a selection only after the provider stream closes successfully and
+while the admitting lease is current, and only as `cancel_work(task_id=frozen)`. That
+call refuses `stale_target` if the frozen task has ended; it never chooses another
+task, including one started since admission. A selection on a turn that offered no
+route is refused with no effect. Interruption before execution cancels nothing. The
+commit point is admission under the work surface's lock: the admitting lease is re-read
+there, with no suspension before the cancel binds, so a newer turn that supersedes this
+one while the cancel waits for the lock cancels nothing and projects nothing.
+
+Speech about the cancel is grounded only in its result. A refusal speaks one fixed host
+sentence chosen by result category, never the result's reason, and none says a task
+stopped. An accepted cancel, whose task is still running, gets the accepted-start
+continuation pattern: one tool-free model request whose new fact is the accepted
+cancellation, instructed to say the task is being stopped and not that it stopped. A
+cancellation acknowledgment means stopping was requested; only the terminal state
+shows the task ended. Speech the model emits before it selects cannot be undone, and
+no phrase guard checks either it or the acknowledgment for a stopped claim; that
+wording remains a manual truthfulness check. A turn answering a heard proposal
+readback offers no cancel, so "no, cancel that" cannot reach the running task.
+
+Invariant: the model never names a task, so a wrong-task cancel is impossible. The
+residual risk is a cancel of the one running task on a turn that did not ask for it,
+the neutral-turn behavior #205 demonstrated. Only the model's judgment guards against
+that; the instructions are not a validator, and no intent classifier is added. The
+#205 and #280 observations remain counter-evidence and are not reinterpreted.
+
 ## Trust and limits
 
 Under this path, the foreground model still proposes objectives
@@ -353,7 +421,8 @@ prose; structural validation is not a semantic guarantee about that string.
 Model output that imitates a tool call is refused before it is yielded
 ([#311](https://github.com/sushiHex/hermes-realtime/issues/311)). Real calls arrive only
 through structured provider channels, so reply text containing call syntax for an
-advertised tool (`start_work`, `task_status`, `search_knowledge`) is an imitation and is
+advertised tool (`start_work`, `task_status`, `cancel_work`, `search_knowledge`) is an
+imitation and is
 not speakable. The guard is a bounded, case-insensitive, per-segment syntactic check in
 `providers/_call_imitation.py`, applied in the Ollama adapter (both the no-tools stream
 and the structured reply path) and the Codex adapter (every agent-message segment, in
@@ -495,8 +564,12 @@ and routing thresholds remain unchanged.
   delegate with the intended objective; ordinary conversation and explanations
   remain direct. Include negation, quotation, neutral turns and instruction-shaped
   reference data. Report denominators, errors and latency without real user text.
-- Forced cancellation and approval calls have zero effect with unrelated work
-  active. Explicit start/cancel controls retain their positive coverage.
+- Forced approval calls, and forced cancel selections when the route is not
+  offered (no task, several tasks, a pending start, non-user turns), have zero
+  effect with unrelated work active. A natural cancel selection cancels exactly the
+  host-frozen task, and a task that ended before selection is refused as stale with
+  no replacement chosen. Explicit start/cancel controls retain their positive
+  coverage.
 - No start from preflight, memory refresh, announcements or cancelled turns.
   At most one admitted model start per turn; replay cannot duplicate its effect.
 - Schema, objective, capacity and identity refusals fail closed. Each changed
@@ -517,6 +590,8 @@ and routing thresholds remain unchanged.
 Per-objective confirmation remains available for callers that require that
 boundary. The owner now accepts automatic natural starts under explicit host
 authorization despite the retained semantic failures. Explicit commands remain available.
-Model cancellation recreates the demonstrated neutral-turn risk and is excluded.
-A second intent model or imperative-word allowlist adds machinery without proving
+Model-targeted cancellation, where the model names the task or the host resolves the
+target when the model selects, can cancel the wrong task and remains excluded. The
+owner accepted host-targeted cancellation on 2026-11-15 with its residual neutral-turn
+risk. A second intent model or imperative-word allowlist adds machinery without proving
 intent. Hermes remains the sole background executor.

@@ -193,6 +193,12 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     owner = captured["local_model_selection"]
     assert type(owner) is host.OllamaSessionSelection
     assert captured["speech_inference"] is owner
+    # The natural cancel shares the natural-work binding (#237).
+    cancellation = captured["speech"]._task_cancellation
+    assert (
+        type(cancellation) is host.ConversationWorkControlSurface
+        if natural_tools else cancellation is None
+    )
     assert captured["model_configuration"] is None
     assert events == []
     await launcher._preflight()

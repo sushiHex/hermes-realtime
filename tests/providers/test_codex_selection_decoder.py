@@ -143,6 +143,11 @@ _REFUSALS: dict[str, _Row] = {
         _selection("task_status", {"task_id": "task_1"}),
         _selection("task_status", {"objective": _OBJECTIVE}),
     ), (_BOUND, True)),
+    # The cancel names no task: the host froze its target (#237).
+    "Codex cancel_work arguments are invalid": (_STATUS_ARGUMENTS_LINE, (
+        _selection("cancel_work", {"task_id": "task_1"}),
+        _selection("cancel_work", {"reason": "now"}),
+    ), (_BOUND, True)),
 }
 _CASES = [
     pytest.param(reason, line, selection, setup, id=f"{reason.removeprefix('Codex ')}-{index}")
@@ -254,7 +259,7 @@ class _Turn:
 
 
 _VALID: dict[str, dict[str, object]] = {
-    "search_knowledge": _SEARCH, "start_work": _START, "task_status": {},
+    "search_knowledge": _SEARCH, "start_work": _START, "task_status": {}, "cancel_work": {},
 }
 _ALL = tuple(_VALID)
 
@@ -287,6 +292,14 @@ _SECOND: dict[tuple[str, str], tuple[bool, str]] = {
     ("task_status", "search_knowledge"): (False, _ADDITIONAL_CHOICE_LINE),
     ("task_status", "start_work"): (False, _ADDITIONAL_CHOICE_LINE),
     ("task_status", "task_status"): (False, _ADDITIONAL_CHOICE_LINE),
+    # The cancel is a terminal host selection, exactly as status is.
+    ("search_knowledge", "cancel_work"): (True, _NO_LINE),
+    ("start_work", "cancel_work"): (False, _ADDITIONAL_CHOICE_LINE),
+    ("task_status", "cancel_work"): (False, _ADDITIONAL_CHOICE_LINE),
+    ("cancel_work", "search_knowledge"): (False, _ADDITIONAL_CHOICE_LINE),
+    ("cancel_work", "start_work"): (False, _ADDITIONAL_CHOICE_LINE),
+    ("cancel_work", "task_status"): (False, _ADDITIONAL_CHOICE_LINE),
+    ("cancel_work", "cancel_work"): (False, _ADDITIONAL_CHOICE_LINE),
 }
 
 

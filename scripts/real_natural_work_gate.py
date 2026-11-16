@@ -548,8 +548,8 @@ class RecordingWorkHandler:
     def __init__(self, delegate: Any, *, clock: Callable[[], float] = time.perf_counter) -> None:
         if not callable(getattr(delegate, "start_work", None)):
             raise TypeError("delegate must provide start_work()")
-        if not callable(getattr(delegate, "cancel_active_work", None)):
-            raise TypeError("delegate must provide cancel_active_work()")
+        if not callable(getattr(delegate, "cancel_work", None)):
+            raise TypeError("delegate must provide cancel_work()")
         maximum = getattr(delegate, "max_objective_chars", None)
         if type(maximum) is not int or not 1 <= maximum <= 4096:
             raise ValueError("delegate objective limit is incompatible")
@@ -626,27 +626,6 @@ class RecordingWorkHandler:
             acknowledged_at = self._clock()
             self._last_start_acknowledged_at = acknowledged_at
             self._start_acknowledgement_ms.append((acknowledged_at - started_at) * 1000.0)
-        return result
-
-    async def cancel_active_work(self, *, invocation_id: str) -> Any:
-        self.cancel_attempts += 1
-        self._last_cancel_was_exactly_accepted = False
-        self._last_accepted_cancel_task_id = None
-        self._last_cancel_acknowledged_at = None
-        started_at = self._clock()
-        result = await self._delegate.cancel_active_work(invocation_id=invocation_id)
-        if (
-            type(result) is WorkCancelResult
-            and result.accepted is True
-            and result.state == "cancelling"
-            and result.task_id is not None
-        ):
-            self.accepted_cancel_calls += 1
-            self._last_cancel_was_exactly_accepted = True
-            self._last_accepted_cancel_task_id = result.task_id
-            acknowledged_at = self._clock()
-            self._last_cancel_acknowledged_at = acknowledged_at
-            self._cancel_acknowledgement_ms.append((acknowledged_at - started_at) * 1000.0)
         return result
 
     async def cancel_work(self, *, task_id: str, invocation_id: str) -> Any:

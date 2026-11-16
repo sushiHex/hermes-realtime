@@ -1612,7 +1612,7 @@ async def test_user_authority_reserves_exact_evidence_lease_before_response_spaw
         transcript: Transcript,
         updates: object,
         evidence_lease: EvidenceTurnLease | None = None,
-        *, typed_input: tuple[int, int] | None = None,
+        *, typed_input: tuple[int, int] | None = None, cancel_target: str | None = None,
     ) -> None:
         del self, speech_authority, operation, turn_id, transcript, updates
         assert typed_input == (3, 7)
@@ -1729,7 +1729,7 @@ async def test_nonadmitted_evidence_result_continues_response_without_fake_lease
         transcript: Transcript,
         updates: object,
         evidence_lease: EvidenceTurnLease | None = None,
-        *, typed_input: tuple[int, int] | None = None,
+        *, typed_input: tuple[int, int] | None = None, cancel_target: str | None = None,
     ) -> None:
         del self, speech_authority, operation, turn_id, transcript, updates
         assert typed_input is None

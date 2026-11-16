@@ -442,6 +442,9 @@ class ConversationUpdateExecutor:
                         "evidence final-input admission rejected: "
                         f"{final_disposition.value}"
                     )
+        # Final-input admission: freeze the natural cancel target with no suspension
+        # since the final was admitted, and carry it unchanged to the producer (#237).
+        cancel_target = self._speech.freeze_natural_cancel_target()
         typed_input = None
         if (evidence_lease is not None and authority is not None
                 and authority.source is InputSource.TYPED
@@ -449,7 +452,9 @@ class ConversationUpdateExecutor:
                 and 1 <= authority.typed_sequence < (1 << 53)
                 and 1 <= authority.binding_generation < (1 << 53)):
             typed_input = (authority.typed_sequence, authority.binding_generation)
-        coroutine = self._execute_response(turn_id, transcript, evidence_lease, typed_input)
+        coroutine = self._execute_response(
+            turn_id, transcript, evidence_lease, typed_input, cancel_target=cancel_target,
+        )
         try:
             operation = asyncio.create_task(
                 coroutine,
@@ -678,6 +683,8 @@ class ConversationUpdateExecutor:
         transcript: Transcript,
         evidence_lease: EvidenceTurnLease | None = None,
         typed_input: tuple[int, int] | None = None,
+        *,
+        cancel_target: str | None = None,
     ) -> None:
         claims = self._director._claim_pending_mentions(
             self,
@@ -702,6 +709,7 @@ class ConversationUpdateExecutor:
                 decisions,
                 evidence_lease,
                 typed_input=typed_input,
+                cancel_target=cancel_target,
             )
         except asyncio.CancelledError:
             disposition = "superseded"
