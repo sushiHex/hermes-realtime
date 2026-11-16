@@ -186,6 +186,8 @@ def test_missing_admission_binding_keeps_legacy_terminal_unbound():
 
 
 def test_correlated_completed_terminal_cannot_certify_silent_success():
+    # A tokenless completion binds by admitted input lineage, never as spoken (#237);
+    # spoken steps refuse it (test_tokenless_completion_still_cannot_certify_a_spoken_turn).
     tracker = EventTracker()
     tracker.begin("synthetic", 1, "Synthetic input")
     tracker.consume([
@@ -193,11 +195,11 @@ def test_correlated_completed_terminal_cannot_certify_silent_success():
         event(2, "assistant_turn_completed", turnId="actual_turn", turnGeneration=1,
               inputSequence=1, bindingGeneration=7),
     ])
-    assert tracker.current["outcome"] == "pending"
-    assert tracker.pair is None
+    assert tracker.current["outcome"] == "completed"
+    assert tracker.current["terminalBinding"] == "admittedInput"
     tracker.consume([event(3, "transcript_final", role="user", text="Synthetic input"),
                      event(4, "first_foreground_token", turnId="actual_turn", turnGeneration=1)])
-    assert tracker.current["outcome"] == "pending"
+    assert tracker.current["terminalBinding"] == "admittedInput"
 
 
 def test_modern_admission_preserves_legacy_bound_completion():
@@ -1285,3 +1287,461 @@ def test_optional_publication_metadata_never_relaxes_original_receipt_bound(tmp_
     monkeypatch.setattr(client, "execute", execute)
     with pytest.raises(ValueError, match="journey_receipt_bound"):
         client.main([*argv, "--execute"])
+
+
+# Natural cancellation and tokenless completion binding (#237).
+
+CANCEL_TASK, CANCEL_RUN = "task_natural", "run_" + "c" * 32
+CANCEL_TEXT = "Please stop that lookup."
+CANCEL_STEP = {"label": "stop", "kind": "natural_cancel", "task": "work", "text": CANCEL_TEXT}
+
+
+def numbered(rows, start):
+    return [event(start + index, kind, **data) for index, (kind, data) in enumerate(rows)]
+
+
+def admitted(sequence=1, binding=7):
+    return ("typed_input_admitted", {"inputSequence": sequence, "bindingGeneration": binding})
+
+
+def user_final(text=CANCEL_TEXT):
+    return ("transcript_final", {"role": "user", "text": text})
+
+
+def task_state(status, task=CANCEL_TASK):
+    return ("task_state", {"taskId": task, "status": status})
+
+
+def completed(turn="cancel_turn", generation=1, sequence=1, binding=7):
+    data = {"turnId": turn, "turnGeneration": generation}
+    if sequence is not None:
+        data |= {"inputSequence": sequence, "bindingGeneration": binding}
+    return ("assistant_turn_completed", data)
+
+
+def tokenless_cancel_turn(task=CANCEL_TASK):
+    return [
+        admitted(), user_final(), task_state("cancelling", task),
+        ("assistant_text_generated", {"turnId": "cancel_turn", "turnGeneration": 1}),
+        completed(),
+    ]
+
+
+def settled(task=CANCEL_TASK):
+    return [task_state("interrupted", task),
+            ("task_result", {"taskId": task, "status": "interrupted", "text": "Stopped."})]
+
+
+def natural_cancel_journey(tmp_path, monkeypatch, batches, *, prior=(), terminal="cancelled"):
+    import scripts.native_typed_journey as client
+
+    options = SimpleNamespace(
+        preview_dir=tmp_path, native_profile=tmp_path, api_origin="http://127.0.0.1:1"
+    )
+    journey = Journey(options, {"expiresInSeconds": 3600}, "secret")
+    monkeypatch.setattr(client, "read_journal", lambda _: ({CANCEL_RUN}, 0))
+    monkeypatch.setattr(client, "NativeRunWitness", lambda *a, **kw: SimpleNamespace(
+        read=lambda: {"terminal": terminal, "toolCalls": []}))
+    history = [task_state("active"), *prior]
+    journey.tracker.consume(numbered(history, 1))
+    journey.bindings["work"] = (CANCEL_TASK, CANCEL_RUN)
+    journey.admissions.add(CANCEL_RUN)
+    cursor = len(history) + 1
+    pending = []
+    for rows in batches:
+        pending.append(numbered(rows, cursor))
+        cursor += len(rows)
+    submitted = []
+
+    async def request(route, payload=None):
+        if route == "input":
+            submitted.append(payload)
+            return {}
+        assert route == "events"
+        return {"version": 2, "events": pending.pop(0) if pending else []}
+
+    journey.request = request
+    return journey, submitted
+
+
+def run_step(journey, step=CANCEL_STEP, seconds=2):
+    asyncio.run(asyncio.wait_for(journey.step(step), seconds))
+
+
+def test_tokenless_natural_cancel_turn_completes_and_proves_cancellation(tmp_path, monkeypatch):
+    journey, submitted = natural_cancel_journey(
+        tmp_path, monkeypatch, [tokenless_cancel_turn() + settled()]
+    )
+    run_step(journey)
+    assert submitted == [{"sequence": 1, "text": CANCEL_TEXT}]
+    assert journey.tracker.current["outcome"] == "completed"
+    assert journey.tracker.current["terminalBinding"] == "admittedInput"
+    assert journey.tracker.current["firstTokenMs"] is None
+    assert journey.results["work"]["terminal"] == "cancelled"
+    assert "cancel_turn" not in json.dumps(journey.tracker.receipt())
+
+
+def test_token_bound_natural_cancel_turn_is_also_trusted_lineage(tmp_path, monkeypatch):
+    rows = [admitted(), user_final(),
+            ("first_foreground_token", {"turnId": "cancel_turn", "turnGeneration": 1}),
+            task_state("cancelling"), completed(sequence=None), *settled()]
+    journey, _ = natural_cancel_journey(tmp_path, monkeypatch, [rows])
+    run_step(journey)
+    assert journey.tracker.current["terminalBinding"] == "token"
+
+
+def test_cleanup_only_cancel_cannot_prove_a_natural_cancel(tmp_path, monkeypatch):
+    rows = tokenless_cancel_turn()
+    del rows[2]  # The turn completes, but nothing cancelled during this step.
+    journey, submitted = natural_cancel_journey(tmp_path, monkeypatch, [rows, settled()])
+    with pytest.raises(ValueError, match="journey_cancel_unobserved"):
+        run_step(journey)
+    asyncio.run(asyncio.wait_for(journey.settle_owned(), 2))
+    # Cleanup cancelled the task with the typed grammar; that is not step evidence.
+    assert submitted[-1] == {"sequence": 2, "text": "cancel task: " + CANCEL_TASK}
+    assert journey.tracker.tasks[CANCEL_TASK] == "interrupted"
+    assert journey.tracker.step_cancels == {}
+
+
+def test_cancelling_a_different_task_cannot_prove_a_natural_cancel(tmp_path, monkeypatch):
+    journey, _ = natural_cancel_journey(
+        tmp_path, monkeypatch,
+        [tokenless_cancel_turn(task="task_other") + settled(task="task_other")],
+    )
+    with pytest.raises(ValueError, match="journey_cancel_unobserved"):
+        run_step(journey)
+
+
+def test_an_additional_foreign_cancel_fails_the_natural_cancel(tmp_path, monkeypatch):
+    rows = tokenless_cancel_turn()
+    rows.insert(3, task_state("cancelling", "task_other"))
+    journey, _ = natural_cancel_journey(tmp_path, monkeypatch, [rows + settled()])
+    with pytest.raises(ValueError, match="journey_cancel_foreign"):
+        run_step(journey)
+
+
+@pytest.mark.parametrize("status", ["cancelling", "interrupted"])
+def test_foreign_cancel_during_settlement_fails_the_natural_cancel(tmp_path, monkeypatch, status):
+    # A known foreign task cancels in the batch collect() consumes, after the
+    # pre-collect scope check passed; the identity-set check cannot see it.
+    rows = tokenless_cancel_turn()
+    journey, _ = natural_cancel_journey(
+        tmp_path, monkeypatch, [rows, [task_state(status, "task_other"), *settled()]],
+        prior=[task_state("active", "task_other")],
+    )
+    with pytest.raises(ValueError, match="journey_cancel_foreign"):
+        run_step(journey)
+
+
+@pytest.mark.parametrize("prior", ["cancelling", "interrupted", "completed"])
+def test_task_not_active_at_step_start_cannot_be_naturally_cancelled(
+    tmp_path, monkeypatch, prior,
+):
+    journey, submitted = natural_cancel_journey(
+        tmp_path, monkeypatch, [tokenless_cancel_turn() + settled()],
+        prior=[task_state(prior)],
+    )
+    with pytest.raises(ValueError, match="journey_cancel_not_active"):
+        run_step(journey)
+    assert submitted == []
+
+
+@pytest.mark.parametrize("status", ["cancelling", "interrupted"])
+@pytest.mark.parametrize("later", [False, True])
+def test_task_state_before_this_steps_admission_never_counts(
+    tmp_path, monkeypatch, status, later,
+):
+    rows = tokenless_cancel_turn()
+    rows.remove(task_state("cancelling"))
+    rows.insert(0, task_state(status))
+    # Even a later post-admission terminal cannot launder a pre-admission cancel.
+    journey, _ = natural_cancel_journey(
+        tmp_path, monkeypatch, [rows + (settled() if later else [])]
+    )
+    with pytest.raises(ValueError, match="journey_cancel_stale"):
+        run_step(journey)
+
+
+def test_natural_cancel_requires_the_native_witness_to_end_cancelled(tmp_path, monkeypatch):
+    rows = tokenless_cancel_turn() + [
+        task_state("completed"),
+        ("task_result", {"taskId": CANCEL_TASK, "status": "completed", "text": "Done."}),
+    ]
+    journey, _ = natural_cancel_journey(tmp_path, monkeypatch, [rows], terminal="completed")
+    with pytest.raises(ValueError, match="journey_cancel_unproven"):
+        run_step(journey)
+
+
+def test_natural_cancel_that_dispatches_new_work_fails(tmp_path, monkeypatch):
+    rows = tokenless_cancel_turn() + settled() + [task_state("active", "task_new")]
+    journey, _ = natural_cancel_journey(tmp_path, monkeypatch, [rows])
+    with pytest.raises(ValueError, match="journey_followup_dispatched"):
+        run_step(journey)
+
+
+def test_interrupted_natural_cancel_turn_fails(tmp_path, monkeypatch):
+    rows = tokenless_cancel_turn()
+    rows[-1] = ("assistant_turn_interrupted", rows[-1][1])
+    journey, _ = natural_cancel_journey(tmp_path, monkeypatch, [rows + settled()])
+    with pytest.raises(ValueError, match="journey_turn_interrupted"):
+        run_step(journey)
+
+
+@pytest.mark.parametrize("stale", ["prior_pair", "prior_input", "wrong_binding", "wrong_sequence",
+                                   "uncorrelated"])
+def test_natural_cancel_never_accepts_an_unbound_completion(tmp_path, monkeypatch, stale):
+    prior = [("assistant_turn_completed", {"turnId": "old_turn", "turnGeneration": 1})]
+    turn = {
+        "prior_pair": completed(turn="old_turn"),
+        "prior_input": completed(sequence=9),
+        "wrong_binding": completed(binding=8),
+        "wrong_sequence": completed(sequence=2),
+        "uncorrelated": completed(sequence=None),
+    }[stale]
+    rows = tokenless_cancel_turn()
+    rows[-1] = turn
+    journey, _ = natural_cancel_journey(tmp_path, monkeypatch, [rows + settled()], prior=prior)
+    with pytest.raises(TimeoutError):
+        run_step(journey, seconds=0.5)
+    assert journey.tracker.current["outcome"] == "pending"
+    assert journey.tracker.pair is None
+    assert "work" not in journey.results
+
+
+@pytest.mark.parametrize("correlation", [
+    {}, {"inputSequence": 2, "bindingGeneration": 7},
+    {"inputSequence": 1, "bindingGeneration": 8},
+    {"inputSequence": True, "bindingGeneration": 7},
+    {"inputSequence": 1, "bindingGeneration": True},
+])
+def test_unbound_tokenless_completion_cannot_bind_current_input(correlation):
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic text")
+    tracker.consume([
+        event(1, "typed_input_admitted", inputSequence=1,
+              bindingGeneration=1 if type(correlation.get("bindingGeneration")) is bool else 7),
+        event(2, "assistant_turn_completed", turnId="foreign_turn", turnGeneration=1,
+              **correlation),
+    ])
+    assert tracker.current["outcome"] == "pending"
+    assert tracker.pair is None
+    assert tracker.current["unboundTerminalEvents"] == 1
+
+
+@pytest.mark.parametrize("terminal_first", [False, True])
+def test_tokenless_completion_binds_only_its_own_admitted_input(terminal_first):
+    tracker = EventTracker()
+    tracker.begin("first", 1, "First input")
+    tracker.consume([event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+                     event(2, "assistant_turn_completed", turnId="first_turn", turnGeneration=1,
+                           inputSequence=1, bindingGeneration=7)])
+    assert tracker.current["outcome"] == "completed"
+    assert tracker.current["terminalBinding"] == "admittedInput"
+    assert tracker.current["unboundTerminalEvents"] == 0
+    tracker.begin("second", 2, "Second input")
+    own = event(0, "assistant_turn_completed", turnId="second_turn", turnGeneration=1,
+                inputSequence=2, bindingGeneration=7)
+    rows = [
+        event(0, "assistant_turn_completed", turnId="first_turn", turnGeneration=1,
+              inputSequence=2, bindingGeneration=7),
+        event(0, "assistant_turn_completed", turnId="other_turn", turnGeneration=1,
+              inputSequence=1, bindingGeneration=7),
+        event(0, "typed_input_admitted", inputSequence=2, bindingGeneration=7),
+    ]
+    rows.insert(0 if terminal_first else 3, own)
+    for index, row in enumerate(rows, 3):
+        row["sequence"] = index
+    tracker.consume(rows)
+    assert tracker.current["outcome"] == "completed"
+    assert tracker.pair == ("second_turn", 1)
+    assert tracker.current["terminalBinding"] == "admittedInput"
+    assert tracker.current["unboundTerminalEvents"] == 2
+
+
+@pytest.mark.parametrize("kind", ["conversation", "status"])
+def test_tokenless_completion_still_cannot_certify_a_spoken_turn(tmp_path, monkeypatch, kind):
+    step = {"label": "speech", "kind": kind, "text": CANCEL_TEXT}
+    if kind == "status":
+        step["task"] = "work"
+    rows = [admitted(), user_final(), completed()]
+    journey, _ = natural_cancel_journey(tmp_path, monkeypatch, [rows])
+    with pytest.raises(ValueError, match="journey_turn_tokenless"):
+        run_step(journey, step)
+
+
+def natural_scenario(tmp_path, step):
+    path = tmp_path / "scenario.json"
+    path.write_text(json.dumps({"version": 1, "steps": [
+        {"label": "work", "kind": "dispatch", "text": "Synthetic lookup", "wait": "accepted"},
+        step,
+    ]}), encoding="utf-8")
+    return load_scenario(path)
+
+
+def test_scenario_accepts_natural_cancel_and_keeps_typed_cancel(tmp_path):
+    assert natural_scenario(tmp_path, CANCEL_STEP)[1] == CANCEL_STEP
+    typed = {"label": "stop", "kind": "cancel", "task": "work"}
+    assert natural_scenario(tmp_path, typed)[1] == typed
+
+
+@pytest.mark.parametrize("change", [
+    {"text": None}, {"task": None}, {"task": "missing"}, {"wait": "completed"},
+    {"tool": "web_search"},
+])
+def test_scenario_rejects_malformed_natural_cancel(tmp_path, change):
+    step = dict(CANCEL_STEP)
+    for key, value in change.items():
+        if value is None:
+            del step[key]
+        else:
+            step[key] = value
+    expected = "journey_text_bound" if "text" not in step else "journey_natural_cancel_shape"
+    with pytest.raises(ValueError, match=expected):
+        natural_scenario(tmp_path, step)
+
+
+@pytest.mark.parametrize("text", [
+    "cancel task: task_natural", "  CANCEL TASK: task_natural", "Task: start something",
+])
+def test_natural_cancel_scenario_refuses_the_typed_command_grammar(tmp_path, text):
+    with pytest.raises(ValueError, match="journey_natural_cancel_grammar"):
+        natural_scenario(tmp_path, CANCEL_STEP | {"text": text})
+
+
+# Host-refused web runs (#237): the native run completed, the tracker failed.
+
+REFUSED_TASK, REFUSED_RUN = "task_refused", "run_" + "d" * 32
+
+
+def refused_journey(tmp_path, monkeypatch, rows, *, terminal="completed"):
+    import scripts.native_typed_journey as client
+
+    options = SimpleNamespace(
+        preview_dir=tmp_path, native_profile=tmp_path, api_origin="http://127.0.0.1:1"
+    )
+    journey = Journey(options, {"expiresInSeconds": 3600}, "secret")
+    monkeypatch.setattr(client, "NativeRunWitness", lambda *a, **kw: SimpleNamespace(
+        read=lambda: {"terminal": terminal, "toolCalls": []}))
+    journey.tracker.consume(numbered(rows, 1))
+    journey.bindings["web"] = (REFUSED_TASK, REFUSED_RUN)
+    return journey
+
+
+def failed_result(text, task=REFUSED_TASK, status="failed"):
+    return [("task_state", {"taskId": task, "status": status}),
+            ("task_result", {"taskId": task, "status": status, "text": text})]
+
+
+@pytest.mark.parametrize("reason", ["insufficient", "too_long", "unverified"])
+def test_host_refused_web_run_is_classified_task_failure(tmp_path, monkeypatch, reason):
+    from hermes_realtime.integration.api import _WEB_REFUSAL_NOTICES, _WEB_UNVERIFIED_NOTICE
+
+    notice = (_WEB_UNVERIFIED_NOTICE if reason == "unverified"
+              else _WEB_REFUSAL_NOTICES[reason])
+    rows = [("task_state", {"taskId": REFUSED_TASK, "status": "active"}),
+            *failed_result(notice)]
+    journey = refused_journey(tmp_path, monkeypatch, rows)
+    with pytest.raises(ValueError, match="journey_task_failed"):
+        asyncio.run(journey.collect("web"))
+    assert journey.failures == {"web": {"classification": "host_refused", "refusal": reason}}
+    assert "web" not in journey.results
+
+
+@pytest.mark.parametrize("variant", [
+    "untrusted_text", "other_task", "interrupted_status", "later_interrupted", "state_only",
+    "superseded", "witness_cancelled",
+])
+def test_host_refused_classification_requires_trusted_exact_evidence(
+    tmp_path, monkeypatch, variant,
+):
+    from hermes_realtime.integration.api import _WEB_REFUSAL_NOTICES
+
+    notice = _WEB_REFUSAL_NOTICES["insufficient"]
+    terminal = "completed"
+    rows = [("task_state", {"taskId": REFUSED_TASK, "status": "active"})]
+    if variant == "untrusted_text":
+        rows += failed_result("Synthetic " + notice)
+    elif variant == "other_task":
+        rows += [("task_state", {"taskId": "task_other", "status": "active"}),
+                 *failed_result(notice, task="task_other"),
+                 ("task_state", {"taskId": REFUSED_TASK, "status": "failed"})]
+    elif variant == "interrupted_status":
+        rows += failed_result(notice, status="interrupted")
+    elif variant == "later_interrupted":
+        rows += [*failed_result(notice), ("task_state", {"taskId": REFUSED_TASK,
+                                                          "status": "interrupted"})]
+    elif variant == "state_only":
+        rows += [("task_state", {"taskId": REFUSED_TASK, "status": "failed"})]
+    elif variant == "superseded":
+        rows += [*failed_result(notice), ("task_result", {
+            "taskId": REFUSED_TASK, "status": "failed", "text": "Synthetic failure."})]
+    else:
+        rows += failed_result(notice)
+        terminal = "cancelled"
+    journey = refused_journey(tmp_path, monkeypatch, rows, terminal=terminal)
+    if variant in {"interrupted_status", "superseded"}:
+        assert journey.tracker.host_refusals == {}
+    with pytest.raises(ValueError, match="journey_terminal_binding"):
+        asyncio.run(journey.collect("web"))
+    assert journey.failures == {}
+
+
+def test_matching_failed_witness_keeps_unclassified_task_failure(tmp_path, monkeypatch):
+    from hermes_realtime.integration.api import _WEB_REFUSAL_NOTICES
+
+    rows = [("task_state", {"taskId": REFUSED_TASK, "status": "active"}),
+            *failed_result(_WEB_REFUSAL_NOTICES["insufficient"])]
+    journey = refused_journey(tmp_path, monkeypatch, rows, terminal="failed")
+    asyncio.run(journey.collect("web"))
+    assert journey.results["web"]["terminal"] == "failed"
+    assert journey.failures == {}
+
+
+def test_receipt_reports_host_refused_classification(tmp_path, monkeypatch):
+    import hashlib
+    import sys
+
+    import scripts.native_typed_journey as client
+    from hermes_realtime import host_launcher
+
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              browser_origin="http://127.0.0.1:1",
+                              livekit_url="ws://127.0.0.1:2")
+    suffix = hashlib.sha256(str(tmp_path / "active.private.json").encode()).hexdigest()[:16]
+    credential = dict(
+        workerIdentity="worker_preview_" + suffix, roomName="hermes-preview-" + suffix,
+        url=options.livekit_url, token="synthetic-lease", participantIdentity="synthetic",
+        expiresInSeconds=3600,
+    )
+
+    class Room:
+        async def connect(self, *args, **kwargs):
+            pass
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "livekit", SimpleNamespace(rtc=SimpleNamespace(
+        Room=Room, RoomOptions=lambda **kwargs: kwargs)))
+    monkeypatch.setattr(host_launcher, "_load_api_bearer", lambda _: "synthetic")
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+
+    def request(origin, route, **kwargs):
+        if route == "events":
+            return 200, {"version": 2, "events": []}
+        return (200, credential) if route == "stable-bootstrap" else (200, {})
+
+    monkeypatch.setattr(client, "request_json", request)
+
+    async def step(self, value):
+        self.failures["web"] = {"classification": "host_refused", "refusal": "insufficient"}
+        raise ValueError("journey_task_failed")
+
+    monkeypatch.setattr(client.Journey, "step", step)
+    receipt = {"outcome": "refused"}
+    with pytest.raises(ValueError, match="journey_task_failed"):
+        asyncio.run(client.execute(options, [{"label": "web"}], receipt))
+    assert receipt["taskFailures"] == {
+        "web": {"classification": "host_refused", "refusal": "insufficient"}
+    }
+    assert receipt["outcome"] == "refused"

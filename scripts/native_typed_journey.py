@@ -20,11 +20,18 @@ from pathlib import Path
 from typing import Any
 
 from hermes_realtime.client.projection import _EVENT_KINDS, BrowserPublicEvent
+from hermes_realtime.conversation.commands import _CANCEL_PREFIX, _START_PREFIX
+from hermes_realtime.integration.api import _WEB_REFUSAL_NOTICES, _WEB_UNVERIFIED_NOTICE
 from hermes_realtime.protocol.identifiers import TASK_ID as TASK
 from scripts.native_run_witness import RUN_ID, NativeRunWitness, require, validate_origin
 
 LABEL = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
 TERMINAL = {"completed", "failed", "interrupted"}
+# The exact fixed notices the host substitutes when it refuses a natively completed
+# web run (integration/api.py _web_completion); never Hermes or model text.
+_HOST_REFUSALS = {notice: reason for reason, notice in _WEB_REFUSAL_NOTICES.items()} | {
+    _WEB_UNVERIFIED_NOTICE: "unverified",
+}
 _PUBLICATION_TIMING_FIELDS = (
     "firstPublicationMs", "tokenToPublicationMs", "publicationToPlayableMs",
 )
@@ -64,7 +71,8 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
             type(label) is str
             and LABEL.fullmatch(label) is not None
             and label not in labels
-            and kind in {"dispatch", "status", "recall", "cancel", "conversation"},
+            and kind in {"dispatch", "status", "recall", "cancel", "natural_cancel",
+                         "conversation"},
             "journey_step_identity",
         )
         labels.add(label)
@@ -88,6 +96,13 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
             tasks.add(label)
         elif kind == "conversation":
             require(set(step) == {"label", "kind", "text"}, "journey_conversation_shape")
+        elif kind == "natural_cancel":
+            require(set(step) == {"label", "kind", "task", "text"}
+                    and step["task"] in tasks, "journey_natural_cancel_shape")
+            # Natural language only: the typed command grammar is the `cancel` kind.
+            folded = step["text"].strip().casefold()
+            require(not folded.startswith((_CANCEL_PREFIX, _START_PREFIX)),
+                    "journey_natural_cancel_grammar")
         else:
             require(
                 step.get("task") in tasks and "wait" not in step and "tool" not in step,
@@ -138,7 +153,14 @@ class EventTracker:
         self.admitted = False
         self.admitted_input: tuple[int, int] | None = None
         self.prior_seen: set[tuple[str, int]] = set()
-        self.interruptions: dict[tuple[str, int], tuple[int, int] | None] = {}
+        # Unbound terminals of this step: pair -> (outcome, admitted-input correlation).
+        self.terminals: dict[tuple[str, int], tuple[str, tuple[int, int] | None]] = {}
+        # Browser sequence of this step's own input admission, and of the first
+        # cancelling/interrupted task_state per task seen during this step.
+        self.admission_event: int | None = None
+        self.step_cancels: dict[str, int] = {}
+        # Tasks whose failed result is exactly a fixed host refusal notice.
+        self.host_refusals: dict[str, str] = {}
         self.started = 0.0
 
     def begin(self, label: str, sequence: int, text: str) -> None:
@@ -156,12 +178,15 @@ class EventTracker:
             "publicationToPlayableMs": None,
             "deliveredSegments": 0,
             "unboundTerminalEvents": 0,
+            "terminalBinding": None,
         }
         self.turns.append(self.current)
         self.pair, self.text, self.user_seen, self.admitted = None, text, False, False
         self.admitted_input = None
         self.prior_seen = set(self.seen)
-        self.interruptions = {}
+        self.terminals = {}
+        self.admission_event = None
+        self.step_cancels = {}
         self.started = time.monotonic() * 1000
 
     @staticmethod
@@ -172,16 +197,20 @@ class EventTracker:
             return sequence, binding
         return None
 
-    def _reconcile_interruptions(self) -> None:
+    def _reconcile_terminals(self) -> None:
+        # A terminal with no first-token binding (pre-text interruption, or a
+        # tokenless natural-cancel turn) binds only through this step's exact
+        # admitted (inputSequence, bindingGeneration), never a prior step's pair.
         if (self.current is None or self.admitted_input is None
                 or self.current["outcome"] != "pending"):
             return
-        for pair, correlation in self.interruptions.items():
+        for pair, (outcome, correlation) in self.terminals.items():
             if (correlation != self.admitted_input or pair in self.prior_seen
                     or (self.pair is not None and pair != self.pair)):
                 continue
             self.pair = pair
-            self.current["outcome"] = "interrupted"
+            self.current["outcome"] = outcome
+            self.current["terminalBinding"] = "admittedInput"
             self.current["unboundTerminalEvents"] -= 1
             return
 
@@ -223,6 +252,17 @@ class EventTracker:
                 )
                 require(identity in self.tasks or len(self.tasks) < 12, "journey_task_bound")
                 self.tasks[identity] = status
+                if (kind == "task_state" and status in {"cancelling", "interrupted"}
+                        and self.current is not None):
+                    # Measured phase only; cleanup runs with no current step.
+                    self.step_cancels.setdefault(identity, seq)
+                if kind == "task_result":
+                    refusal = (_HOST_REFUSALS.get(data.get("text"))
+                               if status == "failed" and type(data.get("text")) is str else None)
+                    if refusal is None:
+                        self.host_refusals.pop(identity, None)
+                    else:
+                        self.host_refusals[identity] = refusal
             if self.current is None:
                 if valid_pair:
                     self.seen.add(pair)
@@ -237,6 +277,7 @@ class EventTracker:
                 )
                 if not self.admitted:
                     self.admitted_input = self._input_correlation(data)
+                    self.admission_event = seq
                 self.admitted = True
             if kind in {"first_foreground_token", "first_playable_audio"} and valid_pair:
                 require(pair in self.markers or len(self.markers) < 128, "journey_marker_bound")
@@ -258,18 +299,20 @@ class EventTracker:
                 self.seen.add(pair)
                 require(len(self.seen) <= 128, "journey_identity_bound")
             if kind in {"assistant_turn_completed", "assistant_turn_interrupted"}:
+                outcome = kind.removeprefix("assistant_turn_")
                 if valid_pair and pair == self.pair:
                     if self.current["outcome"] == "pending":
-                        self.current["outcome"] = kind.removeprefix("assistant_turn_")
+                        self.current["outcome"] = outcome
+                        self.current["terminalBinding"] = "token"
                 else:
                     require(self.current["unboundTerminalEvents"] < 128,
                             "journey_terminal_bound")
                     self.current["unboundTerminalEvents"] += 1
-                    if valid_pair and kind == "assistant_turn_interrupted":
-                        require(pair in self.interruptions or len(self.interruptions) < 128,
+                    if valid_pair:
+                        require(pair in self.terminals or len(self.terminals) < 128,
                                 "journey_terminal_bound")
-                        self.interruptions.setdefault(pair, self._input_correlation(data))
-            self._reconcile_interruptions()
+                        self.terminals.setdefault(pair, (outcome, self._input_correlation(data)))
+            self._reconcile_terminals()
             if not valid_pair or pair != self.pair:
                 continue
             if kind == "assistant_text_generated":
@@ -347,6 +390,7 @@ class Journey:
         self.pending = 0
         self.bindings: dict[str, tuple[str, str]] = {}
         self.results: dict[str, dict] = {}
+        self.failures: dict[str, dict[str, str]] = {}
         self.sequence = 0
 
     async def request(self, route: str, payload: dict | None = None) -> dict:
@@ -406,7 +450,15 @@ class Journey:
             ).read
         )
         expected = {"completed": "completed", "failed": "failed", "interrupted": "cancelled"}
-        require(value["terminal"] == expected[self.tracker.tasks[task]], "journey_terminal_binding")
+        status = self.tracker.tasks[task]
+        if value["terminal"] != expected[status]:
+            # The host withholds a natively completed web run as failed (api.py
+            # _web_completion). Name that only on its exact fixed public notice.
+            refusal = self.tracker.host_refusals.get(task)
+            if value["terminal"] == "completed" and status == "failed" and refusal is not None:
+                self.failures[label] = {"classification": "host_refused", "refusal": refusal}
+                require(False, "journey_task_failed")
+            require(False, "journey_terminal_binding")
         self.results[label] = value
 
     async def step(self, step: dict) -> None:
@@ -420,9 +472,10 @@ class Journey:
             )
         before_tasks, before_runs = set(self.tracker.tasks), set(self.admissions)
         text = step.get("text")
-        if kind == "cancel":
+        if kind in {"cancel", "natural_cancel"}:
             task, _ = self.bindings[step["task"]]
             require(self.tracker.tasks.get(task) == "active", "journey_cancel_not_active")
+        if kind == "cancel":
             text = "cancel task: " + task
         self.sequence += 1
         self.tracker.begin(label, self.sequence, text)
@@ -459,9 +512,39 @@ class Journey:
             require(
                 self.results[step["task"]]["terminal"] == "cancelled", "journey_cancel_unproven"
             )
+        elif kind == "natural_cancel":
+            # Turn completion (token or admitted-input lineage) is not task success.
+            await self.wait(lambda: self.tracker.current["outcome"] != "pending")
+            outcome = self.tracker.current["outcome"]
+            require(outcome != "interrupted", "journey_turn_interrupted")
+            require(outcome == "completed", "journey_turn_incomplete")
+            # The task's cancelling projection precedes the turn's completion, and
+            # only this step's post-admission projections count: never pre-step
+            # state, and never the cleanup `cancel task:` after the step.
+            def require_cancel_scope() -> None:
+                cancels, admission = self.tracker.step_cancels, self.tracker.admission_event
+                require(task in cancels, "journey_cancel_unobserved")
+                require(admission is not None and cancels[task] > admission,
+                        "journey_cancel_stale")
+                require(set(cancels) == {task}, "journey_cancel_foreign")
+
+            require_cancel_scope()
+            await self.collect(step["task"])
+            # collect() keeps consuming events while the task settles; a known
+            # foreign task cancelled in that window must still fail the step.
+            require_cancel_scope()
+            require(
+                self.results[step["task"]]["terminal"] == "cancelled", "journey_cancel_unproven"
+            )
+            require(
+                set(self.tracker.tasks) == before_tasks and self.admissions == before_runs,
+                "journey_followup_dispatched",
+            )
         else:
             await self.wait(lambda: self.tracker.current["outcome"] != "pending")
             require(self.tracker.current["outcome"] == "completed", "journey_turn_incomplete")
+            # A spoken step needs its own first token; lineage alone is silent.
+            require(self.tracker.current["terminalBinding"] == "token", "journey_turn_tokenless")
             require(
                 set(self.tracker.tasks) == before_tasks and self.admissions == before_runs,
                 "journey_followup_dispatched",
@@ -561,6 +644,8 @@ async def execute(options, steps, receipt) -> None:
                 tasks=journey.results,
                 acceptedDispatches=len(journey.bindings),
             )
+            if journey.failures:
+                receipt["taskFailures"] = journey.failures
         if receipt["outcome"] == "completed":
             require(all(receipt["cleanup"].values()), "journey_cleanup_unsettled")
 
