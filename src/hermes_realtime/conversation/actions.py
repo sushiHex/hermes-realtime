@@ -55,6 +55,10 @@ _ACTION_DISPOSITIONS = frozenset(
 _MAX_MENTIONS_PER_TURN = 16
 _MAX_OWNER_GENERATION = 2**63 - 1
 _TYPED_LINEAGE_CEILING = 1 << 53
+# One fixed-category host marker; it never carries the disagreeing values.
+_TYPED_LINEAGE_MISMATCH_MARKER = (
+    '[typed-lineage] {"version":1,"category":"authority_mismatch"}'
+)
 _OWNER_GENERATION_LOCK = Lock()
 _NEXT_OWNER_GENERATION = 1
 
@@ -421,7 +425,8 @@ class ConversationUpdateExecutor:
             if authority is not None and type(authority) is not UserTurnAuthorityV1:
                 raise TypeError("authority must be exact or None")
             # Advisory typed lineage (#237): the worker's accepted tuple, or one derived
-            # from an admitted typed authority. Both present must agree exactly.
+            # from an admitted typed authority. When both are present and disagree,
+            # neither is trusted: the lineage is withheld and the response continues.
             if typed_input is not None and (
                 type(typed_input) is not tuple
                 or len(typed_input) != 2
@@ -434,8 +439,10 @@ class ConversationUpdateExecutor:
                 and authority is not None
                 and typed_input != authority_typed_input
             ):
-                raise ValueError("typed_input does not match the admitted user authority")
-            if typed_input is None:
+                typed_input = None
+                with contextlib.suppress(Exception):
+                    print(_TYPED_LINEAGE_MISMATCH_MARKER, flush=True)
+            elif typed_input is None:
                 typed_input = authority_typed_input
             transcript = Transcript(text=transcript.text, final=transcript.final)
             if not transcript.final:
