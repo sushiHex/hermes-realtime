@@ -63,6 +63,17 @@ def test_call_fails_late(hangs_in_teardown):
 
 def test_call_fails_cleanly():
     raise AssertionError("call failed")
+
+
+def test_call_fails_under_a_frozen_clock(hangs_in_teardown, monkeypatch):
+    # monkeypatch is torn down first, so the clock is still frozen when the timer is re-armed.
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+    raise AssertionError("call failed")
+
+
+def test_call_fails_under_an_exhausted_clock(monkeypatch):
+    monkeypatch.setattr(time, "monotonic", iter(()).__next__)
+    raise AssertionError("call failed")
 """
 
 
@@ -134,6 +145,22 @@ def test_clean_teardown_after_a_failure_is_not_cut_short(tmp_path: Path) -> None
 
     assert returncode == 1, output
     assert "+ Timeout +" not in output, output
+    assert "1 failed" in output, output
+
+
+def test_rearm_ignores_a_frozen_test_clock(tmp_path: Path) -> None:
+    returncode, output, _ = _run_child(tmp_path, "test_call_fails_under_a_frozen_clock", 2.0)
+
+    assert returncode == 1, output
+    assert "+ Timeout +" in output, output
+    assert "hangs_in_teardown" in output, output
+
+
+def test_rearm_ignores_an_exhausted_test_clock(tmp_path: Path) -> None:
+    returncode, output, _ = _run_child(tmp_path, "test_call_fails_under_an_exhausted_clock", 30.0)
+
+    assert returncode == 1, output
+    assert "INTERNALERROR" not in output, output
     assert "1 failed" in output, output
 
 

@@ -15,12 +15,14 @@ entered, pytest-timeout suppresses its timers itself, so an interactive session 
 
 from __future__ import annotations
 
-import time
 from collections.abc import Generator
+from time import monotonic as _real_monotonic
 from typing import Any
 
 import pytest
 
+# The clock is bound at import: the re-arm runs before fixture teardown, so a test's monkeypatched
+# time.monotonic (frozen, synthetic or exhausted) is still in place when it does.
 _DEADLINE = pytest.StashKey[tuple[Any, float]]()
 # A spent deadline still re-arms with a positive timeout: the signal method arms with
 # setitimer(ITIMER_REAL, timeout), where zero disarms the alarm instead of firing it.
@@ -32,7 +34,7 @@ def pytest_timeout_set_timer(item: pytest.Item, settings: Any) -> Generator[None
     # With func_only, pytest-timeout bounds only the call phase and cancels the timer when the call
     # returns, so there is nothing to restore after a failure.
     if settings.func_only is False:
-        item.stash[_DEADLINE] = (settings, time.monotonic() + settings.timeout)
+        item.stash[_DEADLINE] = (settings, _real_monotonic() + settings.timeout)
     return (yield)
 
 
@@ -43,5 +45,5 @@ def pytest_exception_interact(node: pytest.Item | pytest.Collector) -> Generator
     if armed is None:
         return
     settings, deadline = armed
-    remaining = max(deadline - time.monotonic(), _MIN_REMAINING_SECONDS)
+    remaining = max(deadline - _real_monotonic(), _MIN_REMAINING_SECONDS)
     node.ihook.pytest_timeout_set_timer(item=node, settings=settings._replace(timeout=remaining))
