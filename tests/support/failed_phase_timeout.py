@@ -22,6 +22,9 @@ from typing import Any
 import pytest
 
 _DEADLINE = pytest.StashKey[tuple[Any, float]]()
+# A spent deadline still re-arms with a positive timeout: the signal method arms with
+# setitimer(ITIMER_REAL, timeout), where zero disarms the alarm instead of firing it.
+_MIN_REMAINING_SECONDS = 0.001
 
 
 @pytest.hookimpl(wrapper=True, optionalhook=True)
@@ -40,5 +43,5 @@ def pytest_exception_interact(node: pytest.Item | pytest.Collector) -> Generator
     if armed is None:
         return
     settings, deadline = armed
-    remaining = max(deadline - time.monotonic(), 0.0)
+    remaining = max(deadline - time.monotonic(), _MIN_REMAINING_SECONDS)
     node.ihook.pytest_timeout_set_timer(item=node, settings=settings._replace(timeout=remaining))

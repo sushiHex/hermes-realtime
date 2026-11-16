@@ -12,8 +12,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from pytest_timeout import Settings
 
 from tests.support import failed_phase_timeout
 
@@ -25,9 +27,11 @@ CHILD_KILL_SECONDS = 60.0
 HANGING_TEARDOWN = """
 import threading
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+from pytest_timeout import Settings
 
 STARTED = Path(__file__).with_name("started.txt")
 
@@ -141,6 +145,32 @@ def test_plugin_loads_when_pytest_timeout_is_disabled(tmp_path: Path) -> None:
     assert returncode == 1, output
     assert "PluginValidationError" not in output, output
     assert "1 failed" in output, output
+
+
+def test_rearm_after_the_deadline_passes_a_positive_timeout() -> None:
+    # pytest-timeout's signal method arms with setitimer(ITIMER_REAL, timeout), and a zero there
+    # disarms the alarm, so a spent deadline must still re-arm with a positive value.
+    armed: list[float] = []
+
+    def set_timer(*, item: object, settings: Settings) -> bool:
+        armed.append(settings.timeout)
+        return True
+
+    node = SimpleNamespace(
+        stash=pytest.Stash(), ihook=SimpleNamespace(pytest_timeout_set_timer=set_timer)
+    )
+    settings = Settings(
+        timeout=300.0, method="signal", func_only=False, disable_debugger_detection=False
+    )
+    node.stash[failed_phase_timeout._DEADLINE] = (settings, time.monotonic() - 1.0)
+
+    hook = failed_phase_timeout.pytest_exception_interact(node)  # type: ignore[arg-type]
+    next(hook)
+    with pytest.raises(StopIteration):
+        next(hook)
+
+    assert len(armed) == 1
+    assert armed[0] > 0.0
 
 
 def test_suite_registers_the_failed_phase_timeout_plugin(request: pytest.FixtureRequest) -> None:
