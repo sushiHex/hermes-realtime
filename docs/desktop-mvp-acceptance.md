@@ -355,14 +355,12 @@ recording `as_expected`, `different`, `failed` or `not_run` for each. In particu
 
 - Confirm actual microphone input and audible typed/spoken replies. Synthetic
   browser audio is not a substitute for either observation.
-- Exercise the spoken command `start task <objective>` and the typed `task:`
-  form. For cancellation, say `cancel task` when exactly one acknowledged task
-  is active; when there are zero or several, verify the no-task guidance or use
-  **Cancel** on the intended task card. Also exercise the typed
-  `cancel task: <task-id>` form. Record accepted task acknowledgment before
-  active status, exact cancellation and terminal settlement, and speech
-  interruption leaving unrelated work active. The spoken grammar and its
-  ambiguity behavior are detailed in [local-livekit.md](local-livekit.md#full-loopback-host-and-constrained-desktop-human-gate).
+- Exercise the typed `task:` form, then cancel with **Cancel** on the intended
+  task card or the typed `cancel task: <task-id>` form. Spoken input is always
+  an ordinary turn, never a task command. Record accepted task acknowledgment
+  before active status, exact cancellation and terminal settlement, and speech
+  interruption leaving unrelated work active. The command boundary is detailed
+  in [local-livekit.md](local-livekit.md#full-loopback-host-and-constrained-desktop-human-gate).
 - Observe Disconnect/Connect, reload during the readiness cue, and host restart.
   Check context without restating the fact being tested. Record a recall failure
   even when the corresponding history is present.

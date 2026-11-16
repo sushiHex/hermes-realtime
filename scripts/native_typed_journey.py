@@ -423,7 +423,7 @@ class Journey:
         if kind == "cancel":
             task, _ = self.bindings[step["task"]]
             require(self.tracker.tasks.get(task) == "active", "journey_cancel_not_active")
-            text = "cancel task " + task
+            text = "cancel task: " + task
         self.sequence += 1
         self.tracker.begin(label, self.sequence, text)
         await self.request("input", {"sequence": self.sequence, "text": text})
@@ -475,7 +475,7 @@ class Journey:
             if self.tracker.tasks.get(task) not in TERMINAL:
                 self.sequence += 1
                 await self.request(
-                    "input", {"sequence": self.sequence, "text": "cancel task " + task}
+                    "input", {"sequence": self.sequence, "text": "cancel task: " + task}
                 )
                 await self.wait(lambda task=task: self.tracker.tasks.get(task) in TERMINAL, 45)
                 await self.collect(label)

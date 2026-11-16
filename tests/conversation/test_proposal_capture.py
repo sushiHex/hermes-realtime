@@ -19,8 +19,6 @@ from tests.conversation.test_worker import (
 
 
 class CommandSurface(Surface):
-    active_task_ids = ()
-
     async def submit_cancel_command(self, **kwargs):
         raise AssertionError("proposal confirmation must never cancel tasks")
 
