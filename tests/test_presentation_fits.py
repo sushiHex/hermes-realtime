@@ -102,9 +102,11 @@ def test_limits_cap_the_source_count_at_the_longest_footer_that_fits() -> None:
                                  - 2 - _footer(long_urls[:3]))
 
 
-def test_the_detail_bound_and_instructions_stay_one_constant() -> None:
+def test_the_detail_bound_stays_out_of_the_instructions() -> None:
     assert MAX_PRESENTATION_DETAIL_CHARS == 1800
-    instructions = presenter.PRESENTATION_INSTRUCTIONS
+    catalog = ("https://example.com/report",)
+    instructions = presenter.presentation_instructions(
+        presenter.presentation_input("objective", catalog, _passages(catalog)))
     assert type(instructions) is str
     assert "1800" not in instructions
     assert "top-level limits object" in instructions
@@ -419,7 +421,7 @@ def test_every_admitted_selection_renders_and_passes_the_host_contract() -> None
     assert checked > 1000
 
 
-# -- the transport sends one instruction constant and a per-request schema --------------
+# -- the transport sends per-request budgeted instructions and schema -------------------
 
 
 class _Owner:
@@ -500,7 +502,7 @@ def _install_fake_transport(monkeypatch: Any, bodies: list[dict[str, Any]]) -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
-async def test_instructions_are_identical_and_limits_ride_only_in_the_input(
+async def test_instructions_and_schema_follow_the_limits_in_the_input(
     api_mode: str, monkeypatch: Any,
 ) -> None:
     from hermes_realtime.integration.presentation_transport import Presentation
@@ -534,12 +536,14 @@ async def test_instructions_are_identical_and_limits_ride_only_in_the_input(
             instructions = body["instructions"]
             sent_input = body["input"][0]["content"]
             schema = body["text"]["format"]["schema"]
-        assert instructions == presenter.PRESENTATION_INSTRUCTIONS
+        assert instructions == presenter.presentation_instructions(source_input)
+        assert instructions.startswith(presenter.PRESENTATION_INSTRUCTIONS)
         assert sent_input == source_input and "limits" in json.loads(sent_input)
         assert schema == presenter.presentation_schema(source_input)
         schemas.append(schema)
     assert schemas[0] != schemas[1]
-    assert wires[0]["instruction_sha256"] == wires[1]["instruction_sha256"]
+    # The budgets differ with the catalog's footer, so the attested instructions do too.
+    assert wires[0]["instruction_sha256"] != wires[1]["instruction_sha256"]
     assert all(wire["schema_matches"] for wire in wires)
 
 

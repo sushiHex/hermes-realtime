@@ -328,10 +328,9 @@ def test_voice_keeps_source_attribution_in_detail_unless_objective_asks(setup):
     assert "Return JSON with exactly answer and source_ids" in instructions
     assert "Lead is a complete standalone conversational answer" in instructions
     assert "host uses this lead for speech with deterministic unit/time projection" in instructions
-    assert "at most 220 characters" in instructions
-    assert "complete display including the source footer fits" in instructions
-    assert "top-level limits object" in instructions and "1800" not in instructions
-    assert "Put every supported requested date, qualification" in instructions
+    assert "within the lead budget below" in instructions
+    assert "Put every supported requested date, qualification" not in instructions
+    assert "source attribution" in instructions and "1800" not in instructions
 
 
 def test_native_lead_uses_everyday_findings_without_upgrading_evidence(setup):
@@ -339,7 +338,7 @@ def test_native_lead_uses_everyday_findings_without_upgrading_evidence(setup):
     assert "Start lead with the supported finding in everyday language" in instructions
     assert "not a report-style preamble about supplied evidence" in instructions
     assert "Do not turn an earlier observation into a current fact" in instructions
-    assert "Put every supported requested date, qualification" in instructions
+    assert "Never weaken uncertainty or claim completeness" in instructions
     assert "Preserve the original source timestamp in support" in instructions
     assert "Select only unique catalog IDs that support the answer" in instructions
 

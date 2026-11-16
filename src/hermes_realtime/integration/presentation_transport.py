@@ -23,9 +23,9 @@ from .evidence_presentation import (
     CODEX_REJECTED_EVENT_KINDS,
     MAX_CODEX_STREAM_EVENTS,
     MAX_CODEX_STREAM_TEXT_CHARS,
-    PRESENTATION_INSTRUCTIONS,
     PRESENTATION_MODES,
     frozen,
+    presentation_instructions,
     presentation_schema,
 )
 
@@ -279,7 +279,7 @@ class Presentation:
         body = {
             "model": self.config["model"],
             "messages": [
-                {"role": "system", "content": PRESENTATION_INSTRUCTIONS},
+                {"role": "system", "content": presentation_instructions(source_input)},
                 {"role": "user", "content": source_input},
             ],
             "response_format": {"type": "json_schema", "json_schema": {
@@ -364,7 +364,7 @@ class Presentation:
 
         body = {
             "model": self.config["model"],
-            "instructions": PRESENTATION_INSTRUCTIONS,
+            "instructions": presentation_instructions(source_input),
             "input": [{"role": "user", "content": source_input}],
             "store": False,
             "stream": True,
@@ -375,6 +375,7 @@ class Presentation:
             "reasoning": {"effort": "low"},
         }
         expected_text_format = copy.deepcopy(body["text"])
+        expected_instructions = body["instructions"]
 
         async def observe(request: Any) -> None:
             raw = request.content
@@ -392,7 +393,7 @@ class Presentation:
             evidence["wire"] = {
                 "body_sha256": hashlib.sha256(raw).hexdigest(),
                 "input_matches": actual_input == source_input,
-                "instructions_match": instructions == PRESENTATION_INSTRUCTIONS,
+                "instructions_match": instructions == expected_instructions,
                 "model_matches": serialized.get("model") == self.config["model"],
                 "tools_absent": not any(name in serialized for name in (
                     "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")),
