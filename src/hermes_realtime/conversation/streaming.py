@@ -1299,9 +1299,12 @@ class StreamingSpeechLoop:
                 if cancel_selected and lease.is_current:
                     owner = self._task_cancellation
                     assert owner is not None and cancel_target is not None
+                    # The lease is re-read under the admission lock: a newer turn that
+                    # supersedes this one while the cancel waits for admission cancels nothing.
                     cancelled = await owner.cancel_work(
                         task_id=cancel_target,
                         invocation_id=self._natural_cancel_invocation_id(),
+                        still_current=lambda: lease.is_current,
                     )
                     if type(cancelled) is not WorkCancelResult:
                         raise TypeError("natural cancel returned the wrong result")

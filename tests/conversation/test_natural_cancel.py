@@ -108,10 +108,11 @@ def _surface(
 class Inference:
     """Records every request; selects cancel on the first, acknowledges on the second."""
 
-    def __init__(self, *, select: object = None, before_select=None) -> None:
+    def __init__(self, *, select: object = None, before_select=None, after_select=None) -> None:
         self.calls: list[object] = []
         self._select = HostCancelRequest() if select is None else select
         self._before_select = before_select
+        self._after_select = after_select
 
     async def stream(self, snapshot, *, turn_id):
         self.calls.append(snapshot)
@@ -121,6 +122,8 @@ class Inference:
         if self._before_select is not None:
             self._before_select()
         yield self._select
+        if self._after_select is not None:
+            self._after_select()
 
     async def cancel(self, turn_id):
         pass
@@ -229,7 +232,9 @@ class _Owner:
     def natural_cancel_target(self) -> str | None:
         return self.target
 
-    async def cancel_work(self, *, task_id: str, invocation_id: str) -> WorkCancelResult:
+    async def cancel_work(
+        self, *, task_id: str, invocation_id: str, still_current=None,
+    ) -> WorkCancelResult:
         self.cancels.append(task_id)
         return WorkCancelResult(accepted=True, state="cancelling", task_id=task_id)
 
@@ -502,6 +507,96 @@ async def test_superseded_turn_never_cancels() -> None:
     finally:
         await loop.close()
         await surface.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("superseded", [True, False], ids=["superseded", "control"])
+async def test_a_turn_superseded_while_admission_waits_cancels_nothing(superseded) -> None:
+    # The lease is checked before the cancel is awaited; the admission lock is the
+    # commit point. Hold the lock, supersede the turn, release: no cancel may commit.
+    # Mutation: drop the lease re-read under the admission lock.
+    context = ConversationContextStore()
+    _accept(context, "a")
+    surface, controller, events = _surface(context)
+    foreground = ForegroundTurnCoordinator()
+    inference = Inference()
+    loop, synth = _loop(context, surface, inference, foreground=foreground)
+    try:
+        await surface._lock.acquire()
+        turn = asyncio.create_task(_respond(loop))
+        async with asyncio.timeout(1):
+            while not getattr(surface._lock, "_waiters", None):
+                await asyncio.sleep(0)
+        if superseded:
+            foreground._is_current = lambda _lease: False  # type: ignore[method-assign]
+        surface._lock.release()
+        async with asyncio.timeout(1):
+            await turn
+        if superseded:
+            assert controller.cancellations == [] and events == []
+            assert len(inference.calls) == 1 and synth.texts == []
+            assert surface.health == "open"
+        else:
+            assert controller.cancellations == [("task_a", "user requested task cancellation")]
+            assert synth.texts == [_ACK]
+    finally:
+        if surface._lock.locked():
+            surface._lock.release()
+        await loop.close()
+        await surface.close()
+
+
+@pytest.mark.asyncio
+async def test_surface_admits_nothing_once_the_callers_condition_fails() -> None:
+    context = ConversationContextStore()
+    _accept(context, "a")
+    surface, controller, events = _surface(context)
+    try:
+        result = await surface.cancel_work(
+            task_id="task_a", invocation_id="natural_cancel_x", still_current=lambda: False,
+        )
+        assert result == WorkCancelResult(
+            accepted=False, state="rejected", task_id="task_a",
+            reason="request superseded before admission",
+        )
+        assert controller.cancellations == [] and events == []
+        assert surface.health == "open"
+        assert "natural_cancel_x" not in surface._bindings
+        with pytest.raises(TypeError, match="still_current"):
+            await surface.cancel_work(
+                task_id="task_a", invocation_id="natural_cancel_y", still_current=True,  # type: ignore[arg-type]
+            )
+    finally:
+        await surface.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("when", ["at_selection", "after_selection"])
+async def test_a_superseded_turn_never_reaches_the_cancellation_owner(when) -> None:
+    # The owner here ignores still_current, so only the loop's own lease guards stand
+    # between a superseded turn and the call. Mutation: drop the guard at selection
+    # (at_selection) or the one before the call (after_selection).
+    context = ConversationContextStore()
+    _accept(context, "a")
+    owner = _Owner("task_a")
+    foreground = ForegroundTurnCoordinator()
+
+    def supersede() -> None:
+        foreground._is_current = lambda _lease: False  # type: ignore[method-assign]
+
+    resumed: list[bool] = []
+    inference = (
+        Inference(before_select=supersede, after_select=lambda: resumed.append(True))
+        if when == "at_selection" else Inference(after_select=supersede)
+    )
+    loop, synth = _loop(context, owner, inference, foreground=foreground)
+    try:
+        await _respond(loop)
+        assert owner.cancels == [] and synth.texts == []
+        # A superseded selection also stops consuming the stream at once.
+        assert resumed == []
+    finally:
+        await loop.close()
 
 
 def test_refusal_sentence_is_chosen_by_typed_category_only() -> None:

@@ -75,6 +75,8 @@ _UNAVAILABLE_REASON = "work control unavailable; restart required"
 WORK_CONTROL_UNAVAILABLE_NOTICE = "Task control is unavailable until the host restarts."
 # The one reason for a cancel whose named task is no longer active.
 INACTIVE_TASK_REASON = "task is not active"
+# A host-named cancel whose admitting turn was superseded before admission: no effect.
+SUPERSEDED_REASON = "request superseded before admission"
 _CAPACITY_REASON = "background task capacity exhausted"
 _DUPLICATE_OBJECTIVE_REASON = "matching work is already active"
 _PublicValue = str | int | bool | None
@@ -464,21 +466,27 @@ class ConversationWorkControlSurface:
         task_id: str,
         invocation_id: str,
         reason: str = "user requested task cancellation",
+        still_current: Callable[[], bool] | None = None,
     ) -> WorkCancelResult:
         """Cancel an exact public task: a trusted control, or a host-frozen natural target.
 
         The target is always named by the host. A task that is no longer active is refused as
-        ``stale_target``; no other task is ever selected in its place.
+        ``stale_target``; no other task is ever selected in its place. ``still_current`` is
+        the caller's admission condition, read under the admission lock: the commit point.
+        A request that is no longer current there has no effect and projects nothing.
         """
 
         _validate_task_id(task_id)
         _validate_identifier(invocation_id, "invocation_id")
         _validate_reason(reason)
+        if still_current is not None and not callable(still_current):
+            raise TypeError("still_current must be callable or None")
         return await self._cancel_work(
             invocation_id=invocation_id,
             expected_task_id=task_id,
             reason=reason,
             semantic_kind="cancel_exact",
+            still_current=still_current,
         )
 
     async def submit_cancel_command(
@@ -529,12 +537,14 @@ class ConversationWorkControlSurface:
         expected_task_id: str,
         reason: str,
         semantic_kind: str,
+        still_current: Callable[[], bool] | None = None,
     ) -> WorkCancelResult:
         admission = await self._admit_cancel_work(
             invocation_id=invocation_id,
             expected_task_id=expected_task_id,
             reason=reason,
             semantic_kind=semantic_kind,
+            still_current=still_current,
         )
         if isinstance(admission, _InvocationBinding):
             return self._copy_cancel(await asyncio.shield(admission.operation))
@@ -547,12 +557,19 @@ class ConversationWorkControlSurface:
         expected_task_id: str,
         reason: str,
         semantic_kind: str,
+        still_current: Callable[[], bool] | None = None,
     ) -> _InvocationBinding | WorkCancelResult:
         semantics = (semantic_kind, expected_task_id, reason)
         async with self._lock:
             unavailable = self._unavailable_cancel_locked()
             if unavailable is not None:
                 return unavailable
+            # The commit point: no suspension separates this read from the binding below.
+            if still_current is not None and still_current() is not True:
+                return WorkCancelResult(
+                    accepted=False, state="rejected", task_id=expected_task_id,
+                    reason=SUPERSEDED_REASON,
+                )
             existing = self._bindings.get(invocation_id)
             if existing is not None:
                 if existing.semantics != semantics:

@@ -9,6 +9,7 @@ all remains the model's judgment (#205).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -31,7 +32,9 @@ class NaturalCancellation(Protocol):
 
     def natural_cancel_target(self) -> str | None: ...
 
-    async def cancel_work(self, *, task_id: str, invocation_id: str) -> WorkCancelResult: ...
+    async def cancel_work(
+        self, *, task_id: str, invocation_id: str, still_current: Callable[[], bool],
+    ) -> WorkCancelResult: ...
 
 
 def unaccepted_cancel_speech(result: WorkCancelResult) -> str | None:

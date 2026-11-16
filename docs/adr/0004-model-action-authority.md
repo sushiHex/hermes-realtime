@@ -366,7 +366,10 @@ The host executes a selection only after the provider stream closes successfully
 while the admitting lease is current, and only as `cancel_work(task_id=frozen)`. That
 call refuses `stale_target` if the frozen task has ended; it never chooses another
 task, including one started since admission. A selection on a turn that offered no
-route is refused with no effect. Interruption before execution cancels nothing.
+route is refused with no effect. Interruption before execution cancels nothing. The
+commit point is admission under the work surface's lock: the admitting lease is re-read
+there, with no suspension before the cancel binds, so a newer turn that supersedes this
+one while the cancel waits for the lock cancels nothing and projects nothing.
 
 Speech about the cancel is grounded only in its result. A refusal speaks one fixed host
 sentence chosen by result category, never the result's reason, and none says a task
