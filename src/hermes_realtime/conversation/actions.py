@@ -54,8 +54,25 @@ _ACTION_DISPOSITIONS = frozenset(
 )
 _MAX_MENTIONS_PER_TURN = 16
 _MAX_OWNER_GENERATION = 2**63 - 1
+_TYPED_LINEAGE_CEILING = 1 << 53
 _OWNER_GENERATION_LOCK = Lock()
 _NEXT_OWNER_GENERATION = 1
+
+
+def _is_typed_lineage_value(value: object) -> bool:
+    return type(value) is int and 1 <= value < _TYPED_LINEAGE_CEILING
+
+
+def _authority_typed_lineage(authority: UserTurnAuthorityV1 | None) -> tuple[int, int] | None:
+    if (
+        authority is None
+        or authority.source is not InputSource.TYPED
+        or not _is_typed_lineage_value(authority.typed_sequence)
+        or not _is_typed_lineage_value(authority.binding_generation)
+    ):
+        return None
+    assert authority.typed_sequence is not None
+    return (authority.typed_sequence, authority.binding_generation)
 
 
 def _allocate_owner_generation() -> int:
@@ -379,6 +396,7 @@ class ConversationUpdateExecutor:
         authority: UserTurnAuthorityV1 | None = None,
         *,
         reservation: ConversationOperationReservation | None = None,
+        typed_input: tuple[int, int] | None = None,
     ) -> None:
         if not self._started:
             raise RuntimeError("conversation update executor is not started")
@@ -402,6 +420,23 @@ class ConversationUpdateExecutor:
                 raise TypeError("transcript must be an exact Transcript value")
             if authority is not None and type(authority) is not UserTurnAuthorityV1:
                 raise TypeError("authority must be exact or None")
+            # Advisory typed lineage (#237): the worker's accepted tuple, or one derived
+            # from an admitted typed authority. Both present must agree exactly.
+            if typed_input is not None and (
+                type(typed_input) is not tuple
+                or len(typed_input) != 2
+                or not all(_is_typed_lineage_value(value) for value in typed_input)
+            ):
+                raise TypeError("typed_input must be an exact pair of advisory integers")
+            authority_typed_input = _authority_typed_lineage(authority)
+            if (
+                typed_input is not None
+                and authority is not None
+                and typed_input != authority_typed_input
+            ):
+                raise ValueError("typed_input does not match the admitted user authority")
+            if typed_input is None:
+                typed_input = authority_typed_input
             transcript = Transcript(text=transcript.text, final=transcript.final)
             if not transcript.final:
                 raise ValueError("only final transcripts can start a response")
@@ -445,16 +480,6 @@ class ConversationUpdateExecutor:
         # Final-input admission: freeze the natural cancel target with no suspension
         # since the final was admitted, and carry it unchanged to the producer (#237).
         cancel_target = self._speech.freeze_natural_cancel_target()
-        # Advisory typed lineage comes from the admitted user authority alone; it must
-        # not depend on evidence capture, which is off by default (#237).
-        typed_input = None
-        if (authority is not None
-                and authority.source is InputSource.TYPED
-                and type(authority.typed_sequence) is int
-                and 1 <= authority.typed_sequence < (1 << 53)
-                and type(authority.binding_generation) is int
-                and 1 <= authority.binding_generation < (1 << 53)):
-            typed_input = (authority.typed_sequence, authority.binding_generation)
         coroutine = self._execute_response(
             turn_id, transcript, evidence_lease, typed_input, cancel_target=cancel_target,
         )

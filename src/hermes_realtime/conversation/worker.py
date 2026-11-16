@@ -46,6 +46,8 @@ _MAX_IDENTITY_CHARS = 128
 _MAX_SESSION_GENERATION = (1 << 63) - 1
 _MAX_RESPONSE_OPERATIONS = 64
 _MAX_TYPED_TRANSCRIPT_CHARS = 4096
+# Advisory typed lineage stays within the browser's exact-integer range (#237).
+_TYPED_LINEAGE_CEILING = 1 << 53
 # A persistently refused model ends the session loudly instead of going silent (#470).
 _MAX_CONSECUTIVE_REFUSED_RESPONSES = 3
 _DEFAULT_MAX_BUFFERED_AUDIO_BYTES = 256 * 1024
@@ -256,6 +258,8 @@ class ConversationSessionWorker:
         self._evidence_lifecycle_resolver = evidence_lifecycle_resolver
         self._production_observation_recorder = production_observation_recorder
         self._typed_sequence = 0
+        # Advisory-only high-water mark, independent of evidence sequencing (#237).
+        self._typed_lineage_sequence = 0
         self._microphone_input_incarnation = 0
         self._observer = observer
         self._knowledge_coordinator = knowledge_coordinator
@@ -857,7 +861,19 @@ class ConversationSessionWorker:
                         media_incarnation=None,
                         typed_sequence=typed_sequence,
                     )
-                await self._route_final(router, transcript, authority, typed=True)
+                # The accepted tuple is this binding's own; a stale or duplicated
+                # sequence carries no lineage rather than repeating an earlier one.
+                typed_input: tuple[int, int] | None = None
+                if typed_sequence > self._typed_lineage_sequence:
+                    self._typed_lineage_sequence = typed_sequence
+                    if (
+                        typed_sequence < _TYPED_LINEAGE_CEILING
+                        and self._session_generation < _TYPED_LINEAGE_CEILING
+                    ):
+                        typed_input = (typed_sequence, self._session_generation)
+                await self._route_final(
+                    router, transcript, authority, typed=True, typed_input=typed_input,
+                )
             except BaseException as error:
                 self._latch_terminal_error(error)
                 raise
@@ -869,11 +885,14 @@ class ConversationSessionWorker:
         authority: FinalInputAuthorityV1 | None,
         *,
         typed: bool,
+        typed_input: tuple[int, int] | None = None,
     ) -> None:
         """Commands are typed bytes; speech reaches only proposal confirmation."""
 
         if type(typed) is not bool:
             raise TypeError("typed must be an exact bool")
+        if typed_input is not None and not typed:
+            raise ValueError("only typed input carries typed lineage")
         user_authority: UserTurnAuthorityV1 | None = None
         handled = False
         if router is not None:
@@ -890,7 +909,7 @@ class ConversationSessionWorker:
         if handled:
             await self._revoke_active_ticket("command_routed")
         else:
-            self._start_response(transcript, user_authority)
+            self._start_response(transcript, user_authority, typed_input=typed_input)
 
     def _latch_terminal_error(self, error: BaseException) -> None:
         current = asyncio.current_task()
@@ -1143,6 +1162,8 @@ class ConversationSessionWorker:
         self,
         transcript: Transcript,
         authority: UserTurnAuthorityV1 | None = None,
+        *,
+        typed_input: tuple[int, int] | None = None,
     ) -> None:
         if len(self._response_operations) >= self._max_response_operations:
             raise RuntimeError("conversation response operation capacity exhausted")
@@ -1169,6 +1190,7 @@ class ConversationSessionWorker:
                 transcript,
                 authority,
                 reservation=reservation,
+                typed_input=typed_input,
             )
             operation = asyncio.create_task(
                 response,
