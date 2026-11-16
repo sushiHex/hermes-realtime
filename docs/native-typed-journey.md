@@ -137,10 +137,13 @@ equalled the admitted tuple (null when none was admitted), whether the pair
 predates the step, and whether it was the bound one. For a task-bound step it
 records whether a `cancelling`/`interrupted` state for that step's task was seen
 during the step and after its admission, plus the native terminal category.
-`preCleanupTasks` is captured before cleanup acts: the tracker status, and for an
-already-terminal task one witness read for diagnosis (`unavailable` if that read
-fails). Active tasks are left to cleanup unread. No tuple, ID or text is
-recorded, and `diagnostics` is dropped first if it would overflow the receipt.
+`preCleanupTasks` records each task's tracker status and native category, captured
+synchronously before cleanup acts, so nothing optional can delay or skip mandatory
+cleanup. Diagnostics perform no native I/O: the native category is the one
+`collect()` already retained for that task, or null meaning "not read; collect()
+did not run". Cleanup's own later collection does not change the snapshot. No
+tuple, ID or text is recorded, and `diagnostics` is dropped first if it would
+overflow the receipt.
 
 When the existing failure handler catches an `OSError`, its receipt may include
 `osError`: a fixed source-context function and line, `journal`/`scenario`/`other`

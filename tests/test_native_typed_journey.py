@@ -1753,9 +1753,15 @@ PRIVATE_MARKERS = ("cancel_turn", "old_turn", CANCEL_TASK, CANCEL_RUN, CANCEL_TE
 
 
 def diagnose_execute(tmp_path, monkeypatch, step_rows, *, witness="cancelled",
-                     witness_error=None, cleanup_rows=(), fail="journey_turn_incomplete",
-                     prior_rows=()):
-    """Run execute() with one synthetic step that consumes ``step_rows`` then fails."""
+                     cleanup_rows=(), fail="journey_turn_incomplete", prior_rows=(),
+                     collected=None, cleanup=None):
+    """Run execute() with one synthetic step that consumes ``step_rows`` then fails.
+
+    ``collected`` retains a collect() result for the step's task before it fails.
+    ``cleanup`` collects mandatory cleanup calls in order, plus whether any other
+    callback ran (a suspension) between the step's failure and settle_owned.
+    Returns the receipt, cleanup inputs, and the native witnesses constructed.
+    """
     import hashlib
     import sys
 
@@ -1777,24 +1783,34 @@ def diagnose_execute(tmp_path, monkeypatch, step_rows, *, witness="cancelled",
             pass
 
         async def disconnect(self):
-            pass
+            if cleanup is not None:
+                cleanup.append("disconnect")
 
     monkeypatch.setitem(sys.modules, "livekit", SimpleNamespace(rtc=SimpleNamespace(
         Room=Room, RoomOptions=lambda **kwargs: kwargs)))
     monkeypatch.setattr(host_launcher, "_load_api_bearer", lambda _: "synthetic")
     monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
-    reads = []
+    constructed = []
 
-    def read():
-        reads.append(True)
-        if witness_error is not None:
-            raise witness_error
-        return {"terminal": witness, "toolCalls": []}
+    def witness_factory(*args, **kwargs):
+        constructed.append(True)
+        return SimpleNamespace(read=lambda: {"terminal": witness, "toolCalls": []})
 
-    monkeypatch.setattr(client, "NativeRunWitness", lambda *a, **kw: SimpleNamespace(read=read))
+    monkeypatch.setattr(client, "NativeRunWitness", witness_factory)
+    suspended = []
+    if cleanup is not None:
+        real_settle = client.Journey.settle_owned
+
+        async def settle_owned(self):
+            cleanup.append("settle_owned_after_suspension" if suspended else "settle_owned")
+            return await real_settle(self)
+
+        monkeypatch.setattr(client.Journey, "settle_owned", settle_owned)
     inputs, pending = [], []
 
     def request(origin, route, **kwargs):
+        if route == "stop" and cleanup is not None:
+            cleanup.append("stop")
         if route == "input":
             inputs.append(kwargs["payload"])
             start = len(history) + 1
@@ -1815,13 +1831,43 @@ def diagnose_execute(tmp_path, monkeypatch, step_rows, *, witness="cancelled",
         self.tracker.begin(value["label"], self.sequence, CANCEL_TEXT)
         self.tracker.records[-1]["task"] = "work"
         self.tracker.consume(numbered(step_rows, len(before) + 1))
+        if collected is not None:
+            self.results["work"] = {"terminal": collected, "toolCalls": []}
+        # Runs only if execute() suspends before mandatory cleanup begins.
+        asyncio.get_running_loop().call_soon(suspended.append, True)
         raise ValueError(fail)
 
     monkeypatch.setattr(client.Journey, "step", step)
     receipt = {"outcome": "refused"}
     with pytest.raises(ValueError, match=fail):
         asyncio.run(client.execute(options, [{"label": "stop"}], receipt))
-    return receipt, inputs, reads
+    return receipt, inputs, constructed
+
+
+def test_mandatory_cleanup_follows_the_failure_with_no_diagnostic_suspension(
+    tmp_path, monkeypatch,
+):
+    cleanup = []
+    rows = tokenless_cancel_turn() + settled()
+    receipt, inputs, constructed = diagnose_execute(tmp_path, monkeypatch, rows, cleanup=cleanup)
+    # No await precedes settle_owned, so nothing (not even a cancellation) can run between
+    # the failure and mandatory cleanup; all of it completes and the failure is kept.
+    assert cleanup == ["settle_owned", "stop", "disconnect"]
+    assert receipt["cleanup"] == {
+        "ownedTasksSettled": True, "sessionStopped": True, "roomDisconnected": True,
+    }
+    assert receipt["outcome"] == "refused" and inputs == [] and constructed == []
+    assert receipt["diagnostics"]["preCleanupTasks"] == {
+        "work": {"trackerStatus": "interrupted", "nativeTerminal": None},
+    }
+
+
+def test_diagnostics_never_construct_a_native_witness(tmp_path, monkeypatch):
+    # Already terminal, never collected: the one case a diagnostic read could tempt.
+    rows = tokenless_cancel_turn() + settled()
+    receipt, inputs, constructed = diagnose_execute(tmp_path, monkeypatch, rows)
+    assert constructed == [] and inputs == []
+    assert receipt["diagnostics"]["steps"][0]["nativeTerminal"] is None
 
 
 def test_diagnostics_explain_an_uncorrelated_cancel_turn_without_changing_the_verdict(
@@ -1831,12 +1877,12 @@ def test_diagnostics_explain_an_uncorrelated_cancel_turn_without_changing_the_ve
     rows[-1] = completed(sequence=None)  # The no-capture host omits the typed lineage.
     rows += [("assistant_turn_completed", {"turnId": "old_turn", "turnGeneration": 2}),
              *settled()]
-    receipt, inputs, reads = diagnose_execute(tmp_path, monkeypatch, rows)
+    receipt, inputs, constructed = diagnose_execute(tmp_path, monkeypatch, rows)
     assert receipt["outcome"] == "refused" and receipt["turns"][0]["outcome"] == "pending"
     assert receipt["cleanup"] == {
         "ownedTasksSettled": True, "sessionStopped": True, "roomDisconnected": True,
     }
-    assert inputs == [] and reads == [True]  # Already terminal: no cleanup cancel.
+    assert inputs == [] and constructed == []  # Already terminal: no cleanup cancel.
     assert receipt["diagnostics"] == {
         "version": 1,
         "steps": [{
@@ -1855,10 +1901,9 @@ def test_diagnostics_explain_an_uncorrelated_cancel_turn_without_changing_the_ve
             "terminalsOmitted": 0,
             "targetCancelObserved": True,
             "targetCancelAfterAdmission": True,
-            "nativeTerminal": "cancelled",
+            "nativeTerminal": None,  # Not read: collect() did not run for this task.
         }],
-        "preCleanupTasks": {"work": {"trackerStatus": "interrupted",
-                                     "nativeTerminal": "cancelled"}},
+        "preCleanupTasks": {"work": {"trackerStatus": "interrupted", "nativeTerminal": None}},
     }
     assert not any(marker in json.dumps(receipt) for marker in PRIVATE_MARKERS)
 
@@ -1911,15 +1956,16 @@ def test_diagnostics_without_admission_leave_input_equality_unknown(tmp_path, mo
     assert diagnosis["targetCancelAfterAdmission"] is False
 
 
-def test_pre_cleanup_state_is_captured_before_cleanup_cancels(tmp_path, monkeypatch):
+def test_pre_cleanup_snapshot_survives_cleanup(tmp_path, monkeypatch):
     rows = [admitted(), user_final(), completed()]
-    receipt, inputs, reads = diagnose_execute(
+    receipt, inputs, constructed = diagnose_execute(
         tmp_path, monkeypatch, rows, cleanup_rows=settled(),
     )
-    # Cleanup still cancels the active task exactly as before.
+    # Cleanup still cancels the active task and collects it exactly as before.
     assert inputs == [{"sequence": 2, "text": "cancel task: " + CANCEL_TASK}]
-    assert reads == [True]  # The cleanup collect only; an active task is never pre-read.
+    assert constructed == [True]  # cleanup's own collect(), never diagnostics.
     assert receipt["tasks"]["work"]["terminal"] == "cancelled"
+    # The snapshot taken before cleanup is unchanged by what cleanup then did.
     diagnostics = receipt["diagnostics"]
     assert diagnostics["preCleanupTasks"] == {
         "work": {"trackerStatus": "active", "nativeTerminal": None},
@@ -1929,21 +1975,13 @@ def test_pre_cleanup_state_is_captured_before_cleanup_cancels(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("terminal", ["completed", "failed", "cancelled", "surprising"])
-def test_pre_cleanup_native_terminal_is_a_fixed_category(tmp_path, monkeypatch, terminal):
+def test_native_terminal_is_the_retained_collect_category(tmp_path, monkeypatch, terminal):
     rows = tokenless_cancel_turn() + settled()
-    receipt, _, _ = diagnose_execute(tmp_path, monkeypatch, rows, witness=terminal)
+    receipt, _, constructed = diagnose_execute(tmp_path, monkeypatch, rows, collected=terminal)
     expected = terminal if terminal != "surprising" else "other"
+    assert constructed == []
     assert receipt["diagnostics"]["preCleanupTasks"]["work"]["nativeTerminal"] == expected
-
-
-def test_unavailable_pre_cleanup_witness_never_changes_verdict_or_cleanup(tmp_path, monkeypatch):
-    rows = tokenless_cancel_turn() + settled()
-    receipt, inputs, _ = diagnose_execute(
-        tmp_path, monkeypatch, rows, witness_error=OSError("SYNTHETIC_PRIVATE"),
-    )
-    assert receipt["diagnostics"]["preCleanupTasks"]["work"]["nativeTerminal"] == "unavailable"
-    assert receipt["cleanup"]["ownedTasksSettled"] is True and inputs == []
-    assert "SYNTHETIC_PRIVATE" not in json.dumps(receipt)
+    assert receipt["diagnostics"]["steps"][0]["nativeTerminal"] == expected
 
 
 def test_diagnostic_failure_never_changes_verdict_or_cleanup(tmp_path, monkeypatch):

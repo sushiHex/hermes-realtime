@@ -32,8 +32,16 @@ TERMINAL = {"completed", "failed", "interrupted"}
 _HOST_REFUSALS = {notice: reason for reason, notice in _WEB_REFUSAL_NOTICES.items()} | {
     _WEB_UNVERIFIED_NOTICE: "unverified",
 }
-# None means not read before cleanup (no terminal yet).
-_NATIVE_DIAGNOSTIC_TERMINALS = {None, "completed", "failed", "cancelled", "unavailable"}
+# Retained collect() categories; None means not read (collect() did not run).
+_NATIVE_DIAGNOSTIC_TERMINALS = {None, "completed", "failed", "cancelled"}
+
+
+def _native_category(value: object) -> str | None:
+    if value is None:
+        return None
+    return value if type(value) is str and value in _NATIVE_DIAGNOSTIC_TERMINALS else "other"
+
+
 _PUBLICATION_TIMING_FIELDS = (
     "firstPublicationMs", "tokenToPublicationMs", "publicationToPlayableMs",
 )
@@ -371,7 +379,7 @@ class EventTracker:
 def _journey_diagnostics(
     tracker: EventTracker,
     bindings: dict[str, tuple[str, str]],
-    pre_cleanup: dict[str, dict[str, str | None]],
+    pre_cleanup: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Content-free per-step facts: booleans, counts and fixed categories only.
 
@@ -412,11 +420,7 @@ def _journey_diagnostics(
             "nativeTerminal": (None if record["task"] is None else
                                pre_cleanup.get(record["task"], {}).get("nativeTerminal")),
         })
-    return {
-        "version": 1,
-        "steps": steps,
-        "preCleanupTasks": {label: dict(row) for label, row in pre_cleanup.items()},
-    }
+    return {"version": 1, "steps": steps, "preCleanupTasks": pre_cleanup}
 
 
 def request_json(
@@ -625,33 +629,21 @@ class Journey:
                 "journey_followup_dispatched",
             )
 
-    async def pre_cleanup_tasks(self) -> dict[str, dict[str, str | None]]:
-        """Task state before cleanup, for diagnosis only; never a verdict input.
+    def pre_cleanup_tasks(self) -> dict[str, dict[str, Any]]:
+        """Synchronous task state before cleanup, for diagnosis only; never a verdict input.
 
-        An already-terminal task's native witness is read once here, so its category is
-        known even when the failed step never reached collect(). Active tasks are left to
-        cleanup unread, so diagnosis can never stand in for cleanup's own evidence.
+        Nothing is awaited and no native witness is read: mandatory cleanup follows with
+        no suspension point in between. The native category is the one collect() already
+        retained, or null when collect() did not run for that task.
         """
-        tasks: dict[str, dict[str, str | None]] = {}
-        for label, (task, run) in self.bindings.items():
+        tasks: dict[str, dict[str, Any]] = {}
+        for label, (task, _) in self.bindings.items():
             status = self.tracker.tasks.get(task)
-            native: str | None = None
-            if label in self.results:
-                native = self.results[label]["terminal"]
-            elif status in TERMINAL:
-                try:
-                    value = await asyncio.wait_for(asyncio.to_thread(NativeRunWitness(
-                        self.bearer, run, profile=self.options.native_profile,
-                        api_origin=self.options.api_origin,
-                    ).read), 15)
-                    native = value["terminal"]
-                except Exception:
-                    native = "unavailable"
+            native = self.results[label]["terminal"] if label in self.results else None
             tasks[label] = {
                 "trackerStatus": status if status in {"active", "cancelling", *TERMINAL}
                 else None,
-                "nativeTerminal": native if native in _NATIVE_DIAGNOSTIC_TERMINALS
-                else "other",
+                "nativeTerminal": _native_category(native),
             }
         return tasks
 
@@ -728,10 +720,11 @@ async def execute(options, steps, receipt) -> None:
         }
         diagnostics = None
         if journey is not None:
-            # Diagnosis only, captured before cleanup acts; it never changes a verdict.
+            # Diagnosis only, captured synchronously before cleanup acts: no await and no
+            # native read may precede mandatory cleanup, and it never changes a verdict.
             with contextlib.suppress(Exception):
                 diagnostics = _journey_diagnostics(
-                    journey.tracker, journey.bindings, await journey.pre_cleanup_tasks(),
+                    journey.tracker, journey.bindings, journey.pre_cleanup_tasks(),
                 )
             with contextlib.suppress(Exception):
                 receipt["cleanup"]["ownedTasksSettled"] = await journey.settle_owned()
