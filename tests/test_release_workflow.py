@@ -734,7 +734,6 @@ def test_release_gate_registers_task11_benchmark_and_native_full_host_gate() -> 
 def test_release_gate_registers_all_task12_schemas_and_runners_exactly() -> None:
     root = Path(__file__).resolve().parents[1]
     release_gate_path = root / "scripts" / "release_gate.py"
-    source = release_gate_path.read_text(encoding="utf-8")
     release_gate = run_path(str(release_gate_path))
     required = release_gate["required_sdist_paths"]()
     task12_paths = {
@@ -754,16 +753,16 @@ def test_release_gate_registers_all_task12_schemas_and_runners_exactly() -> None
 
     assert task12_paths <= required
     assert all((root / relative).is_file() for relative in task12_paths)
-    typecheck_block = source.split("script_type_env =", 1)[1].split("cwd=root", 1)[0]
+    targets = release_gate["script_mypy_targets"](root)
     for runner in (
-        '"scripts/qualify_evidence_slice_zero.py"',
-        '"scripts/deterministic_equivalence.py"',
-        '"scripts/equivalence_process.py"',
-        '"scripts/equivalence_worker.py"',
-        '"scripts/qualify_deterministic_equivalence.py"',
-        '"scripts/qualify_hermes_v020_pluginmanager.py"',
+        "scripts/qualify_evidence_slice_zero.py",
+        "scripts/deterministic_equivalence.py",
+        "scripts/equivalence_process.py",
+        "scripts/equivalence_worker.py",
+        "scripts/qualify_deterministic_equivalence.py",
+        "scripts/qualify_hermes_v020_pluginmanager.py",
     ):
-        assert typecheck_block.count(runner) == 1
+        assert targets.count(runner) == 1
 
 
 def test_release_gate_registers_shared_source_archive_authority_once_for_sdist_and_mypy(

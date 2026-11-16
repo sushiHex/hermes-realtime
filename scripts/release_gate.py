@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -1344,6 +1345,46 @@ def check_livekit(
     )
 
 
+# Scripts under scripts/ are type-checked by default. A script is exempt only by an entry
+# here carrying its one-line reason. tests/test_release_script_mypy_coverage.py ratchets the
+# set: an entry whose script no longer exists fails, and a new script is checked by default.
+SCRIPT_MYPY_EXCLUDED: dict[str, str] = {
+    "scripts/benchmark_kokoro.py": "imports an optional local-extra package that is not installed",
+    "scripts/evaluate_natural_work_scenario.py": "unannotated helpers; probe_confirmed_natural_work.py depends on this exclusion",
+    "scripts/lookup_backend_gateway.py": "mixed arg-type, operator and attr-defined errors",
+    "scripts/lookup_backend_task.py": "stale type-ignore comments (unused-ignore)",
+    "scripts/lookup_model_capture.py": "optional-dependency import and a redefinition error",
+    "scripts/measure_word_boundary.py": "numpy Any returns and missing variable annotations",
+    "scripts/native_run_witness.py": "bare generic type arguments and Optional narrowing gaps",
+    "scripts/native_typed_journey.py": "bare generic type arguments and object indexing",
+    "scripts/preview_cutover.py": "Optional arguments passed to non-Optional parameters",
+    "scripts/preview_readiness.py": "a redundant cast",
+    "scripts/qualification_cpu_readiness.py": "redundant casts",
+    "scripts/qualification_dependency_files.py": "arg-type errors on loosely typed file records",
+    "scripts/qualification_moonshine_preparation.py": "a redundant cast",
+    "scripts/qualify_hermes_continuity.py": "an arg-type error and a stale type-ignore",
+    "scripts/qualify_hermes_voice_archive.py": "mixed call-arg, no-redef and stale type-ignores",
+    "scripts/qualify_voice_archive_path.py": "an assignment error and stale type-ignores",
+    "scripts/qualify_voice_delete.py": "Any returns and stale type-ignores",
+    "scripts/qualify_voice_memory.py": "Any returns and stale type-ignores",
+    "scripts/qualify_voice_review.py": "call-overload errors and stale type-ignores",
+}
+
+
+def _present_scripts(root: Path) -> set[str]:
+    return {f"scripts/{path.name}" for path in (root / "scripts").glob("*.py")}
+
+
+def stale_script_mypy_exclusions(root: Path) -> tuple[str, ...]:
+    """Exclusion entries naming a script that no longer exists (asserted by a test)."""
+    return tuple(sorted(set(SCRIPT_MYPY_EXCLUDED) - _present_scripts(root)))
+
+
+def script_mypy_targets(root: Path) -> tuple[str, ...]:
+    """Every scripts/*.py not exempted by SCRIPT_MYPY_EXCLUDED, as sorted posix paths."""
+    return tuple(sorted(_present_scripts(root) - set(SCRIPT_MYPY_EXCLUDED)))
+
+
 def run_script_mypy(root: Path, environment: dict[str, str]) -> None:
     script_type_env = environment | {
         "MYPYPATH": os.pathsep.join((str(root / "src"), str(root / "scripts")))
@@ -1356,57 +1397,7 @@ def run_script_mypy(root: Path, environment: dict[str, str]) -> None:
         "dev",
         "mypy",
         "--follow-imports=skip",
-        "scripts/benchmark_evidence_admission.py",
-        "scripts/qualify_evidence_slice_zero.py",
-        "scripts/qualification_run_journal.py",
-        "scripts/qualification_launch.py",
-        "scripts/deterministic_equivalence.py",
-        "scripts/equivalence_process.py",
-        "scripts/equivalence_worker.py",
-        "scripts/local_livekit.py",
-        "scripts/qualify_deterministic_equivalence.py",
-        "scripts/candidate_wheel.py",
-        "scripts/revoke_race.py",
-        "scripts/revoke_race_worker.py",
-        "scripts/qualify_revoke_race.py",
-        "scripts/packaged_scenario.py",
-        "scripts/capacity_rollover.py",
-        "scripts/capacity_rollover_worker.py",
-        "scripts/qualify_capacity_rollover.py",
-        "scripts/evidence_observation.py",
-        "scripts/over_budget_turn.py",
-        "scripts/over_budget_turn_worker.py",
-        "scripts/qualify_over_budget_turn.py",
-        "scripts/owned_close_faults.py",
-        "scripts/owned_close_faults_worker.py",
-        "scripts/qualify_owned_close_faults.py",
-        "scripts/spool_crash_matrix.py",
-        "scripts/storage_process.py",
-        "scripts/storage_worker.py",
-        "scripts/storage_observation.py",
-        "scripts/windows_storage_oracle.py",
-        "scripts/evidence_protocol_oracle.py",
-        "scripts/spool_crash_oracle.py",
-        "scripts/qualify_spool_crash_matrix.py",
-        "scripts/full_purge_cleanup.py",
-        "scripts/full_purge_observation.py",
-        "scripts/full_purge_worker.py",
-        "scripts/qualify_full_purge_cleanup.py",
-        "scripts/synthetic_fault_matrix.py",
-        "scripts/synthetic_fault_worker.py",
-        "scripts/synthetic_fault_oracle.py",
-        "scripts/qualify_synthetic_fault_matrix.py",
-        "scripts/qualify_hermes_v020_pluginmanager.py",
-        "scripts/source_archive_authority.py",
-        "scripts/real_natural_work_gate.py",
-        "scripts/real_gate_support.py",
-        "scripts/real_hermes_api_gate.py",
-        "scripts/rehearse_desktop_mvp.py",
-        "scripts/hermes_session_latency.py",
-        "scripts/task13_artifact_orchestrator.py",
-        "scripts/candidate_source_archive_oracle.py",
-        "scripts/candidate_e2e_fast_track.py",
-        "scripts/natural_work_target_resolution.py",
+        *script_mypy_targets(root),
         cwd=root,
         env=script_type_env,
     )
@@ -1738,15 +1729,12 @@ def self_test() -> None:
             (linear[target], "baseline commit must be an ancestor of candidate HEAD"),
         )
         markers = io.StringIO()
+        def print_refused_binding(baseline: str | None) -> None:
+            print(candidate_diff_binding(history, baseline, revision=merge), file=sys.stderr)
+
         with contextlib.redirect_stderr(markers):
             for baseline, expected in refused:
-                expect_failure(
-                    lambda baseline=baseline: print(
-                        candidate_diff_binding(history, baseline, revision=merge),
-                        file=sys.stderr,
-                    ),
-                    expected,
-                )
+                expect_failure(functools.partial(print_refused_binding, baseline), expected)
         if markers.getvalue().count("[release-gate-baseline] ") != len(refused) or len(
             markers.getvalue().splitlines()
         ) != len(refused):

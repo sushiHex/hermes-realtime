@@ -85,9 +85,12 @@ The `release-candidate` job runs, from that fresh candidate:
    and status-policy tests alongside `tests/providers/test_speech_presence.py` with
    the `speech-verification` extra. These cheap contracts fail before the full matrix;
    their small overlap with default `pytest -q` is intentional. The full Python suite,
-   `ruff check .`, `mypy src` and a typed pass over the governed
-   qualification and real-gate scripts, including the private run journal, follow
-   with the frozen lockfile and development group;
+   `ruff check .`, `mypy src` and a typed pass (`--follow-imports=skip`) over every
+   `scripts/*.py` follow with the frozen lockfile and development group. A script is
+   exempt only through a one-line-justified entry in `SCRIPT_MYPY_EXCLUDED` in
+   `scripts/release_gate.py`; a test fails on an entry naming a script that no longer
+   exists, and a new script is
+   checked without registration;
 2. `npm ci --ignore-scripts`, browser unit tests, and the production browser
    build;
 3. source/static parity after CRLF-to-LF normalization for package files captured from the archived

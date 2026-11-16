@@ -1860,9 +1860,7 @@ def test_governed_aggregation_requires_disabled_false_and_publishes_reopened_out
 def test_release_gate_keeps_the_pluginmanager_harness_in_sdist_and_static_checks() -> None:
     release_gate_path = ROOT / "scripts" / "release_gate.py"
     release_gate = run_path(str(release_gate_path))
-    source = release_gate_path.read_text(encoding="utf-8")
 
-    harness_path = '"scripts/qualify_hermes_v020_pluginmanager.py"'
-    typecheck_block = source.split("script_type_env =", 1)[1].split("cwd=root", 1)[0]
-    assert "scripts/qualify_hermes_v020_pluginmanager.py" in release_gate["required_sdist_paths"]()
-    assert harness_path in typecheck_block
+    harness_path = "scripts/qualify_hermes_v020_pluginmanager.py"
+    assert harness_path in release_gate["required_sdist_paths"]()
+    assert harness_path in release_gate["script_mypy_targets"](ROOT)

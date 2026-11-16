@@ -304,7 +304,7 @@ async def run_cases(*, model: str, private_sink: Any, base_url: str | None = Non
             legacy.IntentCase(case["id"], "negative", case["utterance"], None),
             revision, tuple(case.get("prior_user_turns", ())), active=False,
         )
-        recorder = harness.Recorder()  # type: ignore[no-untyped-call]
+        recorder = harness.Recorder()
         surface = ConversationWorkControlSurface(
             controller=recorder, context=context, observer=lambda *args: None,
             reserve_observer_capacity=lambda: None,

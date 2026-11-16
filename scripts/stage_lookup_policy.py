@@ -48,7 +48,7 @@ def stage_lookup_policy(owned_profile: Path, reviewed_source: Path) -> dict[str,
     The caller separately supplies profile configuration and explicit override
     consent before any real pinned-loader observation. No loader runs here.
     """
-    category = "profile-not-fresh"
+    category: str | None = "profile-not-fresh"
     try:
         if owned_profile.is_symlink() or not owned_profile.is_dir() or any(owned_profile.iterdir()):
             raise StagingRefusal(category)
