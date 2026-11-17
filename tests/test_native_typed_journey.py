@@ -2924,10 +2924,10 @@ def test_readiness_that_needs_pcm_arrives_after_the_silence_feed_starts(tmp_path
     seen = []
     original = client.SyntheticVoice.stream
 
-    async def stream(self, frames):
+    async def stream(self, *args):
         # The warm-up has settled and only silence has been captured so far.
         seen.append((self._idle_task, [bytes(f.data) for f in self.source.frames]))
-        await original(self, frames)
+        await original(self, *args)
 
     monkeypatch.setattr(client.SyntheticVoice, "stream", stream)
     speak(journey)
@@ -3238,6 +3238,8 @@ def barge_journey(tmp_path, monkeypatch, *, pre=None, post=None, response_frames
         if route == "media":
             journey.media.append(payload)
             return {"mediaIncarnation": payload["mediaIncarnation"], "version": 1}
+        if route == "input":
+            return {}
         assert route == "events"
         now[0] += CLOCK_STEP
         window = meter.window
@@ -3295,7 +3297,7 @@ def test_barge_uses_one_track_one_media_request_and_both_pinned_clips(tmp_path, 
     assert journey.media == [{"mediaIncarnation": 1}]
     assert len(journey.room.published) == 1
     pcm = [frame.data for frame in journey.room.published[0][0].source.frames]
-    assert pcm == list(target) + list(stop)
+    assert pcm[-(len(target) + len(stop)):] == list(target) + list(stop)  # after idle silence
 
 
 def test_barge_receipt_is_metadata_only(tmp_path, monkeypatch):
@@ -3332,10 +3334,10 @@ def test_a_target_that_ends_first_is_inconclusive_and_nothing_is_injected(tmp_pa
     assert receipt["stopInjected"] is False and receipt["targetInterrupted"] is False
     import scripts.native_typed_journey as client
 
-    # Only the first clip was ever streamed.
-    assert len(journey.room.published[0][0].source.frames) == len(
-        client.load_barge_fixtures()[0]
-    )
+    # Only the first clip was ever streamed (after the idle silence, which is all zero).
+    pcm = [frame.data for frame in journey.room.published[0][0].source.frames]
+    assert pcm[-len(client.load_barge_fixtures()[0]):] == list(client.load_barge_fixtures()[0])
+    assert not any(any(data) for data in pcm[:-len(client.load_barge_fixtures()[0])])
 
 
 def test_stop_is_not_injected_before_target_has_enough_audio(tmp_path, monkeypatch):
@@ -3528,3 +3530,38 @@ def test_the_barge_fixtures_are_pinned_by_sha256(monkeypatch, name):
     monkeypatch.setattr(client, name, "0" * 64)
     with pytest.raises(ValueError, match="journey_speak_fixture"):
         client.load_barge_fixtures()
+
+
+def test_the_barge_silence_feed_is_cancelled_and_settled_when_readiness_never_arrives(
+    tmp_path, monkeypatch
+):
+    import scripts.native_typed_journey as client
+
+    monkeypatch.setattr(client.SyntheticVoice, "_idle", RecordingIdle.run)
+    pre = barge_pre()
+    pre[1] = []  # readiness never arrives
+    journey = barge_journey(tmp_path, monkeypatch, pre=pre)
+
+    async def run():
+        with pytest.raises(ValueError, match="journey_speak_not_ready"):
+            await asyncio.wait_for(journey.step(BARGE_STEP), 5)
+        return RecordingIdle.cancelled, journey.voice._idle_task
+
+    assert asyncio.run(run()) == (True, None)
+
+
+def test_a_barge_after_a_completed_typed_step_does_not_claim_the_microphone_final(
+    tmp_path, monkeypatch
+):
+    typed_pair = {"turnId": "typed_turn", "turnGeneration": 1}
+    typed = [admitted(sequence=1), user_final("Hi there"),
+             ("first_foreground_token", typed_pair), ("assistant_text_generated", typed_pair),
+             completed(turn="typed_turn", sequence=1)]
+    journey = barge_journey(tmp_path, monkeypatch, pre=[typed, *barge_pre()])
+
+    async def both():
+        await journey.step({"label": "greeting", "kind": "conversation", "text": "Hi there"})
+        await journey.step(BARGE_STEP)
+
+    asyncio.run(asyncio.wait_for(both(), 10))
+    assert journey.speak_receipt["quiescenceObserved"] is True
