@@ -254,10 +254,14 @@ class BargeTrace(SpeakTrace):
             # authority {turnId, turnGeneration, chunkId, streamId}
             # (host_launcher.py _renderer_yield_event_data, lines 937-942) and otherwise an
             # empty payload (lines 933 and 936). So a generation is never legitimately absent
-            # next to a turnId: require an exact turnId and an exact int generation, both
-            # equal to TARGET's. Anything else (True, 1.0, None, a string, absent) is foreign.
+            # next to a turnId: require the strict pair (exact str turnId, exact int
+            # generation) to equal TARGET's. An empty payload is unattributed, so it is not
+            # TARGET evidence and not foreign either. Any other value (another turn, True,
+            # 1.0, None, a string, an absent generation) is foreign.
             turn, generation = data.get("turnId"), data.get("turnGeneration")
-            if (turn == target[0]
+            if not data:
+                pass
+            elif (type(turn) is str and turn == target[0]
                     and type(generation) is int and generation == target[1]):
                 self.interrupt_requested = True
             else:

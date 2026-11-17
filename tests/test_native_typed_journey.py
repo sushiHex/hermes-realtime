@@ -3628,3 +3628,23 @@ def test_a_target_that_ends_during_the_lead_in_aborts_before_any_stop_speech(
     sent = [frame.data for frame in journey.room.published[0][0].source.frames]
     target, _, _, _, _ = client.load_barge_fixtures()
     assert sum(any(pcm) for pcm in sent) == sum(any(pcm) for pcm in target)  # no Stop speech
+
+
+def test_an_empty_interrupt_request_is_not_target_evidence_and_not_foreign(tmp_path, monkeypatch):
+    # The host projects {} when renderer authority does not match: unattributed.
+    post = barge_post(interrupt=False)
+    post[1].append(("interrupt_requested", {}))
+    journey = barge_journey(tmp_path, monkeypatch, post=post)
+    receipt = refused(journey, "journey_barge_no_interrupt_event")
+    assert receipt["interruptEventObserved"] is False
+    assert receipt["playbackSilencedObserved"] is True
+
+
+def test_an_interrupt_request_turn_id_must_be_an_exact_string(tmp_path, monkeypatch):
+    class LoudStr(str):
+        pass
+
+    post = barge_post(interrupt=False)
+    post[1].append(("interrupt_requested",
+                    {"turnId": LoudStr("target_turn"), "turnGeneration": 1}))
+    refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_barge_ambiguous")
