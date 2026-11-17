@@ -333,6 +333,34 @@ class MoonshineStreamingTranscriber:
                             self._finish_operation = None
                         self._settling = False
 
+    async def drain_partials(self) -> tuple[Transcript, ...]:
+        """Decode this utterance's pending audio and return the partials it produced.
+
+        Called at the endpoint, before ``finish_utterance``. A push only collects a decode
+        that already completed, so audio pushed in a burst yields its partials here, not
+        from ``push``. Pushes are refused while the drain runs, so it covers a finite
+        snapshot of this utterance's audio. It returns only non-final partials of the
+        current utterance, never calls the backend's ``finish`` and leaves any operation
+        still running (on cancellation) in this transcriber's custody for ``cancel`` to
+        settle. Like ``finish_utterance``, it has no wall-clock bound of its own.
+        """
+
+        async with self._lifecycle_lock:
+            async with self._lock:
+                if self._closed:
+                    raise RuntimeError("Moonshine transcriber is closed")
+                if self._settling or self._closing:
+                    raise RuntimeError("Moonshine utterance is settling")
+                self._settling = True
+                epoch = self._epoch
+            partials: list[str] = []
+            try:
+                await self._drain_pending(epoch, partials)
+            finally:
+                async with self._lock:
+                    self._settling = False
+            return tuple(Transcript(text=text, final=False) for text in partials)
+
     async def cancel(self) -> None:
         await self._cancel(allow_closing=False)
 
@@ -428,10 +456,12 @@ class MoonshineStreamingTranscriber:
             if errors:
                 raise BaseExceptionGroup("Moonshine close failed", errors)
 
-    async def _drain_pending(self, epoch: int) -> None:
+    async def _drain_pending(self, epoch: int, partials: list[str] | None = None) -> None:
         while True:
             async with self._lock:
-                self._harvest_locked()
+                partial = self._harvest_locked()
+                if partial is not None and partials is not None:
+                    partials.append(partial)
                 self._launch_locked(allow_settling=True)
                 operation = self._operation
                 if operation is None:

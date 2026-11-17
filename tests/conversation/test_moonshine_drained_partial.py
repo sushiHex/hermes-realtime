@@ -8,6 +8,8 @@ harvested only while the endpoint drains, before the final.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from hermes_realtime.conversation import ConversationSessionWorker
@@ -27,11 +29,14 @@ _FRAMES = (
 )
 
 
-async def _barge_in(*, streams_partials: bool) -> tuple[
-    ScriptedMoonshineBackend, bool, list[tuple[str, Transcript]], list[str]
-]:
+async def _barge_in(
+    *,
+    streams_partials: bool = True,
+    partial: str | None = "Stop",
+    transcript_echoes: tuple[str, ...] = (),
+) -> tuple[ScriptedMoonshineBackend, bool, list[tuple[str, Transcript]], list[str]]:
     executor, foreground_cancelled, responses = action_executor_probe()
-    backend = ScriptedMoonshineBackend("Stop", final="Stop.")
+    backend = ScriptedMoonshineBackend(partial, final="Stop.")
     observed: list[str] = []
     worker = ConversationSessionWorker(
         participant_identity="browser_user",
@@ -40,7 +45,7 @@ async def _barge_in(*, streams_partials: bool) -> tuple[
         stt=MoonshineStreamingTranscriber(backend=backend),
         stt_streams_partials=streams_partials,
         actions=executor,
-        echo_guard=ScriptedEchoGuard(False, False),
+        echo_guard=ScriptedEchoGuard(False, False, transcript_echoes=transcript_echoes),
         speech_presence_verifier=ScriptedSpeechPresenceVerifier(SpeechPresence.CONFIRMED_SPEECH),
         observer=lambda kind, _data: observed.append(kind),
     )
@@ -48,8 +53,9 @@ async def _barge_in(*, streams_partials: bool) -> tuple[
     for frame in _FRAMES:
         await worker.receive_audio("browser_user", 1, frame)
     await worker.wait_for_responses()
+    cancelled = foreground_cancelled.is_set()  # before close, which ends the foreground
     await worker.close()
-    return backend, foreground_cancelled.is_set(), responses, observed
+    return backend, cancelled, responses, observed
 
 
 @pytest.mark.asyncio
@@ -68,7 +74,7 @@ async def test_control_without_the_evidence_rule_the_same_barge_in_is_admitted()
 
 @pytest.mark.asyncio
 async def test_endpoint_promoted_short_word_keeps_its_drained_streaming_partial() -> None:
-    backend, cancelled, responses, observed = await _barge_in(streams_partials=True)
+    backend, cancelled, responses, observed = await _barge_in()
 
     # The backend decoded "Stop" from this utterance's own audio before its final.
     assert backend.add_sizes and backend.finish_calls == 1
@@ -78,3 +84,136 @@ async def test_endpoint_promoted_short_word_keeps_its_drained_streaming_partial(
     assert [transcript for _turn, transcript in responses] == [
         Transcript(text="Stop.", final=True)
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("partial", "transcript_echoes", "echo_suppressed"),
+    (
+        pytest.param(None, (), False, id="no-partial"),
+        pytest.param("No", (), False, id="subthreshold-partial"),
+        pytest.param("Stop", ("Stop",), True, id="echoed-partial"),
+    ),
+)
+async def test_drained_partial_without_evidence_leaves_the_final_unauthoritative(
+    partial: str | None, transcript_echoes: tuple[str, ...], echo_suppressed: bool
+) -> None:
+    backend, cancelled, responses, observed = await _barge_in(
+        partial=partial, transcript_echoes=transcript_echoes
+    )
+
+    assert backend.add_sizes and backend.finish_calls == 1
+    assert cancelled is False
+    assert "interrupt_requested" not in observed
+    assert responses == []
+    assert ("transcript_echo_suppressed" in observed) is echo_suppressed
+
+
+@pytest.mark.asyncio
+async def test_an_utterance_outside_playback_is_not_drained() -> None:
+    executor, _cancelled, responses = action_executor_probe()
+    executor._speech.foreground_active = False  # type: ignore[attr-defined]
+    backend = ScriptedMoonshineBackend("Hello", final="Hello there.")
+    observed: list[str] = []
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user",
+        session_generation=1,
+        vad=ScriptedVad(VoiceActivity.SPEECH_STARTED, VoiceActivity.SPEECH_ENDED),
+        stt=MoonshineStreamingTranscriber(backend=backend),
+        actions=executor,
+        observer=lambda kind, _data: observed.append(kind),
+    )
+    worker.start()
+    for frame in _FRAMES:
+        await worker.receive_audio("browser_user", 1, frame)
+    await worker.wait_for_responses()
+    await worker.close()
+
+    # Unchanged behaviour: the final is admitted, and no endpoint drain surfaced a partial.
+    assert [transcript for _turn, transcript in responses] == [
+        Transcript(text="Hello there.", final=True)
+    ]
+    assert "transcript_partial" not in observed
+
+
+class _DrainingTranscriber:
+    def __init__(self, drained: object) -> None:
+        self._drained = drained
+
+    async def push(self, frame: AudioFrame) -> tuple[Transcript, ...]:
+        del frame
+        return ()
+
+    async def drain_partials(self) -> object:
+        return self._drained
+
+    async def finish_utterance(self) -> Transcript:
+        return Transcript(text="Stop.", final=True)
+
+    async def cancel(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drained", "error"),
+    (
+        pytest.param((Transcript(text="Stop.", final=True),), ValueError, id="final"),
+        pytest.param([Transcript(text="Stop", final=False)], TypeError, id="not-a-tuple"),
+        pytest.param(("Stop",), TypeError, id="not-a-transcript"),
+    ),
+)
+async def test_a_drain_that_is_not_exact_non_final_partials_fails_closed(
+    drained: object, error: type[Exception]
+) -> None:
+    executor, foreground_cancelled, responses = action_executor_probe()
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user",
+        session_generation=1,
+        vad=ScriptedVad(VoiceActivity.SPEECH_STARTED, VoiceActivity.SPEECH_ENDED),
+        stt=_DrainingTranscriber(drained),
+        actions=executor,
+        echo_guard=ScriptedEchoGuard(False, False),
+        speech_presence_verifier=ScriptedSpeechPresenceVerifier(SpeechPresence.CONFIRMED_SPEECH),
+    )
+    worker.start()
+    await worker.receive_audio("browser_user", 1, _FRAMES[0])
+
+    with pytest.raises(error):
+        await worker.receive_audio("browser_user", 1, _FRAMES[1])
+
+    assert foreground_cancelled.is_set() is False
+    assert responses == []
+
+
+@pytest.mark.asyncio
+async def test_a_binding_closed_during_the_drain_creates_no_interrupt_or_turn() -> None:
+    executor, _foreground_cancelled, responses = action_executor_probe()
+    backend = ScriptedMoonshineBackend("Stop", final="Stop.")
+    backend.release.clear()
+    observed: list[str] = []
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user",
+        session_generation=1,
+        vad=ScriptedVad(VoiceActivity.SPEECH_STARTED, VoiceActivity.SPEECH_ENDED),
+        stt=MoonshineStreamingTranscriber(backend=backend),
+        actions=executor,
+        echo_guard=ScriptedEchoGuard(False, False),
+        speech_presence_verifier=ScriptedSpeechPresenceVerifier(SpeechPresence.CONFIRMED_SPEECH),
+        observer=lambda kind, _data: observed.append(kind),
+    )
+    worker.start()
+    await worker.receive_audio("browser_user", 1, _FRAMES[0])
+    endpoint = asyncio.create_task(worker.receive_audio("browser_user", 1, _FRAMES[1]))
+    assert await asyncio.to_thread(backend.added.wait, 1)
+
+    closing = asyncio.create_task(worker.close())
+    await asyncio.sleep(0)
+    backend.release.set()
+    await asyncio.gather(endpoint, return_exceptions=True)
+    await closing
+
+    # Close itself ends the foreground; what must not happen is a barge-in or a turn.
+    assert "interrupt_requested" not in observed
+    assert "transcript_final" not in observed
+    assert responses == []
