@@ -174,4 +174,45 @@ evidence takes precedence. The client does not infer semantic
 recall accuracy, source quality, phonemes, microphone recognition, or voice
 interruption from an HTTP transcript. Those remain separate acceptance checks.
 
+## Synthetic `speak` step
+
+A `speak` step has exactly `label` and `kind`; a scenario may hold one. It streams
+the sha256-pinned synthetic clip `tests/fixtures/audio/sapi_hello_can_you_hear_me.wav`
+(`Hello, can you hear me?`, Windows SAPI, no human speech) into the preview's LiveKit
+room as microphone audio: one `microphone-1` track at 48 kHz mono in 10 ms frames at
+real-time pace, with bounded leading and trailing silence, then one `/api/v1/media`
+activation. The audio crosses the real VAD, STT, foreground model and TTS. Only the
+worker's audio track (the exact validated worker identity) is subscribed before
+readiness, one track only (a second distinct worker track is ambiguity), and received
+PCM is measured by RMS and discarded; nothing is written to disk or the receipt. The
+clip's bytes, duration, channels, sample rate and SHA-256 are verified before anything
+is published. After readiness the step waits for one whole local quiet interval,
+measured from the later of gate entry and the last observed worker audio (so a cue the
+host has not started yet cannot pass for silence), bounded by a timeout, before speaking.
+The receipt records `cueAudioObserved` and `quietGateMs` (client clock only). Frames are paced in real time through a queue-bounded `AudioSource`,
+and measurement windows (settle, input, response) only advance, so they never overlap.
+The worker confirms readiness only after it receives PCM, so a warm-up silence producer feeds
+the published track from activation until the clip starts. It is bounded by frames, bytes and
+time, is the only PCM producer at that moment, is cancelled and settled on every exit path,
+and stops before the clip without disposing the shared `AudioSource`. A `speak` step clears
+only a completed preceding typed step's observation state (so the microphone final is not
+also checked as that step's typed input) and keeps seen identities, admissions, task
+baselines and sequence authority; a typed turn still active is rejected
+(`journey_speak_previous_turn_active`), never erased.
+Client and server clocks are never mixed; the step computes no latency.
+
+Microphone input emits no `typed_input_admitted`, so the step is attributed strictly.
+It passes only when the session starts quiet (no active task, no open foreground turn,
+no worker audio for a settle period), voice activity started then ended, exactly one
+new user `transcript_final` whose lowercased, punctuation-stripped words equal the
+fixture's, exactly one new foreground pair bound by `first_foreground_token` after that
+final and completed, no new task, and non-silent worker audio inside that response
+window. More than one final, an unbound or concurrent turn, a missing pair or no audio
+fails. The receipt's `speak` object holds booleans and counts only: no transcript text,
+identity or audio.
+
+This is a controlled synthetic path. It bypasses the physical microphone and acoustic
+echo cancellation. It does not prove source-attributed microphone qualification or the
+naturalness of the conversation.
+
 Offline checks: `uv run pytest -q tests/test_native_typed_journey.py`.
