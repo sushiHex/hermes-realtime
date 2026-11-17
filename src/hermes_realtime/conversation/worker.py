@@ -9,7 +9,7 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol, cast
 
 from hermes_realtime.evidence import (
@@ -55,6 +55,8 @@ _MAX_BUFFERED_AUDIO_BYTES = 2 * 1024 * 1024
 # How long closing a binding waits for the speech it started to stop.
 _BINDING_SPEECH_SETTLE_SECONDS = 10.0
 _BINDING_SPEECH_MARKER = "[binding-speech] "
+_DRAINED_PARTIALS_MARKER = "[drained-partials] "
+_DRAINED_PARTIALS_REFUSALS = frozenset({"not_a_tuple", "not_a_transcript", "final"})
 _LOGGER = logging.getLogger(__name__)
 
 _PublicValue = str | int | bool | None
@@ -251,6 +253,12 @@ class ConversationSessionWorker:
         self._vad = vad
         self._stt = stt
         self._stt_streams_partials = stt_streams_partials
+        # Optional: a streaming STT that decodes in the background returns, at the
+        # endpoint, the partials it produced from this utterance's audio before its final.
+        drain_partials = getattr(stt, "drain_partials", None)
+        self._stt_drain_partials: Callable[[], Awaitable[object]] | None = (
+            drain_partials if callable(drain_partials) else None
+        )
         self._actions = actions
         self._command_router = command_router
         self._task_proposals = task_proposals
@@ -520,19 +528,27 @@ class ConversationSessionWorker:
                     )
                     if frame_finals:
                         self._preliminary_final_transcript = frame_finals[-1]
-                    frame_transcripts = self._with_playback_authority(
+                    frame_transcripts = await self._admit_streaming_partials(
                         tuple(transcript for transcript in raw_transcripts if not transcript.final)
                     )
-                    for transcript in frame_transcripts:
-                        await self._confirm_interruption_from_transcript(transcript)
-                    if self._playback_candidate_authority_revoked:
-                        frame_transcripts = ()
-                        await self._revoke_active_ticket("playback_authority_revoked")
                     transcripts = (*transcripts, *frame_transcripts)
                 if utterance_ended:
                     observer = self._observer
                     if observer is not None:
                         observer("speech_ended", {})
+                    drain_partials = self._stt_drain_partials
+                    if (
+                        drain_partials is not None
+                        and self._playback_candidate_requires_streaming_evidence
+                    ):
+                        drained = self._without_transcript_echoes(
+                            self._trusted_partials(await drain_partials())
+                        )
+                        self._raise_if_closed()
+                        transcripts = (
+                            *transcripts,
+                            *await self._admit_streaming_partials(drained),
+                        )
                     final_transcript = await self._stt.finish_utterance()
                     if final_transcript is None:
                         final_transcript = self._preliminary_final_transcript
@@ -645,6 +661,20 @@ class ConversationSessionWorker:
                 )
             return False
         return True
+
+    async def _admit_streaming_partials(
+        self,
+        partials: tuple[Transcript, ...],
+    ) -> tuple[Transcript, ...]:
+        """Admit non-final transcripts under playback authority, confirming any barge-in."""
+
+        admitted = self._with_playback_authority(partials)
+        for transcript in admitted:
+            await self._confirm_interruption_from_transcript(transcript)
+        if self._playback_candidate_authority_revoked:
+            await self._revoke_active_ticket("playback_authority_revoked")
+            return ()
+        return admitted
 
     def _with_playback_authority(
         self,
@@ -1232,6 +1262,36 @@ class ConversationSessionWorker:
         if type(value) is not tuple:
             raise TypeError("stt push must return an exact tuple")
         return tuple(ConversationSessionWorker._trusted_transcript(item) for item in value)
+
+    @staticmethod
+    def _trusted_partials(value: object) -> tuple[Transcript, ...]:
+        # A refused drain leaves one category-and-count line; its content never does.
+        refusal: str | None = "not_a_tuple"
+        items = len(value) if type(value) is tuple else 0
+        try:
+            if type(value) is not tuple:
+                raise TypeError("stt drain_partials must return an exact tuple")
+            refusal = "not_a_transcript"
+            partials = tuple(
+                ConversationSessionWorker._trusted_transcript(item) for item in value
+            )
+            refusal = "final"
+            if any(partial.final for partial in partials):
+                raise ValueError("stt drain_partials must return only non-final transcripts")
+            refusal = None
+            return partials
+        finally:
+            if refusal in _DRAINED_PARTIALS_REFUSALS:
+                with contextlib.suppress(Exception):
+                    print(
+                        _DRAINED_PARTIALS_MARKER
+                        + json.dumps(
+                            {"category": refusal, "items": items, "version": 1},
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
 
     @staticmethod
     def _trusted_transcript(value: object) -> Transcript:

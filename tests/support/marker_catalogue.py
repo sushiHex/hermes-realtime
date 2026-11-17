@@ -111,6 +111,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "desktop-mvp-rehearsal": {
         "scripts/rehearse_desktop_mvp.py": 1,
     },
+    "drained-partials": {
+        "src/hermes_realtime/conversation/worker.py": 1,
+    },
     "foreground-failure": {
         "src/hermes_realtime/conversation/streaming.py": 1,
     },
