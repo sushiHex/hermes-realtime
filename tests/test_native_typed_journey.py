@@ -3418,17 +3418,35 @@ def test_a_target_that_is_never_interrupted_fails(tmp_path, monkeypatch):
     assert receipt["targetInterrupted"] is False
 
 
-def test_the_exact_pair_interruption_needs_an_interrupt_or_silence_event(tmp_path, monkeypatch):
+def test_the_exact_pair_interruption_needs_an_interrupt_request_for_its_turn(
+    tmp_path, monkeypatch
+):
     journey = barge_journey(tmp_path, monkeypatch,
                             post=barge_post(interrupt=False, silenced=False))
     receipt = refused(journey, "journey_barge_no_interrupt_event")
     assert receipt["interruptEventObserved"] is False
+    assert receipt["playbackSilencedObserved"] is False
 
 
-@pytest.mark.parametrize("interrupt,silenced", [(True, False), (False, True)])
-def test_either_interrupt_event_alone_suffices(tmp_path, monkeypatch, interrupt, silenced):
-    post = barge_post(interrupt=interrupt, silenced=silenced)
-    barge(barge_journey(tmp_path, monkeypatch, post=post))
+def test_an_unanchored_playback_silence_never_satisfies_the_interrupt_requirement(
+    tmp_path, monkeypatch
+):
+    # playback_silenced has an empty payload: it cannot be tied to TARGET.
+    journey = barge_journey(tmp_path, monkeypatch,
+                            post=barge_post(interrupt=False, silenced=True))
+    receipt = refused(journey, "journey_barge_no_interrupt_event")
+    assert receipt["interruptEventObserved"] is False
+    assert receipt["playbackSilencedObserved"] is True
+
+
+def test_an_interrupt_request_for_target_suffices_and_silence_is_only_supporting(
+    tmp_path, monkeypatch
+):
+    journey = barge_journey(tmp_path, monkeypatch,
+                            post=barge_post(interrupt=True, silenced=False))
+    barge(journey)
+    assert journey.speak_receipt["interruptEventObserved"] is True
+    assert journey.speak_receipt["playbackSilencedObserved"] is False
 
 
 def test_audio_that_continues_past_the_budget_fails(tmp_path, monkeypatch):

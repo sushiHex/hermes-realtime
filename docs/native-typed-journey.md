@@ -223,7 +223,7 @@ inconclusive (`journey_barge_target_terminal`); it never claims an interruption.
 
 It passes only when all of these hold: a fresh voice start after injection and exactly one new
 user final with the Stop words; for TARGET's exact pair, `interrupt_requested` for its turn
-and/or `playback_silenced`, plus `assistant_turn_interrupted`, and no `assistant_turn_completed`
+plus `assistant_turn_interrupted` (`playback_silenced` has an empty payload, so it is recorded as `playbackSilencedObserved` supporting evidence only and never satisfies this), and no `assistant_turn_completed`
 through the final drain; no other pair active while TARGET runs and at most one fresh pair;
 no new task; and audio quiescence. Quiescence is a window from injection end that closes at the
 earlier of a fresh pair's first token or a bounded drain (the 1500 ms budget plus the 500 ms
@@ -235,7 +235,7 @@ declared constants, never tuned to pass.
 
 The receipt keeps booleans, counts and client-local milliseconds (`targetAudioMsBeforeStop`,
 `stopInjected`, `stopRecognized`, `targetInterrupted`, `targetCompleted`,
-`interruptEventObserved`, `postStopAudioMs`, `quiescenceObserved`, `quiescenceInconclusive`,
+`interruptEventObserved`, `playbackSilencedObserved`, `postStopAudioMs`, `quiescenceObserved`, `quiescenceInconclusive`,
 `freshReplyObserved`, `stopLatencyMs`). `stopLatencyMs` is the time from the end of the injected
 Stop speech to the last non-silent worker frame observed in the quiescence window (0 if none).
 Every window edge is a client observation: events are seen through 50 ms polls and injected

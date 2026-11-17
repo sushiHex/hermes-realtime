@@ -1125,7 +1125,8 @@ class Journey:
             "pairBound": False, "cueAudioObserved": False, "quietGateMs": 0,
             "targetAudioMsBeforeStop": 0, "stopInjected": False, "stopVadObserved": False,
             "stopFinalsCount": 0, "stopRecognized": False, "targetInterrupted": False,
-            "targetCompleted": False, "interruptEventObserved": False, "postStopAudioMs": 0,
+            "targetCompleted": False, "interruptEventObserved": False,
+            "playbackSilencedObserved": False, "postStopAudioMs": 0,
             "quiescenceObserved": False, "quiescenceInconclusive": False,
             "freshReplyObserved": False, "stopLatencyMs": 0, "quietTailMs": 0,
         }
@@ -1199,7 +1200,8 @@ class Journey:
             stopRecognized=trace.stop_started >= 1 and trace.stop_finals == 1
             and trace.stop_matches,
             targetInterrupted=target["interrupted"], targetCompleted=target["completed"],
-            interruptEventObserved=trace.interrupt_requested or trace.silenced,
+            interruptEventObserved=trace.interrupt_requested,
+            playbackSilencedObserved=trace.silenced,
             postStopAudioMs=meter.window_totals("quiesce")[1],
             freshReplyObserved=trace.fresh_token, stopLatencyMs=latency_ms,
             quietTailMs=max(tail_ms, 0),
