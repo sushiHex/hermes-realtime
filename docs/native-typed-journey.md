@@ -186,8 +186,10 @@ worker's audio track (the exact validated worker identity) is subscribed before
 readiness, one track only (a second distinct worker track is ambiguity), and received
 PCM is measured by RMS and discarded; nothing is written to disk or the receipt. The
 clip's bytes, duration, channels, sample rate and SHA-256 are verified before anything
-is published. After readiness the readiness cue is drained to a bounded quiet gate
-before speaking. Frames are paced in real time through a queue-bounded `AudioSource`,
+is published. After readiness the step waits for one whole local quiet interval,
+measured from the later of gate entry and the last observed worker audio (so a cue the
+host has not started yet cannot pass for silence), bounded by a timeout, before speaking.
+The receipt records `cueAudioObserved` and `quietGateMs` (client clock only). Frames are paced in real time through a queue-bounded `AudioSource`,
 and measurement windows (settle, input, response) only advance, so they never overlap.
 Client and server clocks are never mixed; the step computes no latency.
 

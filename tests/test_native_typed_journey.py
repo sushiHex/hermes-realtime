@@ -1,6 +1,7 @@
 """Offline contracts for the optional typed native-journey client."""
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import time
@@ -2137,6 +2138,7 @@ def speak_journey(tmp_path, monkeypatch, batches, *, audio_at=None, before=(), s
         "_SPEAK_TURN_TIMEOUT": 0.5,
         "_SPEAK_SETTLE_TIMEOUT": 0.2,
         "_SPEAK_READY_TIMEOUT": 0.3,
+        "_SPEAK_SETTLE_SECONDS": 0.0,
     }.items():
         monkeypatch.setattr(client, name, value)
     options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
@@ -2336,12 +2338,65 @@ def test_speak_splits_worker_audio_between_the_input_and_response_windows(tmp_pa
     assert (receipt["inputWindowAudioFrames"], receipt["agentAudioFrames"]) == (40, 6)
 
 
-def test_speak_drains_the_readiness_cue_to_a_quiet_gate_before_speaking(tmp_path, monkeypatch):
-    # Worker audio (the cue) arrives with the ready event: the gate must not open.
-    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {2: 5, 4: 6}})
+def test_speak_never_speaks_while_worker_audio_keeps_arriving_after_ready(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    cue = {call: 1 for call in range(3, 60)}  # a cue that never stops
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": cue})
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 0.1)  # after the helper resets it
     with pytest.raises(ValueError, match="journey_speak_not_quiet"):
         speak(journey)
     assert journey.room.published[0][0].source.frames == []  # nothing was spoken
+    assert journey.speak_receipt["cueAudioObserved"] is True
+
+
+def test_the_post_ready_gate_needs_a_whole_quiet_interval_even_with_no_audio_yet(
+    tmp_path, monkeypatch
+):
+    # The host schedules the cue AFTER publishing readiness, so "no audio so far" is not quiet.
+    import scripts.native_typed_journey as client
+
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {}})
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 0.3)
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_TIMEOUT", 3.0)
+    with contextlib.suppress(ValueError):  # the gate's polls consume the scripted events
+        speak(journey)
+    assert journey.speak_receipt["quietGateMs"] >= 280
+    assert journey.speak_receipt["cueAudioObserved"] is False
+
+
+def test_a_cue_arriving_inside_the_interval_restarts_it(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    # Gate polls start at call 3 and are >= 50 ms apart, so call 5 is >= 100 ms in.
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {5: 5, 9: 6}})
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 0.3)
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_TIMEOUT", 3.0)
+    with contextlib.suppress(ValueError):
+        speak(journey)
+    receipt = journey.speak_receipt
+    assert receipt["cueAudioObserved"] is True
+    assert receipt["quietGateMs"] >= 380  # >= 100 ms to the cue plus a whole 300 ms interval
+
+
+def test_the_gate_interval_starts_at_the_later_of_entry_and_the_last_audio(tmp_path):
+    import scripts.native_typed_journey as client
+
+    now = [100.0]
+    meter = client.SyntheticVoice(fake_rtc(), FakeRoom(), SPEAK_WORKER).meter
+    meter._clock = lambda: now[0]
+    assert meter.quiet_since(100.0, 1.0) is False  # nothing observed is not yet quiet
+    now[0] = 100.9
+    assert meter.quiet_since(100.0, 1.0) is False
+    now[0] = 101.0
+    assert meter.quiet_since(100.0, 1.0) is True
+    meter.last_audio_at = 100.8  # audio before entry would not matter; after entry restarts
+    assert meter.quiet_since(100.0, 1.0) is False
+    now[0] = 101.8
+    assert meter.quiet_since(100.0, 1.0) is True
+    meter.last_audio_at = 50.0  # stale audio older than entry never shortens the interval
+    now[0] = 100.5
+    assert meter.quiet_since(100.0, 1.0) is False
 
 
 def test_a_drained_cue_never_counts_toward_the_response(tmp_path, monkeypatch):
@@ -2419,7 +2474,8 @@ def test_speak_never_reads_server_monotonic_values(tmp_path, monkeypatch):
 
     journey.request = request
     speak(journey)
-    assert not any("ms" in key.lower() and key not in {"agentAudioMs", "inputWindowAudioMs"}
+    timings = {"agentAudioMs", "inputWindowAudioMs", "quietGateMs"}
+    assert not any("ms" in key.lower() and key not in timings
                    for key in journey.speak_receipt)
 
 

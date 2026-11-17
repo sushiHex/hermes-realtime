@@ -243,6 +243,17 @@ class WorkerAudioMeter:
     def quiet_for(self, seconds: float) -> bool:
         return self.last_audio_at is None or self._clock() - self.last_audio_at >= seconds
 
+    def now(self) -> float:
+        return float(self._clock())
+
+    def quiet_since(self, entry: float, seconds: float) -> bool:
+        """One whole quiet interval since the later of ``entry`` and the last worker audio.
+
+        Unlike quiet_for, no audio so far is not quiet: the interval must still elapse.
+        """
+        start = entry if self.last_audio_at is None else max(entry, self.last_audio_at)
+        return self._clock() - start >= seconds
+
     async def aclose(self) -> None:
         for task in self._tasks:
             task.cancel()
@@ -832,6 +843,7 @@ class Journey:
             "voiceActivityOrdered": False, "finalsCount": 0, "transcriptMatches": False,
             "pairBound": False, "pairCompleted": False, "agentAudioFrames": 0,
             "agentAudioMs": 0, "inputWindowAudioFrames": 0, "inputWindowAudioMs": 0,
+            "cueAudioObserved": False, "quietGateMs": 0,
         }
 
         def quiet() -> bool:
@@ -856,15 +868,25 @@ class Journey:
                 await self.wait(lambda: trace.ready, _SPEAK_READY_TIMEOUT)
             except TimeoutError:
                 require(False, "journey_speak_not_ready")
-            # The readiness cue is worker audio: drain it to the quiet gate before speaking,
-            # so it can never be counted as the response.
+            # The host schedules the readiness cue after publishing readiness, and audio
+            # input is suppressed while it plays. Require one whole local quiet interval,
+            # measured from the later of gate entry and the last observed worker audio, so
+            # a cue that has not started yet cannot pass for silence. Client clock only.
+            entry = voice.meter.now()
+            cue_frames = voice.meter.window_totals("settle")[0]
             try:
                 await self.wait(
-                    lambda: not tracker.open_turns and voice.meter.quiet_for(_SPEAK_SETTLE_SECONDS),
+                    lambda: not tracker.open_turns
+                    and voice.meter.quiet_since(entry, _SPEAK_SETTLE_SECONDS),
                     _SPEAK_SETTLE_TIMEOUT,
                 )
             except TimeoutError:
-                require(False, "journey_speak_not_quiet")
+                gate_failed = True
+            else:
+                gate_failed = False
+            receipt["quietGateMs"] = int((voice.meter.now() - entry) * 1000)
+            receipt["cueAudioObserved"] = voice.meter.window_totals("settle")[0] > cue_frames
+            require(not gate_failed, "journey_speak_not_quiet")
             voice.meter.advance("input")
             streaming = asyncio.ensure_future(voice.stream(frames))
             try:
