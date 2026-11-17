@@ -67,7 +67,8 @@ _SPEAK_SETTLE_SECONDS, _SPEAK_SETTLE_TIMEOUT = 1.0, 20.0
 _SPEAK_READY_TIMEOUT, _SPEAK_TURN_TIMEOUT, _SPEAK_DRAIN_SECONDS = 30.0, 60.0, 0.5
 # Windows only advance, so a later window can never re-open an earlier one or overlap it.
 _SPEAK_WINDOWS = ("settle", "input", "response", "closed")
-_SPEAK_QUEUE_MS = 200  # AudioSource queue: capture_frame blocks once this much is buffered
+_SPEAK_STREAM_MARGIN = 10.0  # seconds beyond the clip's real-time duration
+_SPEAK_QUEUE_MS = 200 # AudioSource queue: capture_frame blocks once this much is buffered
 _SPEAK_MAX_FIXTURE_BYTES, _SPEAK_MAX_FIXTURE_SECONDS = 1_048_576, 5
 _SPEAK_LIFECYCLE = {
     "first_foreground_token", "first_playable_audio", "assistant_text_generated",
@@ -117,8 +118,9 @@ def load_speak_fixture() -> tuple[tuple[bytes, ...], tuple[str, ...]]:
 class SpeakTrace:
     """In-memory evidence of one synthetic-microphone step. Only booleans and counts leave it."""
 
-    def __init__(self, prior: frozenset[tuple[str, int]], expected: tuple[str, ...]) -> None:
-        self.prior, self.expected = prior, expected
+    def __init__(self, prior: frozenset[tuple[str, int]], expected: tuple[str, ...],
+                 incarnation: int) -> None:
+        self.prior, self.expected, self.incarnation = prior, expected, incarnation
         self.ready = False
         self.started: int | None = None
         self.ended: int | None = None
@@ -129,7 +131,11 @@ class SpeakTrace:
 
     def observe(self, kind: str, data: dict, seq: int, pair: tuple[str, int] | None) -> None:
         if kind == "voice_input_ready":
-            self.ready = True
+            # Only the incarnation this step activated; a stale, foreign, missing or
+            # non-int (bool) value is not readiness.
+            value = data.get("mediaIncarnation")
+            if type(value) is int and value == self.incarnation:
+                self.ready = True
         elif kind == "voice_activity_started" and self.started is None:
             self.started = seq
         elif kind == "voice_activity_ended" and self.ended is None:
@@ -838,9 +844,14 @@ class Journey:
         except TimeoutError:
             require(False, "journey_speak_not_quiet")
         before_tasks, before_runs = set(tracker.tasks), set(self.admissions)
-        trace = tracker.speak = SpeakTrace(frozenset(tracker.seen), words)
+        trace = tracker.speak = SpeakTrace(
+            frozenset(tracker.seen), words, voice.incarnation + 1
+        )
         try:
-            await voice.activate(self._post_media)
+            try:
+                await asyncio.wait_for(voice.activate(self._post_media), _SPEAK_READY_TIMEOUT)
+            except TimeoutError:
+                require(False, "journey_speak_publish_timeout")
             try:
                 await self.wait(lambda: trace.ready, _SPEAK_READY_TIMEOUT)
             except TimeoutError:
@@ -857,10 +868,16 @@ class Journey:
             voice.meter.advance("input")
             streaming = asyncio.ensure_future(voice.stream(frames))
             try:
-                while not streaming.done():
-                    await self.poll()
-                    await asyncio.sleep(0.05)
-                await streaming
+                # Real-time pace plus a fixed margin: a capture that never returns cannot
+                # hold the step (or its cleanup) open.
+                async with asyncio.timeout(len(frames) * _SPEAK_FRAME_SECONDS
+                                           + _SPEAK_STREAM_MARGIN):
+                    while not streaming.done():
+                        await self.poll()
+                        await asyncio.sleep(0.05)
+                    await streaming
+            except TimeoutError:
+                require(False, "journey_speak_stream_timeout")
             finally:
                 if not streaming.done():
                     streaming.cancel()

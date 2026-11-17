@@ -2110,6 +2110,7 @@ class FakeRoom:
 
 
 SPEAK_PAIR = {"turnId": "speak_turn", "turnGeneration": 1}
+READY = {"generation": 1, "mediaIncarnation": 1}
 
 
 def speak_flow(text=SPEAK_TEXT, *, finals=1, pairs=(SPEAK_PAIR,), complete=True, vad=True):
@@ -2117,7 +2118,7 @@ def speak_flow(text=SPEAK_TEXT, *, finals=1, pairs=(SPEAK_PAIR,), complete=True,
     final = ("transcript_final", {"role": "user", "text": text})
     voice = [("voice_activity_started", {}), ("voice_activity_ended", {})] if vad else []
     # The empty first batch is the step's flush poll, before its trace starts.
-    batches = [[], [("voice_input_ready", {})], [*voice, *[final] * finals]]
+    batches = [[], [("voice_input_ready", READY)], [*voice, *[final] * finals]]
     for pair in pairs:
         batches.append([("first_foreground_token", pair), ("assistant_text_generated", pair)])
     tail = [("assistant_turn_completed", pair) for pair in pairs] if complete else []
@@ -2135,6 +2136,7 @@ def speak_journey(tmp_path, monkeypatch, batches, *, audio_at=None, before=(), s
         "_SPEAK_DRAIN_SECONDS": 0.0,
         "_SPEAK_TURN_TIMEOUT": 0.5,
         "_SPEAK_SETTLE_TIMEOUT": 0.2,
+        "_SPEAK_READY_TIMEOUT": 0.3,
     }.items():
         monkeypatch.setattr(client, name, value)
     options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
@@ -2710,3 +2712,115 @@ def test_execute_gives_a_speak_journey_exactly_the_worker_bound_voice(tmp_path, 
         asyncio.run(client.execute(options, [{"label": "a", "kind": "conversation",
                                               "text": "Hi"}], {"outcome": "refused"}))
     assert seen == [None] and rooms[0].handlers == {}
+
+
+@pytest.mark.parametrize("data", [
+    {"generation": 1, "mediaIncarnation": 2},  # a foreign or stale incarnation
+    {"generation": 1},  # no incarnation
+    {"generation": 1, "mediaIncarnation": True},  # bool is not an exact int
+    {"generation": 1, "mediaIncarnation": "1"},
+], ids=["foreign", "missing", "bool", "string"])
+def test_speak_ignores_readiness_for_any_other_media_incarnation(tmp_path, monkeypatch, data):
+    flow = speak_flow()
+    flow[1] = [("voice_input_ready", data)]
+    journey = speak_journey(tmp_path, monkeypatch, flow, audio_at={4: 6})
+    with pytest.raises(ValueError, match="journey_speak_not_ready"):
+        speak(journey)
+    assert journey.room.published[0][0].source.frames == []  # nothing was spoken
+
+
+def test_speak_accepts_readiness_for_the_activated_incarnation_among_stale_ones(
+    tmp_path, monkeypatch
+):
+    flow = speak_flow()
+    flow[1] = [("voice_input_ready", {"generation": 1, "mediaIncarnation": 9}),
+               ("voice_input_ready", READY)]
+    speak(speak_journey(tmp_path, monkeypatch, flow, audio_at={4: 6}))
+
+
+class HangingSource(FakeAudioSource):
+    cancelled = False
+
+    async def capture_frame(self, frame):
+        try:
+            await asyncio.Event().wait()  # never returns
+        except asyncio.CancelledError:
+            HangingSource.cancelled = True
+            raise
+
+
+def test_a_capture_that_never_returns_fails_the_step_and_still_runs_cleanup(
+    tmp_path, monkeypatch
+):
+    import hashlib
+    import sys
+
+    import scripts.native_typed_journey as client
+    from hermes_realtime import host_launcher
+
+    for name, value in {"_SPEAK_FRAME_SECONDS": 0.0, "_SPEAK_STREAM_MARGIN": 0.2,
+                        "_SPEAK_DRAIN_SECONDS": 0.0}.items():
+        monkeypatch.setattr(client, name, value)
+    HangingSource.cancelled = False
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              browser_origin="http://127.0.0.1:1", api_origin="http://127.0.0.1:3",
+                              livekit_url="ws://127.0.0.1:2")
+    suffix = hashlib.sha256(str(tmp_path / "active.private.json").encode()).hexdigest()[:16]
+    credential = dict(
+        workerIdentity="worker_preview_" + suffix, roomName="hermes-preview-" + suffix,
+        url=options.livekit_url, token="synthetic-lease", participantIdentity="synthetic",
+        expiresInSeconds=3600,
+    )
+    cleanup = []
+
+    class Room(FakeRoom):
+        async def connect(self, url, token, options=None):
+            return None
+
+        async def disconnect(self):
+            cleanup.append("disconnect")
+
+    rtc = fake_rtc()
+    rtc.Room, rtc.RoomOptions, rtc.AudioSource = Room, (lambda **kw: kw), HangingSource
+    monkeypatch.setitem(sys.modules, "livekit", SimpleNamespace(rtc=rtc))
+    monkeypatch.setattr(host_launcher, "_load_api_bearer", lambda _: "synthetic")
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+    batches = [[], [], [("voice_input_ready", READY)]]  # connect poll, flush poll, ready
+    cursor = [1]
+
+    def request(origin, route, **kwargs):
+        if route == "stop":
+            cleanup.append("stop")
+        if route == "media":
+            return 202, {"mediaIncarnation": 1, "version": 1}
+        if route == "events":
+            rows = numbered(batches.pop(0), cursor[0]) if batches else []
+            cursor[0] += len(rows)
+            return 200, {"version": 2, "events": rows}
+        return (200, credential) if route == "stable-bootstrap" else (200, {})
+
+    monkeypatch.setattr(client, "request_json", request)
+    real_settle = client.Journey.settle_owned
+
+    async def settle_owned(self):
+        cleanup.append("settle_owned")
+        return await real_settle(self)
+
+    monkeypatch.setattr(client.Journey, "settle_owned", settle_owned)
+    receipt = {"outcome": "refused"}
+    with pytest.raises(ValueError, match="journey_speak_stream_timeout"):
+        asyncio.run(asyncio.wait_for(client.execute(options, [SPEAK_STEP], receipt), 10))
+    assert HangingSource.cancelled is True
+    assert cleanup == ["settle_owned", "stop", "disconnect"]
+    assert receipt["cleanup"]["sessionStopped"] and receipt["cleanup"]["roomDisconnected"]
+
+
+def test_a_publish_that_never_returns_is_bounded(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch)
+
+    async def hang(track, options):
+        await asyncio.Event().wait()
+
+    journey.room.local_participant.publish_track = hang
+    with pytest.raises(ValueError, match="journey_speak_publish_timeout"):
+        speak(journey)
