@@ -3186,7 +3186,7 @@ def barge_post(*, vad=True, finals=("Stop.",), interrupt=True, silenced=True, in
     first = [("voice_activity_started", {})] if vad else []
     second = [("voice_activity_ended", {}), *[user_say(text) for text in finals]]
     if interrupt:
-        second.append(("interrupt_requested", {"turnId": request_turn}))
+        second.append(("interrupt_requested", {"turnId": request_turn, "turnGeneration": 1}))
     if silenced:
         second.append(("playback_silenced", {}))
     if interrupted:
@@ -3203,7 +3203,7 @@ def fresh_token(pair=FRESH_PAIR):
 
 
 def barge_journey(tmp_path, monkeypatch, *, pre=None, post=None, response_frames=3,
-                  quiesce_audio_polls=0, after_frames=0):
+                  quiesce_audio_polls=0, after_frames=0, before=()):
     """A Journey with a fake mic transport and a state-driven fake host.
 
     Events before the Stop's injection start come from ``pre``; afterwards from ``post``, one
@@ -3228,7 +3228,9 @@ def barge_journey(tmp_path, monkeypatch, *, pre=None, post=None, response_frames
     rtc, room = fake_rtc(), FakeRoom()
     journey.voice = client.SyntheticVoice(rtc, room, SPEAK_WORKER)
     meter = journey.voice.meter
-    now, cursor, quiesce_polls = [1000.0], [1], [0]
+    now, cursor, quiesce_polls = [1000.0], [len(before) + 1], [0]
+    if before:
+        journey.tracker.consume(numbered(list(before), 1))
     meter._clock = lambda: now[0]
     queues = {"pre": list(barge_pre() if pre is None else pre),
               "post": list(barge_post() if post is None else post)}
@@ -3565,3 +3567,64 @@ def test_a_barge_after_a_completed_typed_step_does_not_claim_the_microphone_fina
 
     asyncio.run(asyncio.wait_for(both(), 10))
     assert journey.speak_receipt["quiescenceObserved"] is True
+
+
+@pytest.mark.parametrize("generation", [True, 1.0, None, "1", 2, "absent"],
+                         ids=["bool", "float", "none", "string", "other-int", "absent"])
+def test_an_interrupt_request_needs_an_exact_int_generation_equal_to_targets(
+    tmp_path, monkeypatch, generation
+):
+    data = {"turnId": "target_turn"}
+    if generation != "absent":
+        data["turnGeneration"] = generation
+    post = barge_post(interrupt=False)
+    post[1].append(("interrupt_requested", data))
+    journey = barge_journey(tmp_path, monkeypatch, post=post)
+    receipt = refused(journey, "journey_barge_ambiguous")
+    assert receipt["interruptEventObserved"] is False
+
+
+def test_an_interrupt_request_with_a_non_string_turn_is_foreign(tmp_path, monkeypatch):
+    post = barge_post(interrupt=False)
+    post[1].append(("interrupt_requested", {"turnId": ["target_turn"], "turnGeneration": 1}))
+    refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_barge_ambiguous")
+
+
+def test_a_replayed_prior_pair_is_not_a_fresh_reply_and_cannot_close_the_window(
+    tmp_path, monkeypatch
+):
+    before = [("assistant_turn_completed", OTHER_PAIR)]  # seen before the step
+    post = barge_post(extra=([], [("first_foreground_token", OTHER_PAIR)]))
+    journey = barge_journey(tmp_path, monkeypatch, post=post, before=before, after_frames=3)
+    receipt = refused(journey, "journey_barge_ambiguous")
+    assert receipt["freshReplyObserved"] is False and receipt["quiescenceObserved"] is False
+
+
+def test_a_new_pair_whose_first_token_precedes_the_stop_final_is_not_a_fresh_reply(
+    tmp_path, monkeypatch
+):
+    interrupt = ("interrupt_requested", {"turnId": "target_turn", "turnGeneration": 1})
+    post = [
+        [("voice_activity_started", {}), interrupt, ("assistant_turn_interrupted", TARGET_PAIR),
+         *fresh_token()],
+        [("voice_activity_ended", {}), user_say("Stop.")],
+    ]
+    receipt = refused(barge_journey(tmp_path, monkeypatch, post=post),
+                      "journey_barge_ambiguous")
+    assert receipt["freshReplyObserved"] is False
+
+
+def test_a_target_that_ends_during_the_lead_in_aborts_before_any_stop_speech(
+    tmp_path, monkeypatch
+):
+    import scripts.native_typed_journey as client
+
+    # The completion is delivered at the first poll of the Stop stream, i.e. during its
+    # leading silence, after the pre-injection precondition already passed.
+    pre = [*barge_pre(), [], [("assistant_turn_completed", TARGET_PAIR)]]
+    journey = barge_journey(tmp_path, monkeypatch, pre=pre)
+    receipt = refused(journey, "journey_barge_target_terminal")
+    assert receipt["stopInjected"] is False and receipt["targetInterrupted"] is False
+    sent = [frame.data for frame in journey.room.published[0][0].source.frames]
+    target, _, _, _, _ = client.load_barge_fixtures()
+    assert sum(any(pcm) for pcm in sent) == sum(any(pcm) for pcm in target)  # no Stop speech

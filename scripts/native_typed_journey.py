@@ -218,6 +218,9 @@ class BargeTrace(SpeakTrace):
         self.silenced = False
         self.overlap = False
         self.fresh_token = False
+        self.stop_final_seq: int | None = None
+        self.replayed = False
+        self.premature_fresh = False
 
     def mark_injection(self, cursor: int) -> None:
         self.inj_seq = cursor
@@ -244,10 +247,18 @@ class BargeTrace(SpeakTrace):
         elif kind == "transcript_final" and data.get("role") == "user":
             self.stop_finals += 1
             if self.stop_finals == 1:
+                self.stop_final_seq = seq
                 self.stop_matches = _speak_words(data.get("text")) == self.stop_words
         elif kind == "interrupt_requested":
-            generation = data.get("turnGeneration")
-            if data.get("turnId") == target[0] and generation in {None, target[1]}:
+            # The host publishes an anchorable interrupt_requested only with the full exact
+            # authority {turnId, turnGeneration, chunkId, streamId}
+            # (host_launcher.py _renderer_yield_event_data, lines 937-942) and otherwise an
+            # empty payload (lines 933 and 936). So a generation is never legitimately absent
+            # next to a turnId: require an exact turnId and an exact int generation, both
+            # equal to TARGET's. Anything else (True, 1.0, None, a string, absent) is foreign.
+            turn, generation = data.get("turnId"), data.get("turnGeneration")
+            if (turn == target[0]
+                    and type(generation) is int and generation == target[1]):
                 self.interrupt_requested = True
             else:
                 self.foreign_interrupt = True
@@ -258,8 +269,16 @@ class BargeTrace(SpeakTrace):
                 # Any other pair active while TARGET is still non-terminal overlaps it.
                 if not self.target_terminal():
                     self.overlap = True
-                if kind == "first_foreground_token":
-                    self.fresh_token = True
+                if pair in self.prior:
+                    # A replayed earlier pair is never a fresh reply and cannot close the window.
+                    self.replayed = True
+                elif kind == "first_foreground_token":
+                    # A fresh reply is a genuinely new pair whose first token follows the Stop
+                    # final; a token before it cannot be the reply to Stop.
+                    if self.stop_final_seq is not None and seq > self.stop_final_seq:
+                        self.fresh_token = True
+                    else:
+                        self.premature_fresh = True
             super().observe(kind, data, seq, pair)
 
 
@@ -1158,6 +1177,9 @@ class Journey:
                     "journey_barge_precondition")
 
             def inject_start() -> None:
+                # Re-checked at the first speech frame: TARGET may have ended during the
+                # clip's leading silence. Abort before any Stop speech is sent.
+                require(not trace.target_terminal(), "journey_barge_target_terminal")
                 trace.mark_injection(tracker.cursor)
                 receipt["targetAudioMsBeforeStop"] = meter.window_totals("response")[1]
                 receipt["stopInjected"] = True
@@ -1210,6 +1232,7 @@ class Journey:
         require(trace.stop_finals == 1, "journey_barge_stop_finals")
         require(trace.stop_matches, "journey_barge_stop_transcript")
         require(trace.unbound == 0 and not trace.overlap and not trace.foreign_interrupt
+                and not trace.replayed and not trace.premature_fresh
                 and trace.fresh_pairs() <= 1, "journey_barge_ambiguous")
         require(not target["completed"], "journey_barge_target_completed")
         require(target["interrupted"], "journey_barge_target_not_interrupted")
