@@ -214,6 +214,8 @@ async def test_a_binding_closed_during_the_drain_creates_no_interrupt_or_turn() 
     await closing
 
     # Close itself ends the foreground; what must not happen is a barge-in or a turn.
+    # The probe's close cleanup leaves this flag alone, so only a barge-in cancel clears it.
+    assert executor._speech.foreground_active is True  # type: ignore[attr-defined]
     assert "interrupt_requested" not in observed
     assert "transcript_final" not in observed
     assert responses == []
