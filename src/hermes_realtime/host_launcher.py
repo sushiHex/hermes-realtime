@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import hashlib
 import ipaddress
 import json
@@ -830,6 +831,36 @@ async def _play_readiness_cue(
             raise
         if not cancelled:
             on_input_ready()
+
+
+class _ActiveTurn(Protocol):
+    @property
+    def active_turn_id(self) -> str | None: ...
+
+
+async def _run_readiness_cue(
+    *,
+    playback_gate: asyncio.Lock,
+    speech: _ActiveTurn,
+    admit: Callable[[], bool],
+    play: Callable[[], Awaitable[None]],
+    announce_ready: Callable[[], None],
+) -> None:
+    """Play one admitted readiness cue, else announce readiness at once.
+
+    Readiness is announced only where no cue suppresses the binding's input: a cue that
+    is skipped (speech already owns the floor, or the cue is not admitted) announces at
+    once, and an admitted cue announces through ``play`` after releasing its suppression.
+    """
+
+    if speech.active_turn_id is not None or playback_gate.locked():
+        announce_ready()
+        return
+    async with playback_gate:
+        if speech.active_turn_id is not None or not admit():
+            announce_ready()
+            return
+        await play()
 
 
 class _ReadinessCueAuthority:
@@ -2718,7 +2749,6 @@ def build_local_host_launcher(
         media_incarnation: int,
         announce_ready: Callable[[], None],
     ) -> None:
-        # Readiness is announced only where no cue suppresses this binding's input.
         template = readiness_cue_template
         if template is None:
             announce_ready()
@@ -2728,19 +2758,15 @@ def build_local_host_launcher(
             generation=generation,
             media_incarnation=media_incarnation,
         )
-
-        async def play_with_suppressed_input() -> None:
-            if speech.active_turn_id is not None or playback_gate.locked():
-                announce_ready()
-                return
-            async with playback_gate:
-                if speech.active_turn_id is not None or not readiness_cue_authority.admit(
-                    generation,
-                    media_incarnation,
-                ):
-                    announce_ready()
-                    return
-                await _play_readiness_cue(
+        readiness_cue_tasks.create(
+            _run_readiness_cue(
+                playback_gate=playback_gate,
+                speech=speech,
+                admit=functools.partial(
+                    readiness_cue_authority.admit, generation, media_incarnation
+                ),
+                play=functools.partial(
+                    _play_readiness_cue,
                     conversation=conversation,
                     playback=playback,
                     chunk=chunk,
@@ -2749,10 +2775,9 @@ def build_local_host_launcher(
                     task_proposals=proposals,
                     is_valid=lambda: media_incarnations.get(generation) == media_incarnation,
                     on_input_ready=announce_ready,
-                )
-
-        readiness_cue_tasks.create(
-            play_with_suppressed_input(),
+                ),
+                announce_ready=announce_ready,
+            ),
             name=f"readiness-cue:{generation}:{media_incarnation}",
         )
 
@@ -2855,7 +2880,9 @@ def build_local_host_launcher(
                     participant_identity,
                     generation,
                     media_incarnation,
-                    lambda: _publish_voice_input_ready(projection, generation, media_incarnation),
+                    functools.partial(
+                        _publish_voice_input_ready, projection, generation, media_incarnation
+                    ),
                 )
                 schedule_restart_announcement()
 

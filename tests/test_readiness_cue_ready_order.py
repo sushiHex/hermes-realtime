@@ -132,6 +132,47 @@ async def test_cancelled_cue_releases_input_without_announcing_ready() -> None:
     assert events == ["suppressed", "playing", "released"]
 
 
+class _Speech:
+    def __init__(self, active_turn_id: str | None = None) -> None:
+        self.active_turn_id = active_turn_id
+
+
+async def _run(*, speech: _Speech, gate: asyncio.Lock, admitted: bool, events: list[str]) -> None:
+    async def play() -> None:
+        events.append("played")
+
+    await host_launcher._run_readiness_cue(
+        playback_gate=gate,
+        speech=speech,
+        admit=lambda: admitted,
+        play=play,
+        announce_ready=lambda: events.append("ready"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_admitted_cue_leaves_the_announcement_to_its_playback() -> None:
+    events: list[str] = []
+    await _run(speech=_Speech(), gate=asyncio.Lock(), admitted=True, events=events)
+    assert events == ["played"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip", ["speech_active", "gate_busy", "not_admitted"])
+async def test_skipped_cue_announces_ready_at_once(skip: str) -> None:
+    events: list[str] = []
+    gate = asyncio.Lock()
+    if skip == "gate_busy":
+        await gate.acquire()
+    await _run(
+        speech=_Speech("turn_1" if skip == "speech_active" else None),
+        gate=gate,
+        admitted=skip != "not_admitted",
+        events=events,
+    )
+    assert events == ["ready"]
+
+
 @pytest.mark.asyncio
 async def test_cue_whose_release_fails_does_not_announce_ready() -> None:
     events: list[str] = []
