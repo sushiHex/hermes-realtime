@@ -56,6 +56,40 @@ def test_instructions_state_the_exact_limits_and_schema_budgets(catalog: Any) ->
     assert BUDGET.findall(presenter.PRESENTATION_INSTRUCTIONS) == []
 
 
+TARGET = re.compile(
+    r"Aim support at about (\d+) characters, a preferred length below the support maximum; "
+    r"never exceed (\d+) characters\.")
+
+
+@pytest.mark.parametrize("catalog", CATALOGS, ids=lambda catalog: str(len(catalog)))
+def test_instructions_state_a_preferred_support_target_below_the_unchanged_cap(
+    catalog: Any,
+) -> None:
+    source_input = presenter.presentation_input("objective", catalog, _passages(catalog))
+    instructions = presenter.presentation_instructions(source_input)
+    limits = dict(presenter.presentation_limits(catalog))
+    schema = presenter.presentation_schema(source_input)
+    cap = schema["properties"]["answer"]["properties"]["support"]["maxLength"] - 1
+
+    found = TARGET.findall(instructions)
+    assert len(found) == 1
+    target, never_exceed = (int(value) for value in found[0])
+    assert cap == limits["support"] == never_exceed == _stated(instructions)["support"]
+    assert target == (4 * limits["support"]) // 5  # floor(0.8 * cap), in exact integers
+    assert 0 < target < cap
+    # The target is a preference, not a bound: it is no "at most" budget.
+    assert target not in [int(value) for value in BUDGET.findall(instructions)]
+
+
+def test_the_target_follows_the_validated_limits_not_the_catalog_or_evidence() -> None:
+    catalog = CATALOGS[1]
+    source_input = presenter.presentation_input("objective", catalog, _passages(catalog))
+    payload = json.loads(source_input)
+    payload["limits"]["support"] = 500
+    instructions = presenter.presentation_instructions(json.dumps(payload))
+    assert TARGET.findall(instructions) == [("400", "500")]
+
+
 def test_catalogs_with_different_footers_state_different_support_budgets() -> None:
     stated = [_stated(presenter.presentation_instructions(
         presenter.presentation_input("objective", catalog, _passages(catalog))))

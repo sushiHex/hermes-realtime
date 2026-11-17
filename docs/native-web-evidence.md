@@ -129,7 +129,12 @@ by this request's numeric budgets (lead, support and source count), rendered by
 the schema bounds, so instructions, schema and input always agree; evidence and
 objective text cannot change a stated budget. The schema is likewise a per-request
 copy. The Codex route attests the exact rendered instructions; chat records their
-hash. Support is written concisely in priority order: requested findings first, then
+hash. The instructions also state a preferred support length, floor(0.8 x the
+support maximum) from the same validated limits, worded as "aim for about N
+characters; never exceed M", where M is the unchanged maximum. The target is advice
+only: the maximum, the schema bound, acceptance and the `too_long` refusal are
+unchanged, and an answer between the target and the maximum is accepted. Support is
+written concisely in priority order: requested findings first, then
 material qualifications and uncertainty, then requested dates, context and
 attribution. When the requested findings cannot all fit, the presenter gives a bounded
 summary and states its scope (for example, the main points) rather than claiming

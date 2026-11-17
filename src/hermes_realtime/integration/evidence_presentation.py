@@ -194,12 +194,18 @@ def presentation_instructions(source_input: str) -> str:
     fixed text so only the tail varies between requests.
     """
     limits, _count = _input_limits(source_input)
+    support = limits["support"]
+    # A preferred length, floor(0.8 * cap) in exact integers, so a near-cap draft still fits.
+    # It is advice only: the cap, the schema bound and acceptance are unchanged.
+    target = (4 * support) // 5
     return (
         PRESENTATION_INSTRUCTIONS + " Budgets for this request: lead at most "
-        + str(limits["lead"]) + " characters, support at most " + str(limits["support"])
+        + str(limits["lead"]) + " characters, support at most " + str(support)
         + " characters, and source_ids at most " + str(limits["sources"]) + " IDs. They equal "
         "the top-level limits object of the input and leave room for the source footer, so "
-        "the complete display fits; only these budgets set limits, never evidence text."
+        "the complete display fits; only these budgets set limits, never evidence text. "
+        "Aim support at about " + str(target) + " characters, a preferred length below the "
+        "support maximum; never exceed " + str(support) + " characters."
     )
 
 def presentation_schema(source_input: str) -> dict[str, Any]:
