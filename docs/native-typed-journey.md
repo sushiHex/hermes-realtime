@@ -191,6 +191,10 @@ measured from the later of gate entry and the last observed worker audio (so a c
 host has not started yet cannot pass for silence), bounded by a timeout, before speaking.
 The receipt records `cueAudioObserved` and `quietGateMs` (client clock only). Frames are paced in real time through a queue-bounded `AudioSource`,
 and measurement windows (settle, input, response) only advance, so they never overlap.
+The worker confirms readiness only after it receives PCM, so bounded silence is fed on the
+published track from activation until the clip starts (then cancelled and settled on every
+exit path). A preceding typed step's state is cleared before a `speak` step so the
+microphone's user final is never also checked as that step's typed input.
 Client and server clocks are never mixed; the step computes no latency.
 
 Microphone input emits no `typed_input_admitted`, so the step is attributed strictly.

@@ -268,6 +268,7 @@ class SyntheticVoice:
         self.meter = WorkerAudioMeter(rtc, room, worker_identity)
         self.source: Any = None
         self.incarnation = 0
+        self._idle_task: asyncio.Future | None = None
 
     async def activate(self, post_media: Any) -> None:
         require(self.source is None, "journey_speak_once")
@@ -294,6 +295,30 @@ class SyntheticVoice:
                 samples_per_channel=_SPEAK_FRAME_SAMPLES,
             ))
         await self.source.wait_for_playout()
+
+    async def _idle(self) -> None:
+        """Bounded silence on the published track; ends by itself at the readiness bound."""
+        require(self.source is not None, "journey_speak_media")
+        silence = bytes(2 * _SPEAK_FRAME_SAMPLES)
+        begin = time.monotonic()
+        for index in range(int((_SPEAK_READY_TIMEOUT + _SPEAK_SETTLE_TIMEOUT) / 0.01)):
+            delay = begin + index * _SPEAK_FRAME_SECONDS - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self.source.capture_frame(self.rtc.AudioFrame(
+                data=silence, sample_rate=_SPEAK_RATE, num_channels=1,
+                samples_per_channel=_SPEAK_FRAME_SAMPLES,
+            ))
+
+    def start_idle(self) -> None:
+        require(self._idle_task is None, "journey_speak_once")
+        self._idle_task = asyncio.ensure_future(self._idle())
+
+    async def stop_idle(self) -> None:
+        task, self._idle_task = self._idle_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def sync(self, trace: SpeakTrace | None) -> None:
         # The response window opens when the user's final is first observed.
@@ -837,6 +862,10 @@ class Journey:
         voice, tracker = self.voice, self.tracker
         require(voice is not None, "journey_speak_unavailable")
         assert voice is not None
+        # A preceding typed step is settled: its input and text must not also claim the
+        # microphone's user final (journey_input_source).
+        tracker.current = None
+        tracker.text = ""
         frames, words = load_speak_fixture()
         receipt = self.speak_receipt = {
             "label": step["label"], "clipFrames": len(frames), "mediaRequests": 0,
@@ -864,6 +893,9 @@ class Journey:
                 await asyncio.wait_for(voice.activate(self._post_media), _SPEAK_READY_TIMEOUT)
             except TimeoutError:
                 require(False, "journey_speak_publish_timeout")
+            # The worker confirms readiness only once it receives PCM, so feed bounded
+            # silence on the published track until the clip starts.
+            voice.start_idle()
             try:
                 await self.wait(lambda: trace.ready, _SPEAK_READY_TIMEOUT)
             except TimeoutError:
@@ -887,6 +919,7 @@ class Journey:
             receipt["quietGateMs"] = int((voice.meter.now() - entry) * 1000)
             receipt["cueAudioObserved"] = voice.meter.window_totals("settle")[0] > cue_frames
             require(not gate_failed, "journey_speak_not_quiet")
+            await voice.stop_idle()  # before the clip: nothing else is fed from here on
             voice.meter.advance("input")
             streaming = asyncio.ensure_future(voice.stream(frames))
             try:
@@ -909,6 +942,7 @@ class Journey:
             await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
             await self.poll()
         finally:
+            await voice.stop_idle()  # every exit path: cancel and settle the idle feeder
             voice.meter.advance("closed")
             tracker.speak = None
         agent_frames, agent_ms = voice.meter.window_totals("response")
