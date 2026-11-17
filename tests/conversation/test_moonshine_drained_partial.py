@@ -9,6 +9,7 @@ harvested only while the endpoint drains, before the final.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -154,17 +155,47 @@ class _DrainingTranscriber:
         return None
 
 
+_BAIT = "SECRET-BAIT private words"
+
+
+def _drained_partial_markers(output: str) -> list[dict[str, object]]:
+    prefix = "[drained-partials] "
+    return [
+        json.loads(line[len(prefix) :])
+        for line in output.splitlines()
+        if line.startswith(prefix)
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("drained", "error"),
+    ("drained", "error", "marker"),
     (
-        pytest.param((Transcript(text="Stop.", final=True),), ValueError, id="final"),
-        pytest.param([Transcript(text="Stop", final=False)], TypeError, id="not-a-tuple"),
-        pytest.param(("Stop",), TypeError, id="not-a-transcript"),
+        pytest.param(
+            (Transcript(text="Stop", final=False), Transcript(text=_BAIT, final=True)),
+            ValueError,
+            {"category": "final", "items": 2, "version": 1},
+            id="final",
+        ),
+        pytest.param(
+            [Transcript(text=_BAIT, final=False)],
+            TypeError,
+            {"category": "not_a_tuple", "items": 0, "version": 1},
+            id="not-a-tuple",
+        ),
+        pytest.param(
+            (_BAIT,),
+            TypeError,
+            {"category": "not_a_transcript", "items": 1, "version": 1},
+            id="not-a-transcript",
+        ),
     ),
 )
 async def test_a_drain_that_is_not_exact_non_final_partials_fails_closed(
-    drained: object, error: type[Exception]
+    drained: object,
+    error: type[Exception],
+    marker: dict[str, object],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     executor, foreground_cancelled, responses = action_executor_probe()
     worker = ConversationSessionWorker(
@@ -184,6 +215,30 @@ async def test_a_drain_that_is_not_exact_non_final_partials_fails_closed(
 
     assert foreground_cancelled.is_set() is False
     assert responses == []
+    # The refusal leaves exactly one bounded line: category and item count, no content.
+    output = capsys.readouterr().out
+    assert _drained_partial_markers(output) == [marker]
+    assert "SECRET-BAIT" not in output
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_marker_that_cannot_be_written_does_not_mask_the_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_print(*args: object, **kwargs: object) -> None:
+        raise OSError("stdout unavailable")
+
+    monkeypatch.setattr("builtins.print", broken_print)
+    with pytest.raises(ValueError, match="non-final"):
+        ConversationSessionWorker._trusted_partials((Transcript(text="Stop.", final=True),))
+
+
+@pytest.mark.asyncio
+async def test_an_admitted_drain_writes_no_refusal_marker(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    await _barge_in()
+    assert _drained_partial_markers(capsys.readouterr().out) == []
 
 
 @pytest.mark.asyncio

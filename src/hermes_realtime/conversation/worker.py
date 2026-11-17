@@ -55,6 +55,8 @@ _MAX_BUFFERED_AUDIO_BYTES = 2 * 1024 * 1024
 # How long closing a binding waits for the speech it started to stop.
 _BINDING_SPEECH_SETTLE_SECONDS = 10.0
 _BINDING_SPEECH_MARKER = "[binding-speech] "
+_DRAINED_PARTIALS_MARKER = "[drained-partials] "
+_DRAINED_PARTIALS_REFUSALS = frozenset({"not_a_tuple", "not_a_transcript", "final"})
 _LOGGER = logging.getLogger(__name__)
 
 _PublicValue = str | int | bool | None
@@ -1263,12 +1265,33 @@ class ConversationSessionWorker:
 
     @staticmethod
     def _trusted_partials(value: object) -> tuple[Transcript, ...]:
-        if type(value) is not tuple:
-            raise TypeError("stt drain_partials must return an exact tuple")
-        partials = tuple(ConversationSessionWorker._trusted_transcript(item) for item in value)
-        if any(partial.final for partial in partials):
-            raise ValueError("stt drain_partials must return only non-final transcripts")
-        return partials
+        # A refused drain leaves one category-and-count line; its content never does.
+        refusal: str | None = "not_a_tuple"
+        items = len(value) if type(value) is tuple else 0
+        try:
+            if type(value) is not tuple:
+                raise TypeError("stt drain_partials must return an exact tuple")
+            refusal = "not_a_transcript"
+            partials = tuple(
+                ConversationSessionWorker._trusted_transcript(item) for item in value
+            )
+            refusal = "final"
+            if any(partial.final for partial in partials):
+                raise ValueError("stt drain_partials must return only non-final transcripts")
+            refusal = None
+            return partials
+        finally:
+            if refusal in _DRAINED_PARTIALS_REFUSALS:
+                with contextlib.suppress(Exception):
+                    print(
+                        _DRAINED_PARTIALS_MARKER
+                        + json.dumps(
+                            {"category": refusal, "items": items, "version": 1},
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
 
     @staticmethod
     def _trusted_transcript(value: object) -> Transcript:
