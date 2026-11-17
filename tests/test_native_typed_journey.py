@@ -3648,3 +3648,102 @@ def test_an_interrupt_request_turn_id_must_be_an_exact_string(tmp_path, monkeypa
     post[1].append(("interrupt_requested",
                     {"turnId": LoudStr("target_turn"), "turnGeneration": 1}))
     refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_barge_ambiguous")
+
+
+SECRET_PARTIAL = "secret words here"
+ALL_COUNT_KEYS = (
+    "userPartialCount", "echoSuppressedCount", "transcriptEchoSuppressedCount",
+    "speechEndedCount", "voiceActivityEndedCount", "bargeInNonSpeechSuppressedCount",
+    "bargeInVerifierUnavailableCount", "echoBargeInConfirmedCount",
+    "interruptTargetCount", "interruptEmptyCount", "interruptOtherCount",
+)
+
+
+def diagnostic_events():
+    """One event of every counted kind, to be placed before or after the injection."""
+    return [
+        ("transcript_partial", {"role": "user", "text": SECRET_PARTIAL}),
+        ("echo_suppressed", {}), ("transcript_echo_suppressed", {}), ("speech_ended", {}),
+        ("voice_activity_ended", {}), ("barge_in_non_speech_suppressed", {}),
+        ("barge_in_verifier_unavailable", {}), ("echo_barge_in_confirmed", {}),
+        ("interrupt_requested", {}),
+    ]
+
+
+def counted_barge(tmp_path, monkeypatch, *, post_extra=(), pre_extra=()):
+    pre = barge_pre()
+    pre[3] = [*pre[3], *pre_extra]
+    post = barge_post()
+    post[1] = [*post[1], *post_extra]
+    return barge_journey(tmp_path, monkeypatch, pre=pre, post=post)
+
+
+def test_barge_counts_each_diagnostic_kind_only_after_the_injection(tmp_path, monkeypatch):
+    # The same kinds before the injection must not be counted.
+    journey = counted_barge(tmp_path, monkeypatch, pre_extra=diagnostic_events(),
+                            post_extra=[*diagnostic_events(), ("echo_suppressed", {})])
+    barge(journey)
+    receipt = journey.speak_receipt
+    assert receipt["userPartialCount"] == 1
+    assert receipt["echoSuppressedCount"] == 2  # one more post-injection event of that kind
+    assert receipt["transcriptEchoSuppressedCount"] == 1
+    assert receipt["speechEndedCount"] == 1
+    assert receipt["voiceActivityEndedCount"] == 2  # barge_post's own plus the extra
+    assert receipt["bargeInNonSpeechSuppressedCount"] == 1
+    assert receipt["bargeInVerifierUnavailableCount"] == 1
+    assert receipt["echoBargeInConfirmedCount"] == 1
+    assert (receipt["interruptTargetCount"], receipt["interruptEmptyCount"],
+            receipt["interruptOtherCount"]) == (1, 1, 0)
+
+
+def test_barge_counts_are_zero_when_nothing_follows_the_injection(tmp_path, monkeypatch):
+    journey = counted_barge(tmp_path, monkeypatch, pre_extra=diagnostic_events())
+    barge(journey)
+    receipt = journey.speak_receipt
+    # barge_post's own ended event and strict interrupt are the only post-injection ones.
+    assert {key: receipt[key] for key in ALL_COUNT_KEYS if key not in {
+        "voiceActivityEndedCount", "interruptTargetCount"}} == {
+        key: 0 for key in ALL_COUNT_KEYS
+        if key not in {"voiceActivityEndedCount", "interruptTargetCount"}}
+    assert receipt["userPartialAtLeast3Alnum"] is False
+
+
+def test_barge_splits_interrupt_requests_into_target_empty_and_other(tmp_path, monkeypatch):
+    other = ("interrupt_requested", {"turnId": "other_turn", "turnGeneration": 1})
+    journey = counted_barge(tmp_path, monkeypatch, post_extra=[("interrupt_requested", {}), other])
+    receipt = refused(journey, "journey_barge_ambiguous")  # the verdict is unchanged
+    assert (receipt["interruptTargetCount"], receipt["interruptEmptyCount"],
+            receipt["interruptOtherCount"]) == (1, 1, 1)
+
+
+def test_barge_user_partials_are_counted_by_role_and_alnum_without_storing_text(
+    tmp_path, monkeypatch
+):
+    extra = [("transcript_partial", {"role": "assistant", "text": SECRET_PARTIAL}),
+             ("transcript_partial", {"role": "user", "text": "a!"})]
+    journey = counted_barge(tmp_path, monkeypatch, post_extra=extra)
+    barge(journey)
+    receipt = journey.speak_receipt
+    assert receipt["userPartialCount"] == 1  # the assistant partial is not a user partial
+    assert receipt["userPartialAtLeast3Alnum"] is False  # "a!" has one alphanumeric
+
+
+def test_barge_flags_a_user_partial_with_three_alphanumerics_and_keeps_no_text(
+    tmp_path, monkeypatch
+):
+    extra = [("transcript_partial", {"role": "user", "text": SECRET_PARTIAL})]
+    journey = counted_barge(tmp_path, monkeypatch, post_extra=extra)
+    barge(journey)
+    receipt = journey.speak_receipt
+    assert receipt["userPartialCount"] == 1 and receipt["userPartialAtLeast3Alnum"] is True
+    assert "secret" not in json.dumps(receipt).lower()
+    assert all(type(value) in {bool, int, str} for value in receipt.values())
+
+
+def test_barge_diagnostics_never_change_the_verdict(tmp_path, monkeypatch):
+    # A refused run keeps its category with every diagnostic kind present.
+    post = barge_post(vad=False)
+    post[1] = [*post[1], *diagnostic_events()]
+    journey = barge_journey(tmp_path, monkeypatch, post=post)
+    receipt = refused(journey, "journey_barge_stop_vad")
+    assert receipt["userPartialCount"] == 1 and receipt["echoSuppressedCount"] == 1

@@ -242,6 +242,17 @@ Every window edge is a client observation: events are seen through 50 ms polls a
 audio through a 200 ms `AudioSource` queue, so these are coarse bounds, not perceived speed,
 and no per-pair PCM lineage is inferred from poll timestamps.
 
+The receipt also carries diagnostic counts of projected events after the injection cursor,
+which never change a verdict: `userPartialCount` (user `transcript_partial` events) with
+`userPartialAtLeast3Alnum` (a boolean evaluated in memory, never storing text),
+`echoSuppressedCount`, `transcriptEchoSuppressedCount`, `speechEndedCount`,
+`voiceActivityEndedCount`, `bargeInNonSpeechSuppressedCount`,
+`bargeInVerifierUnavailableCount`, `echoBargeInConfirmedCount`, and `interrupt_requested`
+split into `interruptTargetCount` (the strict TARGET pair), `interruptEmptyCount` (an empty
+payload) and `interruptOtherCount`. Published partial counts sit downstream of the host's
+echo and playback-authority filtering, so a zero does not prove the STT backend emitted no
+partial.
+
 This is a controlled synthetic path. It bypasses the physical microphone and acoustic
 echo cancellation. It does not prove source-attributed microphone qualification or the
 naturalness of the conversation.

@@ -71,6 +71,21 @@ _BARGE_STOP_WORDS = ("stop",)
 # the whole quiet interval that must then be observed.
 _BARGE_MIN_TARGET_MS, _BARGE_BUDGET_MS, _BARGE_QUIET_MS = 1500, 1500, 500
 _BARGE_PRECONDITION_TIMEOUT, _BARGE_INTERRUPT_TIMEOUT = 30.0, 10.0
+# Diagnostic post-injection counts of existing projected kinds (receipt key by kind). Counts
+# are downstream of the host's echo and playback-authority filtering and never a verdict.
+_BARGE_KIND_COUNTS = {
+    "echo_suppressed": "echoSuppressedCount",
+    "transcript_echo_suppressed": "transcriptEchoSuppressedCount",
+    "speech_ended": "speechEndedCount",
+    "voice_activity_ended": "voiceActivityEndedCount",
+    "barge_in_non_speech_suppressed": "bargeInNonSpeechSuppressedCount",
+    "barge_in_verifier_unavailable": "bargeInVerifierUnavailableCount",
+    "echo_barge_in_confirmed": "echoBargeInConfirmedCount",
+}
+_BARGE_COUNT_KEYS = (
+    *_BARGE_KIND_COUNTS.values(), "userPartialCount",
+    "interruptTargetCount", "interruptEmptyCount", "interruptOtherCount",
+)
 _SPEAK_RATE, _SPEAK_FRAME_SAMPLES = 48_000, 480  # 10 ms mono frames
 _SPEAK_LEAD_FRAMES, _SPEAK_TRAIL_FRAMES = 30, 100  # bounded silence: 0.3 s and 1.0 s
 _SPEAK_FRAME_SECONDS = 0.01  # real-time pace
@@ -221,6 +236,10 @@ class BargeTrace(SpeakTrace):
         self.stop_final_seq: int | None = None
         self.replayed = False
         self.premature_fresh = False
+        # Diagnostic counts of projected events after the injection cursor. They never
+        # change a verdict and hold no text.
+        self.counts = dict.fromkeys(_BARGE_COUNT_KEYS, 0)
+        self.partial_alnum = False
 
     def mark_injection(self, cursor: int) -> None:
         self.inj_seq = cursor
@@ -242,8 +261,17 @@ class BargeTrace(SpeakTrace):
             super().observe(kind, data, seq, pair)
             return
         target = self.target
+        counted = _BARGE_KIND_COUNTS.get(kind)
+        if counted is not None:
+            self.counts[counted] += 1
         if kind == "voice_activity_started":
             self.stop_started += 1
+        elif kind == "transcript_partial" and data.get("role") == "user":
+            self.counts["userPartialCount"] += 1
+            text = data.get("text")
+            # Evaluated in memory; the text itself is never stored.
+            if type(text) is str and sum(char.isalnum() for char in text) >= 3:
+                self.partial_alnum = True
         elif kind == "transcript_final" and data.get("role") == "user":
             self.stop_finals += 1
             if self.stop_finals == 1:
@@ -260,11 +288,13 @@ class BargeTrace(SpeakTrace):
             # 1.0, None, a string, an absent generation) is foreign.
             turn, generation = data.get("turnId"), data.get("turnGeneration")
             if not data:
-                pass
+                self.counts["interruptEmptyCount"] += 1
             elif (type(turn) is str and turn == target[0]
                     and type(generation) is int and generation == target[1]):
+                self.counts["interruptTargetCount"] += 1
                 self.interrupt_requested = True
             else:
+                self.counts["interruptOtherCount"] += 1
                 self.foreign_interrupt = True
         elif kind == "playback_silenced":
             self.silenced = True
@@ -1152,6 +1182,7 @@ class Journey:
             "playbackSilencedObserved": False, "postStopAudioMs": 0,
             "quiescenceObserved": False, "quiescenceInconclusive": False,
             "freshReplyObserved": False, "stopLatencyMs": 0, "quietTailMs": 0,
+            "userPartialAtLeast3Alnum": False, **dict.fromkeys(_BARGE_COUNT_KEYS, 0),
         }
         trace, before_tasks, before_runs = await self._mic_quiet_start(
             voice,
@@ -1231,6 +1262,7 @@ class Journey:
             postStopAudioMs=meter.window_totals("quiesce")[1],
             freshReplyObserved=trace.fresh_token, stopLatencyMs=latency_ms,
             quietTailMs=max(tail_ms, 0),
+            userPartialAtLeast3Alnum=trace.partial_alnum, **trace.counts,
         )
         require(trace.stop_started >= 1, "journey_barge_stop_vad")
         require(trace.stop_finals == 1, "journey_barge_stop_finals")
