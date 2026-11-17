@@ -3827,6 +3827,7 @@ async def test_a_page_rebinds_at_once_while_its_readiness_cue_is_still_playing()
     first = _speech_peer("first", events, published)
     second = _speech_peer("second", events, asyncio.Event())
     generation = await livekit.connect(first, room_name="room", participant_identity="page")
+    announced: list[None] = []
     cue = asyncio.create_task(
         _play_readiness_cue(
             conversation=worker,
@@ -3840,6 +3841,7 @@ async def test_a_page_rebinds_at_once_while_its_readiness_cue_is_still_playing()
             participant_identity="page",
             generation=generation,
             is_valid=lambda: True,
+            on_input_ready=lambda: announced.append(None),
         )
     )
     await asyncio.wait_for(published.wait(), timeout=5)
@@ -3851,6 +3853,8 @@ async def test_a_page_rebinds_at_once_while_its_readiness_cue_is_still_playing()
 
     assert rebound == generation + 1
     assert cue.cancelled()
+    # The superseded binding's cue never announces readiness; the rebind announces its own.
+    assert announced == []
     assert events.index("cancel:first:finish_word=False") < events.index("disconnect:first")
     assert "finish:first" not in events
     await livekit.close()

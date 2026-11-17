@@ -102,6 +102,7 @@ async def test_delayed_readiness_cue_invalidates_confirmation_immediately_before
             participant_identity="participant",
             generation=1,
             is_valid=lambda: True,
+            on_input_ready=lambda: None,
             task_proposals=proposals,
         )
     )
