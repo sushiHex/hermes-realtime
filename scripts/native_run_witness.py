@@ -151,19 +151,23 @@ class NativeRunWitness:
             "127.0.0.1", origin.port, timeout=min(STATUS_IDLE_SECONDS, self._remaining())
         )
         expired = threading.Event()
+        # The socket itself, held here: http.client detaches it from the connection when a
+        # response will close (Connection: close, HTTP/1.0), while the response still reads it.
+        owned: list[socket.socket] = []
 
         def expire() -> None:
             expired.set()
-            sock = connection.sock
-            if sock is not None:
+            for sock in owned:
                 with suppress(OSError):
                     sock.shutdown(socket.SHUT_RDWR)
 
         timer: threading.Timer | None = None
+        response: http.client.HTTPResponse | None = None
         failed = False
         try:
             try:
                 connection.connect()
+                owned.append(connection.sock)
                 timer = threading.Timer(self._remaining(), expire)
                 timer.daemon = True
                 timer.start()
@@ -189,7 +193,11 @@ class NativeRunWitness:
             if timer is not None:
                 timer.cancel()
                 timer.join()
+            if response is not None:
+                response.close()
             connection.close()
+            for sock in owned:
+                sock.close()
         require(status == 200 and content_type == "application/json", "witness_run_response")
         require(len(raw) <= TEXT_CAP, "witness_run_bound")
         return object_json(raw.decode("utf-8"))

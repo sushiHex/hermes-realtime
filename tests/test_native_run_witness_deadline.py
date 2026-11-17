@@ -45,18 +45,30 @@ class _Server:
                     request += connection.recv(4096)
                 except TimeoutError:
                     continue
-            headers = (
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                b"Content-Length: " + str(len(_STATUS)).encode() + b"\r\n\r\n"
-            )
+            length = b"Content-Length: " + str(len(_STATUS)).encode() + b"\r\n"
+            if self.mode == "trickle_body_connection_close":
+                # http.client detaches a will-close response's socket from its connection.
+                headers = (
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + length
+                    + b"Connection: close\r\n\r\n"
+                )
+            elif self.mode == "trickle_body_http10":
+                # No length at all: the body ends only when the server closes.
+                headers = b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n"
+            else:
+                headers = (
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" + length + b"\r\n"
+                )
             if self.mode == "complete":
                 connection.sendall(headers + _STATUS)
                 return
             if self.mode == "stall":
                 self._wait_for_client_or_stop(connection)
                 return
-            prefix = headers if self.mode == "trickle_body" else b""
-            trickled = _STATUS if self.mode == "trickle_body" else headers + _STATUS
+            body_only = self.mode.startswith("trickle_body")
+            prefix = headers if body_only else b""
+            trickled = _STATUS if body_only else headers + _STATUS
             try:
                 connection.sendall(prefix)
                 # One byte every 0.1 s: never idle long enough for a per-socket timeout.
@@ -111,7 +123,16 @@ def _read_in_thread(subject: NativeRunWitness) -> tuple[threading.Thread, list[o
     return thread, outcome
 
 
-@pytest.mark.parametrize("mode", ["trickle_headers", "trickle_body", "stall"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "trickle_headers",
+        "trickle_body",
+        "trickle_body_connection_close",
+        "trickle_body_http10",
+        "stall",
+    ],
+)
 def test_a_slow_status_response_ends_the_read_itself_at_the_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
