@@ -2041,7 +2041,10 @@ SPEAK_WORKER = "worker_preview_speak"
 class FakeAudioSource:
     def __init__(self, rate, channels, queue_size_ms=1000):
         self.rate, self.channels, self.queue_size_ms = rate, channels, queue_size_ms
-        self.frames, self.played_out = [], False
+        self.frames, self.played_out, self.closed = [], False, False
+
+    async def aclose(self):
+        self.closed = True
 
     async def wait_for_playout(self):
         self.played_out = True
@@ -2918,15 +2921,19 @@ def test_readiness_that_needs_pcm_arrives_after_the_silence_feed_starts(tmp_path
     original = client.SyntheticVoice.stream
 
     async def stream(self, frames):
-        seen.append(self._idle_task)  # the idle feeder is gone before the clip starts
+        # The warm-up has settled and only silence has been captured so far.
+        seen.append((self._idle_task, [bytes(f.data) for f in self.source.frames]))
         await original(self, frames)
 
     monkeypatch.setattr(client.SyntheticVoice, "stream", stream)
     speak(journey)
-    sent = journey.room.published[0][0].source.frames
-    assert len(sent) > len(client.load_speak_fixture()[0])  # silence preceded the clip
-    assert sent[0].data == bytes(960)
-    assert seen == [None] and journey.voice._idle_task is None
+    source = journey.room.published[0][0].source
+    assert len(source.frames) > len(client.load_speak_fixture()[0])  # silence preceded the clip
+    (idle, before_clip), = seen
+    assert idle is None and before_clip and not any(any(pcm) for pcm in before_clip)
+    assert journey.voice._idle_task is None
+    # Stopping the warm-up never disposes or replaces the shared AudioSource.
+    assert journey.voice.source is source and source.closed is False
 
 
 def test_without_a_silence_feed_a_pcm_gated_readiness_never_arrives(tmp_path, monkeypatch):
@@ -2995,3 +3002,125 @@ def test_the_silence_feed_is_settled_when_the_clip_stream_times_out(tmp_path, mo
     monkeypatch.setattr(client, "_SPEAK_STREAM_MARGIN", 0.2)
     journey.voice.rtc.AudioSource = HangingSource
     assert idle_state_after_refusal(journey, "journey_speak_stream_timeout") == (True, None)
+
+
+def test_the_silence_feed_is_bounded_by_frames_and_by_bytes(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    for name, value, expected in (("_SPEAK_IDLE_MAX_FRAMES", 7, 7),
+                                  ("_SPEAK_IDLE_MAX_BYTES", 3 * 960, 3)):
+        flow = speak_flow()
+        flow[1] = []  # readiness never arrives, so the feed runs to its bound
+        journey = speak_journey(tmp_path, monkeypatch, flow)
+        monkeypatch.setattr(client, name, value)
+        with pytest.raises(ValueError, match="journey_speak_not_ready"):
+            speak(journey)
+        assert len(journey.room.published[0][0].source.frames) == expected
+        monkeypatch.undo()
+
+
+def test_the_silence_feed_is_bounded_by_time_when_capture_backpressures(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    class SlowSource(FakeAudioSource):
+        async def capture_frame(self, frame):
+            self.frames.append(frame)
+            await asyncio.sleep(0.05)
+
+    journey = speak_journey(tmp_path, monkeypatch, speak_flow())
+    monkeypatch.setattr(client, "_SPEAK_READY_TIMEOUT", 0.15)
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_TIMEOUT", 0.05)  # 20 frames by count, 0.2 s
+    voice = journey.voice
+    voice.source = SlowSource(48_000, 1)
+    started = time.monotonic()
+    asyncio.run(voice._idle())
+    assert time.monotonic() - started < 0.5 and len(voice.source.frames) <= 6
+
+
+def test_only_one_pcm_producer_runs_at_a_time(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    voice = client.SyntheticVoice(fake_rtc(), FakeRoom(), SPEAK_WORKER)
+    voice.source = FakeAudioSource(48_000, 1)
+    frames = (bytes(960),) * 3
+
+    async def run():
+        voice.start_idle()
+        with pytest.raises(ValueError, match="journey_speak_producer"):
+            await voice.stream(frames)  # the warm-up has not settled
+        with pytest.raises(ValueError, match="journey_speak_producer"):
+            voice.start_idle()  # nor can a second warm-up start
+        await voice.stop_idle()
+        await voice.stream(frames)
+
+    asyncio.run(run())
+    assert len(voice.source.frames) >= 3
+
+
+def test_the_silence_feed_is_settled_when_the_quiet_gate_fails(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    monkeypatch.setattr(client.SyntheticVoice, "_idle", RecordingIdle.run)
+    cue = {call: 1 for call in range(3, 60)}  # a cue that never stops: the gate times out
+    journey = speak_journey(tmp_path, monkeypatch, speak_flow(), audio_at=cue)
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 0.1)
+    assert idle_state_after_refusal(journey, "journey_speak_not_quiet") == (True, None)
+
+
+def typed_conversation_step(label="greeting", text="Hi there"):
+    pair = {"turnId": "typed_turn", "turnGeneration": 1}
+    rows = [admitted(sequence=1), user_final(text), ("first_foreground_token", pair),
+            ("assistant_text_generated", pair), completed(turn="typed_turn", sequence=1)]
+    return {"label": label, "kind": "conversation", "text": text}, rows, pair
+
+
+def run_steps(journey, *steps):
+    async def go():
+        for step in steps:
+            await journey.step(step)
+
+    asyncio.run(asyncio.wait_for(go(), 10))
+
+
+def test_clearing_the_typed_step_keeps_identities_admissions_baselines_and_sequence(
+    tmp_path, monkeypatch
+):
+    step, rows, pair = typed_conversation_step()
+    journey = speak_journey(tmp_path, monkeypatch, [rows, *speak_flow()], audio_at={5: 6},
+                            before=[task_state("completed")])
+    run_steps(journey, step, SPEAK_STEP)
+    assert (pair["turnId"], pair["turnGeneration"]) in journey.tracker.seen
+    assert journey.sequence == 1 and journey.admissions == set() and journey.bindings == {}
+    assert journey.tracker.tasks == {CANCEL_TASK: "completed"}  # the owned-task baseline
+    assert [turn["label"] for turn in journey.tracker.turns] == ["greeting"]
+
+
+@pytest.mark.parametrize("replayed", [
+    [("assistant_turn_completed", {"turnId": "typed_turn", "turnGeneration": 1})],
+    [("first_foreground_token", {"turnId": "typed_turn", "turnGeneration": 1})],
+])
+def test_a_replayed_prior_pair_during_speak_is_rejected(tmp_path, monkeypatch, replayed):
+    step, rows, _ = typed_conversation_step()
+    flow = speak_flow()
+    flow[2] = [*flow[2], *replayed]  # arrives with the microphone's user final
+    journey = speak_journey(tmp_path, monkeypatch, [rows, *flow], audio_at={5: 6})
+    with pytest.raises(ValueError, match="journey_speak_concurrent"):
+        run_steps(journey, step, SPEAK_STEP)
+
+
+def test_a_prior_pair_cannot_stand_in_for_the_microphone_turn(tmp_path, monkeypatch):
+    step, rows, pair = typed_conversation_step()
+    journey = speak_journey(tmp_path, monkeypatch,
+                            [rows, *speak_flow(pairs=(pair,))], audio_at={5: 6})
+    with pytest.raises(ValueError, match="journey_speak_pair_unbound"):
+        run_steps(journey, step, SPEAK_STEP)
+
+
+def test_speak_rejects_a_previous_typed_turn_that_is_still_active(tmp_path, monkeypatch):
+    journey = speak_journey(tmp_path, monkeypatch, speak_flow())
+    journey.tracker.begin("greeting", 1, "Hi there")  # admitted, never completed
+    with pytest.raises(ValueError, match="journey_speak_previous_turn_active"):
+        speak(journey)
+    # It was rejected, not erased: the active turn is still the tracker's current step.
+    assert journey.tracker.current is not None and journey.tracker.text == "Hi there"
+    assert journey.media == []

@@ -67,7 +67,8 @@ _SPEAK_SETTLE_SECONDS, _SPEAK_SETTLE_TIMEOUT = 1.0, 20.0
 _SPEAK_READY_TIMEOUT, _SPEAK_TURN_TIMEOUT, _SPEAK_DRAIN_SECONDS = 30.0, 60.0, 0.5
 # Windows only advance, so a later window can never re-open an earlier one or overlap it.
 _SPEAK_WINDOWS = ("settle", "input", "response", "closed")
-_SPEAK_STREAM_MARGIN = 10.0  # seconds beyond the clip's real-time duration
+_SPEAK_IDLE_MAX_FRAMES, _SPEAK_IDLE_MAX_BYTES = 4_000, 4_000_000  # warm-up silence bounds
+_SPEAK_STREAM_MARGIN = 10.0 # seconds beyond the clip's real-time duration
 _SPEAK_QUEUE_MS = 200 # AudioSource queue: capture_frame blocks once this much is buffered
 _SPEAK_MAX_FIXTURE_BYTES, _SPEAK_MAX_FIXTURE_SECONDS = 1_048_576, 5
 _SPEAK_LIFECYCLE = {
@@ -269,6 +270,7 @@ class SyntheticVoice:
         self.source: Any = None
         self.incarnation = 0
         self._idle_task: asyncio.Future | None = None
+        self._streaming = False
 
     async def activate(self, post_media: Any) -> None:
         require(self.source is None, "journey_speak_once")
@@ -285,23 +287,37 @@ class SyntheticVoice:
 
     async def stream(self, frames: tuple[bytes, ...]) -> None:
         require(self.source is not None, "journey_speak_media")
-        begin = time.monotonic()
-        for index, pcm in enumerate(frames):
-            delay = begin + index * _SPEAK_FRAME_SECONDS - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            await self.source.capture_frame(self.rtc.AudioFrame(
-                data=pcm, sample_rate=_SPEAK_RATE, num_channels=1,
-                samples_per_channel=_SPEAK_FRAME_SAMPLES,
-            ))
-        await self.source.wait_for_playout()
+        # Exactly one PCM producer at a time: the warm-up must have settled first.
+        require(self._idle_task is None and not self._streaming, "journey_speak_producer")
+        self._streaming = True
+        try:
+            begin = time.monotonic()
+            for index, pcm in enumerate(frames):
+                delay = begin + index * _SPEAK_FRAME_SECONDS - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self.source.capture_frame(self.rtc.AudioFrame(
+                    data=pcm, sample_rate=_SPEAK_RATE, num_channels=1,
+                    samples_per_channel=_SPEAK_FRAME_SAMPLES,
+                ))
+            await self.source.wait_for_playout()
+        finally:
+            self._streaming = False
 
     async def _idle(self) -> None:
-        """Bounded silence on the published track; ends by itself at the readiness bound."""
+        """Warm-up silence on the published track, bounded by frames, bytes and time.
+
+        It only stops being fed; it never closes or replaces the shared AudioSource.
+        """
         require(self.source is not None, "journey_speak_media")
         silence = bytes(2 * _SPEAK_FRAME_SAMPLES)
+        budget = _SPEAK_READY_TIMEOUT + _SPEAK_SETTLE_TIMEOUT
+        limit = min(int(budget / 0.01), _SPEAK_IDLE_MAX_FRAMES,
+                    _SPEAK_IDLE_MAX_BYTES // len(silence))
         begin = time.monotonic()
-        for index in range(int((_SPEAK_READY_TIMEOUT + _SPEAK_SETTLE_TIMEOUT) / 0.01)):
+        for index in range(limit):
+            if time.monotonic() - begin > budget:
+                break
             delay = begin + index * _SPEAK_FRAME_SECONDS - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
@@ -311,7 +327,7 @@ class SyntheticVoice:
             ))
 
     def start_idle(self) -> None:
-        require(self._idle_task is None, "journey_speak_once")
+        require(self._idle_task is None and not self._streaming, "journey_speak_producer")
         self._idle_task = asyncio.ensure_future(self._idle())
 
     async def stop_idle(self) -> None:
@@ -862,8 +878,12 @@ class Journey:
         voice, tracker = self.voice, self.tracker
         require(voice is not None, "journey_speak_unavailable")
         assert voice is not None
-        # A preceding typed step is settled: its input and text must not also claim the
-        # microphone's user final (journey_input_source).
+        # A preceding typed step must be settled, never erased while active or ambiguous. Only
+        # its completed per-step observation state is cleared, so its input and text cannot
+        # also claim the microphone's user final (journey_input_source). Seen identities,
+        # admissions, task baselines and sequence authority are kept.
+        require(tracker.current is None or tracker.current["outcome"] != "pending",
+                "journey_speak_previous_turn_active")
         tracker.current = None
         tracker.text = ""
         frames, words = load_speak_fixture()
