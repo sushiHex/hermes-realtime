@@ -2713,8 +2713,9 @@ def test_media_route_is_allowed_on_the_v1_endpoint(monkeypatch):
         client.request_json("http://127.0.0.1:1", "audio-diagnostic")
 
 
-@pytest.mark.parametrize("scenario_step", [SPEAK_STEP, {"label": "stop", "kind": "speak_barge"}],
-                         ids=["speak", "speak_barge"])
+@pytest.mark.parametrize("scenario_step", [SPEAK_STEP, {"label": "stop", "kind": "speak_barge"},
+                                           {"label": "delegate", "kind": "speak_task"}],
+                         ids=["speak", "speak_barge", "speak_task"])
 def test_execute_gives_a_speak_journey_exactly_the_worker_bound_voice(
     tmp_path, monkeypatch, scenario_step
 ):
@@ -3914,3 +3915,580 @@ def test_the_snapshot_flag_is_false_when_the_snapshot_succeeds(tmp_path, monkeyp
     barge(journey)
     assert journey.speak_receipt["snapshotError"] is False
     assert journey.speak_receipt["interruptEventObserved"] is True
+
+
+# Spoken delegation and natural spoken cancellation `speak_task` step (#159, cross-ref #237):
+# controlled synthetic path only; it bypasses the physical microphone and AEC.
+
+TASK_STEP = {"label": "delegate", "kind": "speak_task"}
+T_TARGET, T_OTHER, T_OLD = "task_target", "task_other", "task_old"
+RUN_TARGET, RUN_OTHER, RUN_OLD = "run_" + "t" * 32, "run_" + "o" * 32, "run_" + "l" * 32
+DISPATCH_TEXT = "Research European public transit funding and compare the major cities."
+CANCEL_SPOKEN = "Actually, stop that research, I don't need it anymore."
+TASK_CLOCK_STEP = 0.25
+
+
+def task_state_row(task, status):
+    return ("task_state", {"taskId": task, "status": status})
+
+
+def task_result_row(task, status):
+    return ("task_result", {"taskId": task, "status": status, "text": "Stopped."})
+
+
+def admit(run=RUN_TARGET):
+    return ("__admit__", {"run": run})  # the run journal gains an admission, not an event
+
+
+def task_pre(text=DISPATCH_TEXT, *, vad=True, finals=1, task=True, admission=True, extra=()):
+    voice = [("voice_activity_started", {}), ("voice_activity_ended", {})] if vad else []
+    dispatched = []
+    if task:
+        dispatched.append(task_state_row(T_TARGET, "active"))
+    if admission:
+        dispatched.append(admit())
+    return [[], [("voice_input_ready", READY)], [*voice, *[user_final(text)] * finals],
+            dispatched, *extra]
+
+
+def task_post(text=CANCEL_SPOKEN, *, vad=True, finals=1, cancelling=True, terminal=True,
+              before_final=()):
+    first = [("voice_activity_started", {})] if vad else []
+    second = [*before_final, ("voice_activity_ended", {}), *[user_final(text)] * finals]
+    third = [task_state_row(T_TARGET, "cancelling")] if cancelling else []
+    fourth = []
+    if terminal:
+        fourth = [task_state_row(T_TARGET, "interrupted") if cancelling
+                  else task_result_row(T_TARGET, "interrupted"),
+                  task_result_row(T_TARGET, "interrupted")]
+    return [first, second, third, fourth]
+
+
+def task_journey(tmp_path, monkeypatch, *, pre=None, post=None, before=(), settle=0.0,
+                 witness="cancelled", journal=()):
+    """A Journey with a fake mic transport and a state-driven fake host.
+
+    Events before the cancellation's injection cursor come from ``pre``; afterwards from
+    ``post``; one batch per poll. ``__admit__`` rows grow the fake run journal. The client clock
+    is fake and advances TASK_CLOCK_STEP per poll.
+    """
+    import scripts.native_typed_journey as client
+
+    for name, value in {
+        "_SPEAK_FRAME_SECONDS": 0.0, "_SPEAK_DRAIN_SECONDS": 0.0, "_SPEAK_TURN_TIMEOUT": 1.0,
+        "_SPEAK_SETTLE_TIMEOUT": 0.5, "_SPEAK_READY_TIMEOUT": 1.0,
+        "_SPEAK_SETTLE_SECONDS": settle, "_TASK_DISPATCH_TIMEOUT": 0.6,
+        "_TASK_QUIET_TIMEOUT": 0.6, "_TASK_CANCEL_TIMEOUT": 0.6,
+    }.items():
+        monkeypatch.setattr(client, name, value)
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              api_origin="http://127.0.0.1:1")
+    journey = Journey(options, {"expiresInSeconds": 3600}, "secret")
+    run_journal = {"ids": set(journal), "pending": 0}
+    monkeypatch.setattr(client, "read_journal",
+                        lambda _: (set(run_journal["ids"]), run_journal["pending"]))
+    journey.witness_reads = []
+
+    def witness_factory(*args, **kwargs):
+        journey.witness_reads.append(args[1])
+        return SimpleNamespace(read=lambda: {"terminal": witness, "toolCalls": []})
+
+    monkeypatch.setattr(client, "NativeRunWitness", witness_factory)
+    rtc, room = fake_rtc(), FakeRoom()
+    journey.voice = client.SyntheticVoice(rtc, room, SPEAK_WORKER)
+    meter = journey.voice.meter
+    now, cursor = [1000.0], [len(before) + 1]
+    if before:
+        journey.tracker.consume(numbered(list(before), 1))
+    meter._clock = lambda: now[0]
+    queues = {"pre": list(task_pre() if pre is None else pre),
+              "post": list(task_post() if post is None else post)}
+    journey.media, journey.rtc, journey.room, journey.journal = [], rtc, room, run_journal
+    journey.queues = queues
+
+    async def request(route, payload=None):
+        if route == "media":
+            journey.media.append(payload)
+            return {"mediaIncarnation": payload["mediaIncarnation"], "version": 1}
+        if route == "input":
+            journey.media.append(("input", payload))
+            return {}
+        assert route == "events"
+        now[0] += TASK_CLOCK_STEP
+        trace = journey.tracker.speak
+        if trace is not None and getattr(trace, "cancel_cursor", None) is not None:
+            journey.journal["post"] = True  # the cancellation was injected: stay post afterwards
+        phase = "post" if journey.journal.get("post") else "pre"
+        rows = []
+        for kind, data in queues[phase].pop(0) if queues[phase] else []:
+            if kind == "__admit__":
+                run_journal["ids"].add(data["run"])
+            else:
+                rows.append((kind, data))
+        events = numbered(rows, cursor[0])
+        cursor[0] += len(events)
+        return {"version": 2, "events": events}
+
+    journey.request = request
+    return journey
+
+
+def run_task(journey, seconds=10):
+    asyncio.run(asyncio.wait_for(journey.step(TASK_STEP), seconds))
+
+
+def task_refused(journey, category):
+    with pytest.raises(ValueError, match=category):
+        run_task(journey)
+    return journey.speak_receipt
+
+
+def test_speak_task_delegates_by_voice_then_cancels_exactly_that_task(tmp_path, monkeypatch):
+    journey = task_journey(tmp_path, monkeypatch)
+    run_task(journey)
+    receipt = journey.speak_receipt
+    assert receipt["dispatchTasks"] == 1 and receipt["dispatchAdmissions"] == 1
+    assert receipt["taskBound"] and receipt["targetActiveBeforeCancel"]
+    assert receipt["cancelInjected"] and receipt["cancelObserved"]
+    assert receipt["cancelFinalsCount"] == 1 and receipt["cancelTranscriptMatches"]
+    assert receipt["nativeCancelledBeforeCleanup"] is True
+    assert receipt["foreignCancelCount"] == 0 and receipt["competingAdmissionCount"] == 0
+    assert journey.bindings == {"delegate": (T_TARGET, RUN_TARGET)}
+    assert journey.results["delegate"]["terminal"] == "cancelled"
+    assert journey.witness_reads == [RUN_TARGET]  # read once, in the step, before any cleanup
+
+
+def test_speak_task_uses_one_track_one_media_request_and_never_a_typed_admission(
+    tmp_path, monkeypatch
+):
+    import scripts.native_typed_journey as client
+
+    journey = task_journey(tmp_path, monkeypatch)
+    run_task(journey)
+    dispatch, _, cancel, _, _ = client.load_task_fixtures()
+    assert journey.media == [{"mediaIncarnation": 1}]  # no typed "input" request either
+    assert len(journey.room.published) == 1
+    pcm = [frame.data for frame in journey.room.published[0][0].source.frames]
+    assert pcm[-(len(dispatch) + len(cancel)):] == list(dispatch) + list(cancel)
+    assert journey.tracker.turns == []
+
+
+def test_speak_task_receipt_is_metadata_only(tmp_path, monkeypatch):
+    journey = task_journey(tmp_path, monkeypatch)
+    run_task(journey)
+    raw = json.dumps(journey.speak_receipt).lower()
+    for private in (T_TARGET, RUN_TARGET, "research", "european", "actually"):
+        assert private not in raw
+    assert all(type(value) in {bool, int, str} for value in journey.speak_receipt.values())
+
+
+@pytest.mark.parametrize("text,category", [
+    ("Research European public transit funding", "journey_speak_transcript"),
+    ("", "journey_speak_transcript"),
+])
+def test_speak_task_refuses_wrong_dispatch_words(tmp_path, monkeypatch, text, category):
+    journey = task_journey(tmp_path, monkeypatch, pre=task_pre(text))
+    receipt = task_refused(journey, category)
+    assert receipt["dispatchTranscriptMatches"] is False and receipt["cancelInjected"] is False
+
+
+@pytest.mark.parametrize("finals,category", [(0, "journey_speak_finals"),
+                                             (2, "journey_speak_finals")])
+def test_speak_task_refuses_zero_or_two_dispatch_finals(tmp_path, monkeypatch, finals, category):
+    journey = task_journey(tmp_path, monkeypatch, pre=task_pre(finals=finals))
+    task_refused(journey, category)
+
+
+def test_speak_task_refuses_a_dispatch_with_no_voice_activity(tmp_path, monkeypatch):
+    journey = task_journey(tmp_path, monkeypatch, pre=task_pre(vad=False))
+    task_refused(journey, "journey_speak_voice_activity")
+
+
+def test_speak_task_refuses_when_no_task_or_no_admission_appears(tmp_path, monkeypatch):
+    for pre in (task_pre(task=False), task_pre(admission=False)):
+        journey = task_journey(tmp_path, monkeypatch, pre=pre)
+        task_refused(journey, "journey_task_not_dispatched")
+        monkeypatch.undo()
+
+
+def test_speak_task_refuses_a_competing_admission_during_dispatch(tmp_path, monkeypatch):
+    pre = task_pre()
+    pre[3] = [*pre[3], task_state_row(T_OTHER, "active"), admit(RUN_OTHER)]
+    receipt = task_refused(task_journey(tmp_path, monkeypatch, pre=pre), "journey_task_competing")
+    assert receipt["dispatchTasks"] == 2 and receipt["dispatchAdmissions"] == 2
+    assert receipt["targetActiveBeforeCancel"] is False  # refused before any quiet wait
+
+
+def test_speak_task_refuses_a_replayed_prior_task_during_dispatch(tmp_path, monkeypatch):
+    pre = task_pre()
+    pre[3] = [task_state_row(T_OLD, "active"), *pre[3]]  # a replay of an earlier task
+    journey = task_journey(tmp_path, monkeypatch, pre=pre,
+                           before=[task_state_row(T_OLD, "completed")],
+                           journal=[RUN_OLD])
+    task_refused(journey, "journey_task_replayed")
+
+
+def test_speak_task_refuses_a_task_whose_first_state_precedes_the_dispatch_final(
+    tmp_path, monkeypatch
+):
+    pre = task_pre()
+    pre[2] = [("voice_activity_started", {}), task_state_row(T_TARGET, "active"),
+              ("voice_activity_ended", {}), user_final(DISPATCH_TEXT)]
+    pre[3] = [admit()]
+    receipt = task_refused(task_journey(tmp_path, monkeypatch, pre=pre),
+                           "journey_task_dispatch_unbound")
+    assert receipt["taskBound"] is False
+
+
+def test_speak_task_never_selects_a_replacement_when_target_ends_before_the_cancel(
+    tmp_path, monkeypatch
+):
+    pre = task_pre()
+    pre[3] = [*pre[3], task_result_row(T_TARGET, "completed")]  # ends with the dispatch
+    journey = task_journey(tmp_path, monkeypatch, pre=pre)
+    receipt = task_refused(journey, "journey_task_target_terminal")
+    assert receipt["cancelInjected"] is False and receipt["targetActiveBeforeCancel"] is False
+
+
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_a_target_that_ends_during_the_cancel_lead_in_is_inconclusive_and_nothing_is_sent(
+    tmp_path, monkeypatch, status
+):
+    import scripts.native_typed_journey as client
+
+    # Delivered at the first poll of the cancel stream, i.e. during its leading silence,
+    # after the quiet session was established. A failed run covers a rate-limit or lookup refusal.
+    pre = task_pre(extra=([task_result_row(T_TARGET, status)],))
+    journey = task_journey(tmp_path, monkeypatch, pre=pre)
+    receipt = task_refused(journey, "journey_task_target_terminal")
+    assert receipt["targetActiveBeforeCancel"] is True and receipt["cancelInjected"] is False
+    sent = [frame.data for frame in journey.room.published[0][0].source.frames]
+    dispatch = client.load_task_fixtures()[0]
+    assert sum(any(pcm) for pcm in sent) == sum(any(pcm) for pcm in dispatch)  # no cancel speech
+
+
+def test_a_competing_admission_at_the_first_cancel_speech_frame_aborts_before_any_speech(
+    tmp_path, monkeypatch
+):
+    import scripts.native_typed_journey as client
+
+    pre = task_pre(extra=([admit(RUN_OTHER)],))
+    journey = task_journey(tmp_path, monkeypatch, pre=pre)
+    receipt = task_refused(journey, "journey_task_competing")
+    assert receipt["cancelInjected"] is False
+    sent = [frame.data for frame in journey.room.published[0][0].source.frames]
+    dispatch = client.load_task_fixtures()[0]
+    assert sum(any(pcm) for pcm in sent) == sum(any(pcm) for pcm in dispatch)
+
+
+def test_a_competing_active_task_at_the_first_cancel_speech_frame_aborts(tmp_path, monkeypatch):
+    pre = task_pre(extra=([task_state_row(T_OTHER, "active")],))
+    task_refused(task_journey(tmp_path, monkeypatch, pre=pre), "journey_task_competing")
+
+
+def test_a_pending_admission_blocks_the_quiet_session_and_the_cancel(tmp_path, monkeypatch):
+    journey = task_journey(tmp_path, monkeypatch)
+    journey.journal["pending"] = 1  # a dispatch that is not yet an accepted admission
+    task_refused(journey, "journey_task_not_quiet")
+
+
+def test_the_cancel_needs_a_whole_quiet_interval_after_the_dispatch(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    journey = task_journey(tmp_path, monkeypatch)
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 0.5)
+    monkeypatch.setattr(client, "_TASK_QUIET_TIMEOUT", 3.0)
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_TIMEOUT", 3.0)
+    run_task(journey)
+    assert journey.speak_receipt["preCancelQuietMs"] >= 500
+
+
+def test_the_cancel_waits_for_an_open_foreground_turn_to_close(tmp_path, monkeypatch):
+    ack = {"turnId": "ack_turn", "turnGeneration": 1}
+    pre = task_pre(extra=([], [("assistant_turn_completed", ack)]))
+    pre[3] = [*pre[3], ("first_foreground_token", ack)]  # the acknowledgment turn is open
+    journey = task_journey(tmp_path, monkeypatch, pre=pre)
+    run_task(journey)
+    assert journey.speak_receipt["preCancelQuietMs"] >= 500  # two polls with the turn open
+
+
+def test_an_open_foreground_turn_that_never_closes_is_not_quiet(tmp_path, monkeypatch):
+    ack = {"turnId": "ack_turn", "turnGeneration": 1}
+    pre = task_pre()
+    pre[3] = [*pre[3], ("first_foreground_token", ack)]  # opened and never closed
+    task_refused(task_journey(tmp_path, monkeypatch, pre=pre), "journey_task_not_quiet")
+
+
+@pytest.mark.parametrize("text,category", [
+    ("Never mind", "journey_task_cancel_transcript"),
+    ("", "journey_task_cancel_transcript"),
+])
+def test_speak_task_refuses_wrong_cancel_words(tmp_path, monkeypatch, text, category):
+    journey = task_journey(tmp_path, monkeypatch, post=task_post(text))
+    receipt = task_refused(journey, category)
+    assert receipt["cancelTranscriptMatches"] is False and receipt["cancelInjected"] is True
+    assert journey.results == {}  # no witness read, so no acceptance evidence
+
+
+@pytest.mark.parametrize("finals", [0, 2])
+def test_speak_task_refuses_zero_or_two_cancel_finals(tmp_path, monkeypatch, finals):
+    journey = task_journey(tmp_path, monkeypatch, post=task_post(finals=finals))
+    task_refused(journey, "journey_task_cancel_finals")
+
+
+def test_speak_task_needs_a_fresh_voice_start_for_the_cancel(tmp_path, monkeypatch):
+    journey = task_journey(tmp_path, monkeypatch, post=task_post(vad=False))
+    receipt = task_refused(journey, "journey_task_cancel_vad")
+    assert receipt["cancelVadObserved"] is False
+
+
+def test_a_foreign_cancellation_fails_the_step(tmp_path, monkeypatch):
+    post = task_post()
+    post[2] = [*post[2], task_state_row(T_OTHER, "cancelling")]
+    journey = task_journey(tmp_path, monkeypatch, post=post)
+    receipt = task_refused(journey, "journey_task_foreign_cancel")
+    assert receipt["foreignCancelCount"] == 1
+    assert journey.witness_reads == []  # refused before the native witness was read
+
+
+def test_a_task_started_after_the_cancel_fails_the_step(tmp_path, monkeypatch):
+    post = task_post()
+    post[2] = [*post[2], task_state_row(T_OTHER, "active")]
+    task_refused(task_journey(tmp_path, monkeypatch, post=post), "journey_task_competing")
+
+
+def test_a_second_admission_after_the_cancel_fails_the_step(tmp_path, monkeypatch):
+    post = task_post()
+    post[2] = [*post[2], admit(RUN_OTHER)]
+    receipt = task_refused(task_journey(tmp_path, monkeypatch, post=post),
+                           "journey_task_competing")
+    assert receipt["competingAdmissionCount"] == 1
+
+
+def test_a_cancelling_state_before_the_cancel_final_is_stale_not_evidence(tmp_path, monkeypatch):
+    post = task_post(before_final=[task_state_row(T_TARGET, "cancelling")], cancelling=False)
+    task_refused(task_journey(tmp_path, monkeypatch, post=post), "journey_task_cancel_stale")
+
+
+def test_a_cancel_visible_only_as_a_terminal_result_is_not_accepted(tmp_path, monkeypatch):
+    # No cancelling or interrupted task_state for TARGET after the final: whatever settles it
+    # later (cleanup included) cannot be acceptance evidence.
+    post = task_post(cancelling=False)
+    journey = task_journey(tmp_path, monkeypatch, post=post)
+    receipt = task_refused(journey, "journey_task_cancel_unobserved")
+    assert receipt["cancelObserved"] is False and receipt["nativeCancelledBeforeCleanup"] is False
+    assert journey.results == {} and journey.witness_reads == []
+
+
+def test_a_cancel_that_never_arrives_is_not_accepted(tmp_path, monkeypatch):
+    post = task_post(cancelling=False, terminal=False)
+    journey = task_journey(tmp_path, monkeypatch, post=post)
+    task_refused(journey, "journey_task_cancel_unobserved")
+    assert journey.witness_reads == []
+
+
+def test_the_native_witness_must_agree_that_the_task_was_cancelled(tmp_path, monkeypatch):
+    journey = task_journey(tmp_path, monkeypatch, witness="completed")
+    task_refused(journey, "journey_terminal_binding")
+    assert journey.speak_receipt["nativeCancelledBeforeCleanup"] is False
+
+
+def test_speak_task_owns_the_dispatched_task_even_when_the_step_fails(tmp_path, monkeypatch):
+    journey = task_journey(tmp_path, monkeypatch, post=task_post(vad=False))
+    task_refused(journey, "journey_task_cancel_vad")
+    assert journey.bindings == {"delegate": (T_TARGET, RUN_TARGET)}  # cleanup can cancel it
+
+
+def test_scenario_accepts_one_speak_task_step_and_no_second_microphone_step(tmp_path):
+    def scenario(*steps):
+        path = tmp_path / "task.json"
+        path.write_text(json.dumps({"version": 1, "steps": list(steps)}), encoding="utf-8")
+        return load_scenario(path)
+
+    assert scenario({"label": "delegate", "kind": "speak_task"})[0]["kind"] == "speak_task"
+    for bad in (
+        [{"label": "a", "kind": "speak"}, {"label": "b", "kind": "speak_task"}],
+        [{"label": "a", "kind": "speak_task"}, {"label": "b", "kind": "speak_task"}],
+        [{"label": "a", "kind": "speak_task", "text": "Research"}],
+        [{"label": "a", "kind": "speak_task", "task": "x"}],
+    ):
+        with pytest.raises(ValueError, match="journey_(speak|step)"):
+            scenario(*bad)
+
+
+@pytest.mark.parametrize("name", ["_TASK_DISPATCH_SHA256", "_TASK_CANCEL_SHA256"])
+def test_the_task_fixtures_are_pinned_by_sha256(monkeypatch, name):
+    import scripts.native_typed_journey as client
+
+    frames = client.load_task_fixtures()
+    assert frames[1] == ("research", "european", "public", "transit", "funding", "and",
+                         "compare", "the", "major", "cities")
+    assert frames[4][:4] == ("actually", "stop", "that", "research")
+    monkeypatch.setattr(client, name, "0" * 64)
+    with pytest.raises(ValueError, match="journey_speak_fixture"):
+        client.load_task_fixtures()
+
+
+def test_a_task_dispatched_after_the_witness_read_still_fails_the_step(tmp_path, monkeypatch):
+    post = [*task_post(), [task_result_row(T_OTHER, "completed")]]  # first seen as a result
+    journey = task_journey(tmp_path, monkeypatch, post=post)
+    receipt = task_refused(journey, "journey_followup_dispatched")
+    assert receipt["nativeCancelledBeforeCleanup"] is True  # evidence was read, then refused
+
+
+def test_a_previously_seen_task_reactivated_at_the_first_cancel_speech_frame_aborts(
+    tmp_path, monkeypatch
+):
+    pre = task_pre(extra=([task_state_row(T_OLD, "active")],))
+    journey = task_journey(tmp_path, monkeypatch, pre=pre,
+                           before=[task_state_row(T_OLD, "completed")], journal=[RUN_OLD])
+    receipt = task_refused(journey, "journey_task_competing")
+    assert receipt["cancelInjected"] is False
+
+
+class FailAfterSpeechSource(FakeAudioSource):
+    """Captures the warm-up and the clip's leading silence, then fails on the first speech."""
+
+    async def capture_frame(self, frame):
+        await asyncio.sleep(0.01)  # real time passes, so the step polls between frames
+        if any(frame.data):
+            raise RuntimeError("capture failed")
+        self.frames.append(frame)
+
+
+def cleanup_cancels(journey):
+    """Run settle_owned() with a host that settles a task once it is asked to cancel it."""
+    requested = []
+    inner = journey.request
+
+    async def request(route, payload=None):
+        if route == "input":
+            requested.append(payload["text"])
+            journey.queues["pre"].insert(0, [task_state_row(T_TARGET, "interrupted"),
+                                             task_result_row(T_TARGET, "interrupted")])
+        return await inner(route, payload)
+
+    journey.request = request
+    return requested
+
+
+def test_an_accepted_task_is_owned_and_cancelled_when_the_dispatch_stream_later_fails(
+    tmp_path, monkeypatch
+):
+    journey = task_journey(tmp_path, monkeypatch)
+    journey.voice.rtc.AudioSource = FailAfterSpeechSource
+    requested = cleanup_cancels(journey)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="capture failed"):
+            await asyncio.wait_for(journey.step(TASK_STEP), 10)
+        owned = dict(journey.bindings)
+        settled = await journey.settle_owned()
+        return owned, settled
+
+    owned, settled = asyncio.run(run())
+    assert owned == {"delegate": (T_TARGET, RUN_TARGET)}
+    assert requested == ["cancel task: " + T_TARGET]  # exactly that task, by exact id
+    assert settled is False  # the journal still holds the admission: honest, not hidden
+
+
+def test_ambiguous_dispatch_peers_are_never_guessed_into_ownership(tmp_path, monkeypatch):
+    pre = task_pre()
+    pre[3] = [*pre[3], task_state_row(T_OTHER, "active"), admit(RUN_OTHER)]
+    journey = task_journey(tmp_path, monkeypatch, pre=pre)
+    requested = cleanup_cancels(journey)
+
+    async def run():
+        with pytest.raises(ValueError, match="journey_task_competing"):
+            await asyncio.wait_for(journey.step(TASK_STEP), 10)
+        return dict(journey.bindings), await journey.settle_owned()
+
+    owned, settled = asyncio.run(run())
+    assert owned == {} and requested == [] and settled is False
+
+
+def test_a_second_user_final_during_the_cancel_lead_in_fails_the_step(tmp_path, monkeypatch):
+    pre = task_pre(extra=([user_final("unexpected extra input")],))
+    journey = task_journey(tmp_path, monkeypatch, pre=pre)
+    receipt = task_refused(journey, "journey_speak_finals")
+    assert receipt["dispatchFinalsCount"] == 2 and receipt["cancelInjected"] is False
+
+
+def test_a_second_user_final_during_the_quiet_wait_fails_the_step(tmp_path, monkeypatch):
+    ack = {"turnId": "ack_turn", "turnGeneration": 1}
+    pre = task_pre(extra=([user_final("unexpected extra input")],
+                          [("assistant_turn_completed", ack)]))
+    pre[3] = [*pre[3], ("first_foreground_token", ack)]  # an open turn keeps the wait polling
+    journey = task_journey(tmp_path, monkeypatch, pre=pre)
+    receipt = task_refused(journey, "journey_speak_finals")
+    assert receipt["targetActiveBeforeCancel"] is False
+
+
+@pytest.mark.parametrize("rows", [
+    [("voice_activity_started", {})],
+    [("assistant_turn_completed", {})],  # an unbound foreground terminal
+    [("assistant_turn_completed", {"turnId": "old_turn", "turnGeneration": 1})],  # replayed
+], ids=["voice-start", "unbound-foreground", "replayed-foreground"])
+def test_unexpected_input_or_foreground_after_the_dispatch_fails_the_step(
+    tmp_path, monkeypatch, rows
+):
+    old = ("assistant_turn_completed", {"turnId": "old_turn", "turnGeneration": 1})
+    pre = task_pre(extra=(rows,))
+    journey = task_journey(tmp_path, monkeypatch, pre=pre, before=[old])
+    receipt = task_refused(journey, "journey_task_unexpected_input")
+    assert receipt["unexpectedInputCount"] == 1 and receipt["cancelInjected"] is False
+
+
+def test_the_expected_acknowledgment_turn_is_not_unexpected_input(tmp_path, monkeypatch):
+    ack = {"turnId": "ack_turn", "turnGeneration": 1}
+    pre = task_pre(extra=([], [("assistant_turn_completed", ack)]))
+    pre[3] = [*pre[3], ("first_foreground_token", ack), ("assistant_text_generated", ack)]
+    run_task(task_journey(tmp_path, monkeypatch, pre=pre))
+
+
+def test_a_foreign_cancel_in_the_final_poll_fails_after_the_witness_read(tmp_path, monkeypatch):
+    # A prior completed task goes cancelling only in the poll after the witness read.
+    post = [*task_post(), [task_state_row(T_OLD, "cancelling")]]
+    journey = task_journey(tmp_path, monkeypatch, post=post,
+                           before=[task_state_row(T_OLD, "completed")], journal=[RUN_OLD])
+    receipt = task_refused(journey, "journey_task_foreign_cancel")
+    assert receipt["foreignCancelCount"] == 1
+    # The pre-cleanup evidence is preserved in the receipt even though the verdict is refused.
+    assert receipt["nativeCancelledBeforeCleanup"] is True and journey.witness_reads == [RUN_TARGET]
+
+
+def test_a_foreign_cancel_during_witness_collection_fails_the_step(tmp_path, monkeypatch):
+    # Delivered while collect() polls for TARGET's terminal state.
+    post = task_post(terminal=False)  # [vad], [ended, final], [cancelling TARGET], []
+    post.append([task_state_row(T_OTHER, "cancelling")])  # delivered by collect()'s polling
+    post.append([task_state_row(T_TARGET, "interrupted"), task_result_row(T_TARGET, "interrupted")])
+    journey = task_journey(tmp_path, monkeypatch, post=post)
+    receipt = task_refused(journey, "journey_task_foreign_cancel")
+    assert receipt["foreignCancelCount"] == 1 and journey.witness_reads == [RUN_TARGET]
+
+
+def test_an_admission_in_the_final_poll_fails_after_the_witness_read(tmp_path, monkeypatch):
+    post = [*task_post(), [admit(RUN_OTHER)]]
+    journey = task_journey(tmp_path, monkeypatch, post=post)
+    receipt = task_refused(journey, "journey_task_competing")
+    assert receipt["competingAdmissionCount"] == 1
+    assert receipt["nativeCancelledBeforeCleanup"] is True
+
+
+def test_a_second_cancel_final_in_the_final_poll_fails_after_the_witness_read(
+    tmp_path, monkeypatch
+):
+    post = [*task_post(), [user_final(CANCEL_SPOKEN)]]
+    journey = task_journey(tmp_path, monkeypatch, post=post)
+    receipt = task_refused(journey, "journey_task_cancel_finals")
+    assert receipt["cancelFinalsCount"] == 2  # the refusal keeps the updated count
+    assert receipt["nativeCancelledBeforeCleanup"] is True and journey.witness_reads == [RUN_TARGET]
+
+
+def test_a_second_cancel_final_during_witness_collection_fails_the_step(tmp_path, monkeypatch):
+    post = task_post(terminal=False)  # [vad], [ended, final], [cancelling TARGET], []
+    post.append([user_final("Please stop it")])  # delivered by collect()'s polling
+    post.append([task_state_row(T_TARGET, "interrupted"), task_result_row(T_TARGET, "interrupted")])
+    journey = task_journey(tmp_path, monkeypatch, post=post)
+    receipt = task_refused(journey, "journey_task_cancel_finals")
+    assert receipt["cancelFinalsCount"] == 2 and receipt["cancelTranscriptMatches"] is True

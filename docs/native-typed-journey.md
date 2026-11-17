@@ -262,6 +262,46 @@ payload) and `interruptOtherCount`. Published partial counts sit downstream of t
 echo and playback-authority filtering, so a zero does not prove the STT backend emitted no
 partial.
 
+### `speak_task`
+
+A `speak_task` step (exactly `label` and `kind`; a scenario holds one microphone step) tests
+natural spoken delegation and a sole-active natural spoken cancellation. It is labelled for
+#159 with a #237 cross-reference. It does not cover the explicit `task:`/`cancel task:` command
+grammar or the ambiguous-cancel category.
+
+1. **Delegate.** It runs the speak flow (warm-up, quiet gate) with the pinned request
+   `sapi_task_dispatch.wav`. It needs voice activity ordered, exactly one user final with the
+   exact normalized words, and exactly one new accepted dispatch admission and one new
+   `task_state` active whose first state follows that final. Microphone input has no
+   `typed_input_admitted`, so none is faked: attribution is by event order around the user
+   final. A replayed earlier task, a competing second task or admission, or a task whose first
+   state precedes the final fails. That task and its run are TARGET, frozen. Exactly one new
+   task and one new run are owned for cleanup as soon as they are observed, and again on every
+   exit path, so a later failure (a stream error included) still lets cleanup cancel exactly that
+   task; with several candidates nothing is guessed and cleanup stays honestly unsettled. No
+   sleep, hold or budget change is added; the work is genuinely substantial public work.
+2. **Quiet with TARGET active.** From the freeze through the cancel injection there must be
+   exactly one matching dispatch final and no further voice start, unbound or replayed
+   foreground event (`journey_speak_finals`, `journey_task_unexpected_input`). It waits for no open foreground turn, no pending admission, one
+   whole quiet interval, and TARGET still active. If TARGET already ended (including a
+   rate-limit or lookup refusal) the result is inconclusive, `journey_task_target_terminal`.
+   No replacement task is ever selected.
+3. **Cancel.** It injects `sapi_task_cancel.wav` on the same track. At its first speech frame
+   it re-checks that TARGET is still the sole live task with no competing task or admission and
+   aborts before any cancel speech if not. It needs a fresh voice start, exactly one final with
+   the exact words, and a `cancelling` or `interrupted` `task_state` for exactly TARGET after
+   that final. A cancel state before the final is stale; any other task cancelling is foreign;
+   any new dispatch fails.
+4. **Native evidence before cleanup.** The native witness is read in the step (through
+   `collect`) and must say `cancelled`. The cancellation's whole validate-and-snapshot (a voice
+   start, exactly one final with the exact words, nothing foreign cancelled, no competing task or
+   admission) runs before the witness read and again after it and the final poll, with the trace
+   still live; a late second final is refused with its updated count kept in the receipt.
+   Cleanup never creates acceptance evidence: a task that is only cancelled later is a failure.
+
+The receipt holds booleans and counts only (no ids or text). It is controlled synthetic
+evidence.
+
 This is a controlled synthetic path. It bypasses the physical microphone and acoustic
 echo cancellation. It does not prove source-attributed microphone qualification or the
 naturalness of the conversation.

@@ -71,3 +71,16 @@ Synthetic phrase `Please tell me a long story about the ocean.` for the native j
 - Expected words after lowercasing and stripping punctuation: `please tell me a long story about the ocean`
 
 Generation command: the same PowerShell recipe as `sapi_hello_can_you_hear_me.wav`, with output file `sapi_long_ocean_story.wav` and `$synth.Speak('Please tell me a long story about the ocean.')`.
+
+## `sapi_task_dispatch.wav` and `sapi_task_cancel.wav`
+
+Synthetic phrases for the native journey `speak_task` step (spoken delegation, then a natural spoken cancellation). Neither contains a human recording or user speech. Both use the `Microsoft David Desktop` SAPI voice (CPU), mono signed 16-bit little-endian PCM at 22,050 Hz, and are at most 5 seconds.
+
+| File | Phrase | SHA-256 | Frames |
+| --- | --- | --- | --- |
+| `sapi_task_dispatch.wav` | `Research European public transit funding and compare the major cities.` | `1068ad9d4119dc34f04a6a8a725469bc067883d3e68403e62f02a37eccf4da77` | `105,696` (about `4.793` s) |
+| `sapi_task_cancel.wav` | `Actually, stop that research, I don't need it anymore.` | `f24ade6b163ccdafbbebf291cac8724811defecc328ebd260fd6f867c4208c69` | `102,396` (about `4.644` s) |
+
+Expected words after lowercasing and replacing punctuation with spaces: `research european public transit funding and compare the major cities` and `actually stop that research i don t need it anymore`.
+
+Generation command: the same PowerShell recipe as `sapi_hello_can_you_hear_me.wav` (set `[Environment]::CurrentDirectory` first), once per file, with output file names `sapi_task_dispatch.wav` / `sapi_task_cancel.wav` and `$synth.Speak(...)` given the phrase from the table.

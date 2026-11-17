@@ -18,7 +18,7 @@ The packaged browser bundle is built from `web/package-lock.json`. `web/build.mj
 
 ### Synthetic test audio
 
-`tests/fixtures/audio/sapi_stop.wav`, `tests/fixtures/audio/sapi_hello_can_you_hear_me.wav` and `tests/fixtures/audio/sapi_long_ocean_story.wav` are synthetic Windows SAPI speech, not human recordings. Their phrases, generator, PCM format, and SHA-256 values are recorded in `tests/fixtures/audio/README.md`. They are included in the source distribution, not the wheel.
+`tests/fixtures/audio/sapi_stop.wav`, `tests/fixtures/audio/sapi_hello_can_you_hear_me.wav`, `tests/fixtures/audio/sapi_long_ocean_story.wav`, `tests/fixtures/audio/sapi_task_dispatch.wav` and `tests/fixtures/audio/sapi_task_cancel.wav` are synthetic Windows SAPI speech, not human recordings. Their phrases, generator, PCM format, and SHA-256 values are recorded in `tests/fixtures/audio/README.md`. They are included in the source distribution, not the wheel.
 
 ## Required Python runtime dependencies
 
