@@ -68,6 +68,7 @@ def _worker_with_outcomes(
         authority: UserTurnAuthorityV1 | None = None,
         *,
         reservation: Any | None = None,
+        typed_input: Any | None = None,
     ) -> None:
         del turn_id, authority
         if reservation is not None:

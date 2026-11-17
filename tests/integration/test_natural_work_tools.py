@@ -615,6 +615,7 @@ class NaturalWorkRuntime:
             authority: object | None = None,
             *,
             reservation: object,
+            typed_input: object | None = None,
         ) -> None:
             del actions
             assert authority is None

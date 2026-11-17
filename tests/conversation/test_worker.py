@@ -373,6 +373,7 @@ def action_executor_probe() -> tuple[
         authority: UserTurnAuthorityV1 | None = None,
         *,
         reservation: Any | None = None,
+        typed_input: Any | None = None,
     ) -> None:
         del authority
         responses.append((turn_id, transcript))
@@ -418,6 +419,7 @@ def evidence_action_executor_probe() -> tuple[
         authority: UserTurnAuthorityV1,
         *,
         reservation: Any | None = None,
+        typed_input: Any | None = None,
     ) -> None:
         responses.append((turn_id, transcript, authority))
         if reservation is not None:
@@ -441,6 +443,7 @@ async def test_delete_quiesces_old_response_without_closing_binding() -> None:
         authority: UserTurnAuthorityV1 | None = None,
         *,
         reservation: Any | None = None,
+        typed_input: Any | None = None,
     ) -> None:
         del turn_id, transcript, authority
         started.set()
@@ -2626,6 +2629,7 @@ async def test_response_reservation_precedes_mutation_and_is_handed_to_executor(
         authority: UserTurnAuthorityV1 | None = None,
         *,
         reservation: Any | None = None,
+        typed_input: Any | None = None,
     ) -> None:
         del turn_id, transcript, authority
         assert reservation is not None
