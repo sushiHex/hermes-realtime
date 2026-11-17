@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import socket
 import sqlite3
+import threading
 import time
-import urllib.error
-import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -18,6 +19,10 @@ KNOWN = {"web_search", "web_extract", "mcp__vram__vram_status", "tool_search", "
 ROW_CAP = 512
 TEXT_CAP = 256 * 1024
 TOTAL_CAP = 2 * 1024 * 1024
+# One deadline for the whole read: status request, response and database. Progress never
+# extends it, and at expiry the status socket is shut down so a blocked read returns.
+READ_DEADLINE_SECONDS = 15.0
+STATUS_IDLE_SECONDS = 5.0
 
 
 def require(ok: bool, category: str) -> None:
@@ -102,14 +107,23 @@ def web_row_counts(rows: object, text_key: str, *, source_bound: bool, call_erro
 
 
 @contextmanager
-def connect_readonly(path: Path):
+def connect_readonly(path: Path, overall_deadline: float | None = None):
     require(path.is_file(), "witness_database_missing")
-    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
-    db.execute("PRAGMA query_only=ON")
     deadline = time.monotonic() + 3
-    db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+    if overall_deadline is not None:
+        deadline = min(deadline, overall_deadline)
+    remaining = deadline - time.monotonic()
+    require(remaining > 0, "witness_deadline")
+    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=min(2, remaining))
     try:
+        db.execute("PRAGMA query_only=ON")
+        db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
         yield db
+    except sqlite3.OperationalError:
+        # Interrupted by the deadline, or still locked when it came: a deadline refusal.
+        require(overall_deadline is None or time.monotonic() < overall_deadline,
+                "witness_deadline")
+        raise
     finally:
         db.close()
 
@@ -122,32 +136,66 @@ class NativeRunWitness:
         validate_origin(api_origin)
         self.api_bearer, self.run_id = api_bearer, run_id
         self.profile, self.api_origin = profile, api_origin.rstrip("/")
+        self._deadline = time.monotonic() + READ_DEADLINE_SECONDS
+
+    def _remaining(self) -> float:
+        remaining = self._deadline - time.monotonic()
+        require(remaining > 0, "witness_deadline")
+        return remaining
 
     def _status(self) -> dict:
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *args, **kwargs):
-                return None
-
-        request = urllib.request.Request(
-            self.api_origin + "/v1/runs/" + quote(self.run_id, safe=""),
-            headers={"Authorization": "Bearer " + self.api_bearer, "Accept": "application/json"},
-            method="GET",
+        # A plain loopback connection: no proxy, and a redirect is not followed (status != 200).
+        origin = urlsplit(self.api_origin)
+        # validate_origin admitted only the literal loopback host with an explicit port.
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", origin.port, timeout=min(STATUS_IDLE_SECONDS, self._remaining())
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        expired = threading.Event()
+
+        def expire() -> None:
+            expired.set()
+            sock = connection.sock
+            if sock is not None:
+                with suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+
+        timer: threading.Timer | None = None
+        failed = False
         try:
-            with opener.open(request, timeout=5) as response:
-                require(
-                    response.status == 200
-                    and response.headers.get_content_type() == "application/json",
-                    "witness_run_response",
+            try:
+                connection.connect()
+                timer = threading.Timer(self._remaining(), expire)
+                timer.daemon = True
+                timer.start()
+                connection.request(
+                    "GET",
+                    "/v1/runs/" + quote(self.run_id, safe=""),
+                    headers={
+                        "Authorization": "Bearer " + self.api_bearer,
+                        "Accept": "application/json",
+                    },
                 )
+                response = connection.getresponse()
+                status, content_type = response.status, response.headers.get_content_type()
                 raw = response.read(TEXT_CAP + 1)
-        except (OSError, urllib.error.URLError):
-            raise ValueError("witness_run_http") from None
+            except (OSError, http.client.HTTPException):
+                failed = True
+            # A read cut short by the deadline is never taken for a short response.
+            require(not expired.is_set() and time.monotonic() < self._deadline,
+                    "witness_deadline")
+            if failed:
+                raise ValueError("witness_run_http")
+        finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join()
+            connection.close()
+        require(status == 200 and content_type == "application/json", "witness_run_response")
         require(len(raw) <= TEXT_CAP, "witness_run_bound")
         return object_json(raw.decode("utf-8"))
 
     def read(self) -> dict:
+        self._deadline = time.monotonic() + READ_DEADLINE_SECONDS
         status = self._status()
         require(
             status.get("object") == "hermes.run" and status.get("run_id") == self.run_id,
@@ -168,7 +216,7 @@ class NativeRunWitness:
             "pairSuccess": False,
             "toolTraceAvailable": False,
         }
-        with connect_readonly(self.profile / "state.db") as db:
+        with connect_readonly(self.profile / "state.db", self._deadline) as db:
             session = db.execute(
                 "SELECT source FROM sessions WHERE id=?", (self.run_id,)
             ).fetchall()

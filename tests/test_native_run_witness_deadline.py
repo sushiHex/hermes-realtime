@@ -139,6 +139,35 @@ def test_a_slow_status_response_ends_the_read_itself_at_the_deadline(
     assert '"category": "witness_deadline"' in capsys.readouterr().out
 
 
+def test_the_database_read_shares_the_one_deadline_and_is_not_restarted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(native_run_witness, "READ_DEADLINE_SECONDS", _DEADLINE, raising=False)
+    profile = _profile(tmp_path)
+    subject = NativeRunWitness("secret", RUN, profile=profile, api_origin="http://127.0.0.1:1")
+
+    def slow_status() -> dict:
+        time.sleep(_DEADLINE * 0.7)  # most of the budget goes on the status request
+        return {"object": "hermes.run", "run_id": RUN, "session_id": RUN, "status": "completed"}
+
+    subject._status = slow_status  # type: ignore[method-assign]
+    holder = sqlite3.connect(profile / "state.db")
+    holder.execute("BEGIN EXCLUSIVE")  # the database stays locked past the deadline
+    try:
+        started = time.monotonic()
+        with pytest.raises(ValueError, match="witness_deadline"):
+            subject.read()
+        elapsed = time.monotonic() - started
+    finally:
+        holder.rollback()
+        holder.close()
+    # The lock wait is cut at the overall deadline, not given a fresh two-second wait (which
+    # would end near 2.7 s). SQLite's busy wait overshoots its timeout by up to about 0.5 s
+    # on Windows, so the margin allows that and no more.
+    assert elapsed < _DEADLINE + 1.0
+    assert '"category": "witness_deadline"' in capsys.readouterr().out
+
+
 def test_a_prompt_status_response_still_reads_within_the_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
