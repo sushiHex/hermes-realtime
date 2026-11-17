@@ -246,7 +246,8 @@ TARGET's exclusivity (one pair, one matching final, no unbound foreground event)
 re-validated after the precondition wait and again at the first Stop speech frame; worker audio
 from an ambiguous window never qualifies TARGET (`journey_barge_ambiguous`). On any refusal the
 receipt keeps whatever evidence exists (a pure, bounded snapshot taken in `finally` before
-cleanup, which can neither change the verdict nor block cleanup). `targetInterrupted`,
+cleanup, which can neither change the verdict nor block cleanup: acceptance reads the validated
+trace, never the snapshot, and a failed snapshot sets `snapshotError`). `targetInterrupted`,
 `targetCompleted`, `postStopAudioMs`, `stopLatencyMs` and `quietTailMs` are null when that stage
 was never reached, so "not measured" is distinct from an observed false or zero.
 

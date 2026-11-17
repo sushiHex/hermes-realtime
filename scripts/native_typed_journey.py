@@ -1182,7 +1182,8 @@ class Journey:
             "playbackSilencedObserved": False, "postStopAudioMs": None,
             "quiescenceObserved": False, "quiescenceInconclusive": False,
             "freshReplyObserved": False, "stopLatencyMs": None, "quietTailMs": None,
-            "userPartialAtLeast3Alnum": False, **dict.fromkeys(_BARGE_COUNT_KEYS, 0),
+            "userPartialAtLeast3Alnum": False, "snapshotError": False,
+            **dict.fromkeys(_BARGE_COUNT_KEYS, 0),
         }
         trace, before_tasks, before_runs = await self._mic_quiet_start(
             voice,
@@ -1222,7 +1223,7 @@ class Journey:
                             int(round((meter.entered_at["after"] - tail_start) * 1000)), 0
                         )
             except Exception:  # evidence is best effort; the original outcome stands
-                pass
+                receipt["snapshotError"] = True  # the diagnostic metadata is unavailable
 
         try:
             await self._mic_ready(voice, trace, receipt)
@@ -1247,12 +1248,13 @@ class Journey:
 
             with contextlib.suppress(TimeoutError):
                 await self.wait(injectable, _BARGE_PRECONDITION_TIMEOUT)
-            receipt["targetAudioMsBeforeStop"] = meter.window_totals("response")[1]
+            audio_ms = meter.window_totals("response")[1]
+            receipt["targetAudioMsBeforeStop"] = audio_ms
             # Audio from an ambiguous window never qualifies TARGET.
             exclusive()
             # A TARGET that ended first can never show an interruption: inconclusive.
             require(not trace.target_terminal(), "journey_barge_target_terminal")
-            require(row["playable"] and receipt["targetAudioMsBeforeStop"] >= _BARGE_MIN_TARGET_MS,
+            require(row["playable"] and audio_ms >= _BARGE_MIN_TARGET_MS,
                     "journey_barge_precondition")
 
             def inject_start() -> None:
@@ -1306,7 +1308,8 @@ class Journey:
                 and trace.fresh_pairs() <= 1, "journey_barge_ambiguous")
         require(not target["completed"], "journey_barge_target_completed")
         require(target["interrupted"], "journey_barge_target_not_interrupted")
-        require(receipt["interruptEventObserved"], "journey_barge_no_interrupt_event")
+        # Acceptance reads the validated trace, never the best-effort receipt snapshot.
+        require(trace.interrupt_requested, "journey_barge_no_interrupt_event")
         require(set(tracker.tasks) == before_tasks and self.admissions == before_runs,
                 "journey_followup_dispatched")
         require(not meter.ambiguous, "journey_speak_audio_track")

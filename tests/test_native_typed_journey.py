@@ -3880,3 +3880,37 @@ def test_a_failing_evidence_snapshot_neither_changes_the_verdict_nor_blocks_clea
         return (journey.voice._idle_task, journey.tracker.speak, journey.voice.meter.window)
 
     assert asyncio.run(run()) == (None, None, "closed")
+
+
+def test_a_valid_barge_passes_even_when_the_evidence_snapshot_raises(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    class SnapshotOnlyFailure(dict):
+        def get(self, *args, **kwargs):  # used only by the best-effort snapshot
+            raise RuntimeError("snapshot failed")
+
+    original = client.BargeTrace.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.pairs = SnapshotOnlyFailure()
+
+    monkeypatch.setattr(client.BargeTrace, "__init__", init)
+    journey = barge_journey(tmp_path, monkeypatch)
+
+    async def run():
+        await asyncio.wait_for(journey.step(BARGE_STEP), 10)  # still passes
+        return (journey.voice._idle_task, journey.tracker.speak, journey.voice.meter.window)
+
+    assert asyncio.run(run()) == (None, None, "closed")  # cleanup ran
+    receipt = journey.speak_receipt
+    assert receipt["snapshotError"] is True  # the diagnostic metadata is flagged unavailable
+    assert receipt["quiescenceObserved"] is True and journey.media == [{"mediaIncarnation": 1}]
+    assert receipt["interruptEventObserved"] is False  # unavailable, not the verdict's source
+
+
+def test_the_snapshot_flag_is_false_when_the_snapshot_succeeds(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch)
+    barge(journey)
+    assert journey.speak_receipt["snapshotError"] is False
+    assert journey.speak_receipt["interruptEventObserved"] is True
