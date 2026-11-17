@@ -1177,11 +1177,11 @@ class Journey:
             "voiceActivityOrdered": False, "finalsCount": 0, "transcriptMatches": False,
             "pairBound": False, "cueAudioObserved": False, "quietGateMs": 0,
             "targetAudioMsBeforeStop": 0, "stopInjected": False, "stopVadObserved": False,
-            "stopFinalsCount": 0, "stopRecognized": False, "targetInterrupted": False,
-            "targetCompleted": False, "interruptEventObserved": False,
-            "playbackSilencedObserved": False, "postStopAudioMs": 0,
+            "stopFinalsCount": 0, "stopRecognized": False, "targetInterrupted": None,
+            "targetCompleted": None, "interruptEventObserved": False,
+            "playbackSilencedObserved": False, "postStopAudioMs": None,
             "quiescenceObserved": False, "quiescenceInconclusive": False,
-            "freshReplyObserved": False, "stopLatencyMs": 0, "quietTailMs": 0,
+            "freshReplyObserved": False, "stopLatencyMs": None, "quietTailMs": None,
             "userPartialAtLeast3Alnum": False, **dict.fromkeys(_BARGE_COUNT_KEYS, 0),
         }
         trace, before_tasks, before_runs = await self._mic_quiet_start(
@@ -1189,6 +1189,41 @@ class Journey:
             lambda prior, incarnation: BargeTrace(prior, target_words, incarnation, stop_words),
         )
         meter = voice.meter
+
+        def snapshot() -> None:
+            """Whatever evidence exists, as pure bounded metadata: no I/O, no await, and no
+            assumption that a stage was reached. Unreached target flags stay null. It never
+            raises, so it can neither change the verdict nor block cleanup."""
+            try:
+                row = None if trace.target is None else trace.pairs.get(trace.target)
+                if row is not None:
+                    receipt["targetInterrupted"] = bool(row["interrupted"])
+                    receipt["targetCompleted"] = bool(row["completed"])
+                if trace.inj_seq is None:
+                    receipt["targetAudioMsBeforeStop"] = meter.window_totals("response")[1]
+                receipt.update(
+                    stopVadObserved=trace.stop_started >= 1,
+                    stopFinalsCount=trace.stop_finals,
+                    stopRecognized=trace.stop_started >= 1 and trace.stop_finals == 1
+                    and trace.stop_matches,
+                    interruptEventObserved=trace.interrupt_requested,
+                    playbackSilencedObserved=trace.silenced,
+                    freshReplyObserved=trace.fresh_token,
+                    userPartialAtLeast3Alnum=trace.partial_alnum, **trace.counts,
+                )
+                if "quiesce" in meter.entered_at:
+                    receipt["postStopAudioMs"] = meter.window_totals("quiesce")[1]
+                    start = meter.entered_at["quiesce"]
+                    last = meter.last_by_window.get("quiesce")
+                    tail_start = start if last is None else max(start, last)
+                    receipt["stopLatencyMs"] = int(round((tail_start - start) * 1000))
+                    if "after" in meter.entered_at:
+                        receipt["quietTailMs"] = max(
+                            int(round((meter.entered_at["after"] - tail_start) * 1000)), 0
+                        )
+            except Exception:  # evidence is best effort; the original outcome stands
+                pass
+
         try:
             await self._mic_ready(voice, trace, receipt)
             await self._stream_bounded(voice, target_frames)
@@ -1198,6 +1233,13 @@ class Journey:
             pair, row = self._require_first_utterance(trace, receipt)
             trace.target = pair
 
+            def exclusive() -> None:
+                # The first-utterance exclusivity, re-validated after every poll so far: still
+                # one pair (TARGET), still one user final (its words were checked at binding),
+                # and no unbound foreground event.
+                require(trace.unbound == 0 and len(trace.pairs) == 1
+                        and trace.final_count == 1, "journey_barge_ambiguous")
+
             def injectable() -> bool:
                 return trace.target_terminal() or (
                     row["playable"] and meter.window_totals("response")[1] >= _BARGE_MIN_TARGET_MS
@@ -1206,6 +1248,8 @@ class Journey:
             with contextlib.suppress(TimeoutError):
                 await self.wait(injectable, _BARGE_PRECONDITION_TIMEOUT)
             receipt["targetAudioMsBeforeStop"] = meter.window_totals("response")[1]
+            # Audio from an ambiguous window never qualifies TARGET.
+            exclusive()
             # A TARGET that ended first can never show an interruption: inconclusive.
             require(not trace.target_terminal(), "journey_barge_target_terminal")
             require(row["playable"] and receipt["targetAudioMsBeforeStop"] >= _BARGE_MIN_TARGET_MS,
@@ -1215,6 +1259,7 @@ class Journey:
                 # Re-checked at the first speech frame: TARGET may have ended during the
                 # clip's leading silence. Abort before any Stop speech is sent.
                 require(not trace.target_terminal(), "journey_barge_target_terminal")
+                exclusive()  # and still exactly the first utterance, after every lead-in poll
                 trace.mark_injection(tracker.cursor)
                 receipt["targetAudioMsBeforeStop"] = meter.window_totals("response")[1]
                 receipt["stopInjected"] = True
@@ -1243,6 +1288,7 @@ class Journey:
             await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
             await self.poll()
         finally:
+            snapshot()  # first, synchronously: partial evidence survives any early refusal
             await voice.stop_idle()  # every exit path: cancel and settle the idle feeder
             meter.advance("closed")
             tracker.speak = None
@@ -1252,18 +1298,6 @@ class Journey:
         latency_ms = int(round((tail_start - start) * 1000))
         tail_ms = int(round((close - tail_start) * 1000))
         target = trace.target_row()
-        receipt.update(
-            stopVadObserved=trace.stop_started >= 1, stopFinalsCount=trace.stop_finals,
-            stopRecognized=trace.stop_started >= 1 and trace.stop_finals == 1
-            and trace.stop_matches,
-            targetInterrupted=target["interrupted"], targetCompleted=target["completed"],
-            interruptEventObserved=trace.interrupt_requested,
-            playbackSilencedObserved=trace.silenced,
-            postStopAudioMs=meter.window_totals("quiesce")[1],
-            freshReplyObserved=trace.fresh_token, stopLatencyMs=latency_ms,
-            quietTailMs=max(tail_ms, 0),
-            userPartialAtLeast3Alnum=trace.partial_alnum, **trace.counts,
-        )
         require(trace.stop_started >= 1, "journey_barge_stop_vad")
         require(trace.stop_finals == 1, "journey_barge_stop_finals")
         require(trace.stop_matches, "journey_barge_stop_transcript")

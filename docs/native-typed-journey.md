@@ -242,6 +242,14 @@ Every window edge is a client observation: events are seen through 50 ms polls a
 audio through a 200 ms `AudioSource` queue, so these are coarse bounds, not perceived speed,
 and no per-pair PCM lineage is inferred from poll timestamps.
 
+TARGET's exclusivity (one pair, one matching final, no unbound foreground event) is
+re-validated after the precondition wait and again at the first Stop speech frame; worker audio
+from an ambiguous window never qualifies TARGET (`journey_barge_ambiguous`). On any refusal the
+receipt keeps whatever evidence exists (a pure, bounded snapshot taken in `finally` before
+cleanup, which can neither change the verdict nor block cleanup). `targetInterrupted`,
+`targetCompleted`, `postStopAudioMs`, `stopLatencyMs` and `quietTailMs` are null when that stage
+was never reached, so "not measured" is distinct from an observed false or zero.
+
 The receipt also carries diagnostic counts of projected events after the injection cursor,
 which never change a verdict: `userPartialCount` (user `transcript_partial` events) with
 `userPartialAtLeast3Alnum` (a boolean evaluated in memory, never storing text),
