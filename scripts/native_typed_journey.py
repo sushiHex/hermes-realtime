@@ -86,6 +86,21 @@ _BARGE_COUNT_KEYS = (
     *_BARGE_KIND_COUNTS.values(), "userPartialCount",
     "interruptTargetCount", "interruptEmptyCount", "interruptOtherCount",
 )
+_TASK_DISPATCH_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "tests/fixtures/audio/sapi_task_dispatch.wav"
+)
+_TASK_DISPATCH_SHA256 = "1068ad9d4119dc34f04a6a8a725469bc067883d3e68403e62f02a37eccf4da77"
+_TASK_DISPATCH_WORDS = ("research", "european", "public", "transit", "funding", "and",
+                        "compare", "the", "major", "cities")
+_TASK_CANCEL_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "tests/fixtures/audio/sapi_task_cancel.wav"
+)
+_TASK_CANCEL_SHA256 = "f24ade6b163ccdafbbebf291cac8724811defecc328ebd260fd6f867c4208c69"
+_TASK_CANCEL_WORDS = ("actually", "stop", "that", "research", "i", "don", "t", "need", "it",
+                      "anymore")
+# Bounds for the spoken-delegation step: dispatch attribution, the quiet wait with the task
+# still active, and the observed cancellation of exactly TARGET.
+_TASK_DISPATCH_TIMEOUT, _TASK_QUIET_TIMEOUT, _TASK_CANCEL_TIMEOUT = 90.0, 90.0, 30.0
 _SPEAK_RATE, _SPEAK_FRAME_SAMPLES = 48_000, 480  # 10 ms mono frames
 _SPEAK_LEAD_FRAMES, _SPEAK_TRAIL_FRAMES = 30, 100  # bounded silence: 0.3 s and 1.0 s
 _SPEAK_FRAME_SECONDS = 0.01  # real-time pace
@@ -125,6 +140,16 @@ def load_barge_fixtures() -> tuple[
     target, _, _ = _load_clip(_BARGE_TARGET_FIXTURE, _BARGE_TARGET_SHA256)
     stop, first, end = _load_clip(_BARGE_STOP_FIXTURE, _BARGE_STOP_SHA256)
     return target, _BARGE_TARGET_WORDS, stop, (first, end), _BARGE_STOP_WORDS
+
+
+def load_task_fixtures() -> tuple[
+    tuple[bytes, ...], tuple[str, ...], tuple[bytes, ...], tuple[int, int], tuple[str, ...]
+]:
+    """The pinned spoken delegation and the pinned spoken cancellation: (dispatch frames,
+    dispatch words, cancel frames, cancel speech span [first, end) in frames, cancel words)."""
+    dispatch, _, _ = _load_clip(_TASK_DISPATCH_FIXTURE, _TASK_DISPATCH_SHA256)
+    cancel, first, end = _load_clip(_TASK_CANCEL_FIXTURE, _TASK_CANCEL_SHA256)
+    return dispatch, _TASK_DISPATCH_WORDS, cancel, (first, end), _TASK_CANCEL_WORDS
 
 
 def _load_clip(path: Path, sha256: str) -> tuple[tuple[bytes, ...], int, int]:
@@ -314,6 +339,85 @@ class BargeTrace(SpeakTrace):
                     else:
                         self.premature_fresh = True
             super().observe(kind, data, seq, pair)
+
+
+class TaskSpeakTrace(SpeakTrace):
+    """SpeakTrace for a spoken delegation followed by a spoken cancellation of TARGET.
+
+    Task events up to the cancellation's browser-event cursor go to ``task_log`` (the dispatch
+    attribution); later ones are attributed to the cancellation. Microphone input has no
+    typed admission, so attribution is by event order around the user finals. Identities stay
+    in memory; only booleans and counts leave it.
+    """
+
+    def __init__(self, prior: frozenset[tuple[str, int]], expected: tuple[str, ...],
+                 incarnation: int, cancel_words: tuple[str, ...]) -> None:
+        super().__init__(prior, expected, incarnation)
+        self.cancel_words = cancel_words
+        self.cancel_cursor: int | None = None
+        self.task_log: list[tuple[int, str, str, str]] = []  # (seq, kind, task, status)
+        self.task_overflow = False
+        self.target: str | None = None
+        self.cancel_started = 0
+        self.cancel_finals = 0
+        self.cancel_final_seq: int | None = None
+        self.cancel_matches = False
+        self.target_cancel_seq: int | None = None
+        self.cancel_stale = False
+        self.foreign_cancel = 0
+        self.competing_active = 0
+        # From the dispatch freeze to the cancel injection: further voice starts and unbound
+        # or replayed foreground events are unexpected input (user finals count in final_count).
+        self.frozen_seq: int | None = None
+        self.late_voice = 0
+        self.unexpected_foreground = 0
+
+    def mark_cancel(self, cursor: int) -> None:
+        self.cancel_cursor = cursor
+
+    def mark_frozen(self, cursor: int) -> None:
+        self.frozen_seq = cursor
+
+    def observe(self, kind: str, data: dict, seq: int, pair: tuple[str, int] | None) -> None:
+        post = self.cancel_cursor is not None and seq > self.cancel_cursor
+        if kind in {"task_state", "task_result"}:
+            task, status = data.get("taskId"), data.get("status")
+            if type(task) is str and type(status) is str:
+                if post:
+                    self._post_task(kind, task, status, seq)
+                elif len(self.task_log) < 128:
+                    self.task_log.append((seq, kind, task, status))
+                else:
+                    self.task_overflow = True
+            return
+        if not post:
+            if self.frozen_seq is not None and seq > self.frozen_seq:
+                if kind == "voice_activity_started":
+                    self.late_voice += 1
+                elif kind in _SPEAK_LIFECYCLE and (pair is None or pair in self.prior):
+                    self.unexpected_foreground += 1
+            super().observe(kind, data, seq, pair)
+        elif kind == "voice_activity_started":
+            self.cancel_started += 1
+        elif kind == "transcript_final" and data.get("role") == "user":
+            self.cancel_finals += 1
+            if self.cancel_finals == 1:
+                self.cancel_final_seq = seq
+                self.cancel_matches = _speak_words(data.get("text")) == self.cancel_words
+
+    def _post_task(self, kind: str, task: str, status: str, seq: int) -> None:
+        cancelling = kind == "task_state" and status in {"cancelling", "interrupted"}
+        if task == self.target:
+            if cancelling and self.target_cancel_seq is None:
+                # Only a cancellation after the cancel final is attributed to it.
+                if self.cancel_final_seq is not None and seq > self.cancel_final_seq:
+                    self.target_cancel_seq = seq
+                else:
+                    self.cancel_stale = True
+        elif cancelling:
+            self.foreign_cancel += 1
+        elif status == "active":
+            self.competing_active += 1
 
 
 class WorkerAudioMeter:
@@ -555,19 +659,24 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
             and LABEL.fullmatch(label) is not None
             and label not in labels
             and kind in {"dispatch", "status", "recall", "cancel", "natural_cancel",
-                         "conversation", "speak", "speak_barge"},
+                         "conversation", "speak", "speak_barge", "speak_task"},
             "journey_step_identity",
         )
         labels.add(label)
         if kind == "cancel":
             require(set(step) == {"label", "kind", "task"}, "journey_cancel_shape")
-        elif kind in {"speak", "speak_barge"}:
+        elif kind in {"speak", "speak_barge", "speak_task"}:
             # One fixed pinned synthetic clip set, once: no text, task or repeat. A barge and a
             # plain speak share the one microphone track, so a scenario holds only one of them.
             require(set(step) == {"label", "kind"}, "journey_speak_shape")
             require(not speaking, "journey_speak_count")
             speaking = True
-            load_barge_fixtures() if kind == "speak_barge" else load_speak_fixture()
+            if kind == "speak_barge":
+                load_barge_fixtures()
+            elif kind == "speak_task":
+                load_task_fixtures()
+            else:
+                load_speak_fixture()
             continue
         else:
             require(
@@ -1368,10 +1477,208 @@ class Journey:
         require(not voice.meter.ambiguous, "journey_speak_audio_track")
         require(agent_ms >= _SPEAK_MIN_AUDIO_MS, "journey_speak_no_audio")
 
+    def _require_task_dispatch(
+        self, trace: TaskSpeakTrace, receipt: dict[str, Any],
+        before_tasks: set[str], before_runs: set[str],
+    ) -> tuple[str, str]:
+        """The spoken delegation produced exactly one new task and one new admission, bound to
+        this step's user final by event order, with nothing stale or replayed."""
+        tracker = self.tracker
+        first = trace.first_final
+        ordered = (trace.started is not None and trace.ended is not None
+                   and trace.started < trace.ended
+                   and (first is None or first[0] > trace.started))
+        receipt.update(
+            voiceActivityOrdered=ordered, dispatchFinalsCount=trace.final_count,
+            dispatchTranscriptMatches=first is not None and first[1],
+        )
+        require(ordered, "journey_speak_voice_activity")
+        require(trace.final_count == 1, "journey_speak_finals")
+        require(receipt["dispatchTranscriptMatches"], "journey_speak_transcript")
+        assert first is not None
+        new_tasks = set(tracker.tasks) - before_tasks
+        new_runs = self.admissions - before_runs
+        receipt.update(dispatchTasks=len(new_tasks), dispatchAdmissions=len(new_runs))
+        require(not trace.task_overflow, "journey_task_competing")
+        replayed = any(kind == "task_state" and status == "active" and task in before_tasks
+                       for _, kind, task, status in trace.task_log)
+        require(not replayed, "journey_task_replayed")
+        require(bool(new_tasks) and bool(new_runs), "journey_task_not_dispatched")
+        require(len(new_tasks) == 1 and len(new_runs) == 1, "journey_task_competing")
+        target, run = next(iter(new_tasks)), next(iter(new_runs))
+        rows = [row for row in trace.task_log if row[2] == target]
+        receipt["taskBound"] = bool(rows) and (
+            rows[0][1] == "task_state" and rows[0][3] == "active" and rows[0][0] > first[0]
+        )
+        require(receipt["taskBound"], "journey_task_dispatch_unbound")
+        return target, run
+
+    def _own_single_dispatch(self, label: str, before_tasks: set[str],
+                             before_runs: set[str]) -> None:
+        """Own the one new task and run as soon as they are unambiguous, whatever the verdict.
+
+        Called on every exit so a later failure still lets cleanup cancel exactly that task by
+        id. With zero or several candidates nothing is guessed: cleanup stays honestly false.
+        """
+        new_tasks = set(self.tracker.tasks) - before_tasks
+        new_runs = self.admissions - before_runs
+        if label not in self.bindings and len(new_tasks) == 1 and len(new_runs) == 1:
+            self.bindings[label] = (next(iter(new_tasks)), next(iter(new_runs)))
+
+    async def speak_task(self, step: dict) -> None:
+        try:
+            await self._speak_task(step)
+        finally:
+            # The trace stays live through witness collection and the final poll.
+            self.tracker.speak = None
+
+    async def _speak_task(self, step: dict) -> None:
+        """Delegate by voice, then cancel that exact task by voice.
+
+        Microphone input has no typed admission, so attribution is by event order: the
+        dispatch is one new task and one new admission whose first active state follows the
+        dispatch final; TARGET is that task and run, frozen. Once the session is quiet with
+        TARGET still active, a natural spoken cancellation is injected. At its first speech
+        frame TARGET must still be the sole live task with no competing admission, otherwise
+        the result is inconclusive (journey_task_target_terminal); no replacement is chosen.
+        The cancellation counts only if TARGET itself is observed cancelling or interrupted
+        after that final and the native witness, read before cleanup, says cancelled.
+        """
+        voice, tracker = self.voice, self.tracker
+        require(voice is not None, "journey_speak_unavailable")
+        assert voice is not None
+        dispatch, dispatch_words, cancel, (cancel_first, _), cancel_words = load_task_fixtures()
+        label = step["label"]
+        receipt = self.speak_receipt = {
+            "label": label, "kind": "speak_task", "mediaRequests": 0,
+            "voiceActivityOrdered": False, "dispatchFinalsCount": 0,
+            "dispatchTranscriptMatches": False, "dispatchTasks": 0, "dispatchAdmissions": 0,
+            "taskBound": False, "cueAudioObserved": False, "quietGateMs": 0,
+            "preCancelQuietMs": 0, "targetActiveBeforeCancel": False, "cancelInjected": False,
+            "cancelVadObserved": False, "cancelFinalsCount": 0,
+            "cancelTranscriptMatches": False, "cancelObserved": False,
+            "foreignCancelCount": 0, "competingAdmissionCount": 0,
+            "nativeCancelledBeforeCleanup": False, "unexpectedInputCount": 0,
+        }
+        trace, before_tasks, before_runs = await self._mic_quiet_start(
+            voice,
+            lambda prior, incarnation: TaskSpeakTrace(
+                prior, dispatch_words, incarnation, cancel_words
+            ),
+        )
+        meter = voice.meter
+        target = run = ""
+        try:
+            await self._mic_ready(voice, trace, receipt)
+            await self._stream_bounded(voice, dispatch)
+            with contextlib.suppress(TimeoutError):
+                await self.wait(
+                    lambda: trace.first_final is not None
+                    and bool(set(tracker.tasks) - before_tasks)
+                    and bool(self.admissions - before_runs),
+                    _TASK_DISPATCH_TIMEOUT,
+                )
+            self._own_single_dispatch(label, before_tasks, before_runs)
+            target, run = self._require_task_dispatch(trace, receipt, before_tasks, before_runs)
+            trace.target = target
+            trace.mark_frozen(tracker.cursor)
+
+            def exclusive() -> None:
+                # Exactly one matching dispatch final, and no further input or replayed
+                # foreground, from the freeze through the cancel injection.
+                receipt["dispatchFinalsCount"] = trace.final_count
+                require(trace.final_count == 1, "journey_speak_finals")
+                receipt["unexpectedInputCount"] = trace.late_voice + trace.unexpected_foreground
+                require(trace.late_voice == 0 and trace.unexpected_foreground == 0,
+                        "journey_task_unexpected_input")
+            # Quiet session with TARGET still active: no open turn, no pending admission and
+            # one whole quiet interval since the dispatch settled. Client clock only.
+            entry = meter.now()
+            try:
+                await self.wait(
+                    lambda: tracker.tasks.get(target) in TERMINAL
+                    or (not tracker.open_turns and self.pending == 0
+                        and meter.quiet_since(entry, _SPEAK_SETTLE_SECONDS)),
+                    _TASK_QUIET_TIMEOUT,
+                )
+            except TimeoutError:
+                require(False, "journey_task_not_quiet")
+            receipt["preCancelQuietMs"] = int((meter.now() - entry) * 1000)
+            require(tracker.tasks.get(target) not in TERMINAL, "journey_task_target_terminal")
+            require(tracker.tasks.get(target) == "active", "journey_task_not_active")
+            exclusive()
+            receipt["targetActiveBeforeCancel"] = True
+
+            def inject_start() -> None:
+                # Re-checked at the first speech frame, after the clip's leading silence.
+                status = tracker.tasks.get(target)
+                require(status not in TERMINAL, "journey_task_target_terminal")
+                require(status == "active", "journey_task_cancel_stale")
+                exclusive()
+                live = {task for task, state in tracker.tasks.items() if state not in TERMINAL}
+                require(live == {target} and set(tracker.tasks) - before_tasks == {target}
+                        and self.admissions - before_runs == {run} and self.pending == 0,
+                        "journey_task_competing")
+                trace.mark_cancel(tracker.cursor)
+                receipt["cancelInjected"] = True
+
+            await self._stream_bounded(voice, cancel, {cancel_first: inject_start})
+            with contextlib.suppress(TimeoutError):
+                await self.wait(
+                    lambda: trace.target_cancel_seq is not None
+                    or tracker.tasks.get(target) in TERMINAL,
+                    _TASK_CANCEL_TIMEOUT,
+                )
+            await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
+            await self.poll()
+        finally:
+            self._own_single_dispatch(label, before_tasks, before_runs)  # before any cleanup
+            await voice.stop_idle()  # every exit path: cancel and settle the idle feeder
+            meter.advance("closed")
+
+        def validate_cancellation() -> None:
+            # One bounded validate-and-snapshot of the cancellation: its input (a voice start,
+            # exactly one final with the exact words) and its scope (nothing foreign cancelled,
+            # no competing task or admission). The counts are refreshed into the receipt first,
+            # so a refusal keeps them. Run before, and again after, the witness read and the
+            # final poll, with the trace still live.
+            extra_admissions = len(self.admissions - before_runs - {run})
+            receipt.update(
+                cancelVadObserved=trace.cancel_started >= 1,
+                cancelFinalsCount=trace.cancel_finals,
+                cancelTranscriptMatches=trace.cancel_matches,
+                cancelObserved=trace.target_cancel_seq is not None,
+                foreignCancelCount=trace.foreign_cancel,
+                competingAdmissionCount=trace.competing_active + extra_admissions,
+            )
+            require(trace.cancel_started >= 1, "journey_task_cancel_vad")
+            require(trace.cancel_finals == 1, "journey_task_cancel_finals")
+            require(trace.cancel_matches, "journey_task_cancel_transcript")
+            require(trace.foreign_cancel == 0, "journey_task_foreign_cancel")
+            require(trace.competing_active == 0 and extra_admissions == 0,
+                    "journey_task_competing")
+            require(not trace.cancel_stale, "journey_task_cancel_stale")
+
+        validate_cancellation()
+        require(trace.target_cancel_seq is not None, "journey_task_cancel_unobserved")
+        # The native witness is read here, before cleanup: cleanup never supplies evidence.
+        await self.collect(label)
+        require(self.results[label]["terminal"] == "cancelled", "journey_cancel_unproven")
+        receipt["nativeCancelledBeforeCleanup"] = True
+        await self.poll()  # a late dispatch or foreign cancel would show here
+        validate_cancellation()  # re-checked after the witness read and the final poll
+        require(set(tracker.tasks) == before_tasks | {target}
+                and self.admissions - before_runs == {run}, "journey_followup_dispatched")
+
     async def step(self, step: dict) -> None:
         kind, label = step["kind"], step["label"]
-        if kind in {"speak", "speak_barge"}:
-            await (self.speak_barge(step) if kind == "speak_barge" else self.speak(step))
+        if kind in {"speak", "speak_barge", "speak_task"}:
+            if kind == "speak_barge":
+                await self.speak_barge(step)
+            elif kind == "speak_task":
+                await self.speak_task(step)
+            else:
+                await self.speak(step)
             return
         if kind == "recall":
             await self.collect(step["task"])
@@ -1534,7 +1841,8 @@ async def execute(options, steps, receipt) -> None:
             ),
             15,
         )
-        if any(step.get("kind") in {"speak", "speak_barge"} for step in steps):
+        if any(step.get("kind") in {"speak", "speak_barge", "speak_task"}
+               for step in steps):
             # Subscribe only to the worker's audio, by the identity validated above.
             journey.voice = SyntheticVoice(rtc, room, credential["workerIdentity"])
             journey.voice.meter.start()
