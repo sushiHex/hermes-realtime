@@ -211,6 +211,37 @@ window. More than one final, an unbound or concurrent turn, a missing pair or no
 fails. The receipt's `speak` object holds booleans and counts only: no transcript text,
 identity or audio.
 
+### `speak_barge`
+
+A `speak_barge` step (also exactly `label` and `kind`; a scenario holds one microphone step,
+`speak` or `speak_barge`) first runs the same flow with the pinned request
+`sapi_long_ocean_story.wav` (`Please tell me a long story about the ocean.`). The one new
+token-bound pair is TARGET. Only once TARGET has `first_playable_audio`, is still running and
+has at least 1500 ms of worker audio in its window does it inject the pinned `sapi_stop.wav`
+(`Stop.`) on the same track, under the same stream bound. If TARGET ends first the step is
+inconclusive (`journey_barge_target_terminal`); it never claims an interruption.
+
+It passes only when all of these hold: a fresh voice start after injection and exactly one new
+user final with the Stop words; for TARGET's exact pair, `interrupt_requested` for its turn
+and/or `playback_silenced`, plus `assistant_turn_interrupted`, and no `assistant_turn_completed`
+through the final drain; no other pair active while TARGET runs and at most one fresh pair;
+no new task; and audio quiescence. Quiescence is a window from injection end that closes at the
+earlier of a fresh pair's first token or a bounded drain (the 1500 ms budget plus the 500 ms
+quiet interval). Worker audio must stop within 1500 ms of injection end and then stay silent
+for a whole 500 ms observed interval. If a fresh reply closes the window before that interval
+is observable, quiescence is inconclusive (`journey_barge_quiescence_inconclusive`) and the step
+does not pass. Audio after a fresh token is not counted against TARGET. These thresholds are
+declared constants, never tuned to pass.
+
+The receipt keeps booleans, counts and client-local milliseconds (`targetAudioMsBeforeStop`,
+`stopInjected`, `stopRecognized`, `targetInterrupted`, `targetCompleted`,
+`interruptEventObserved`, `postStopAudioMs`, `quiescenceObserved`, `quiescenceInconclusive`,
+`freshReplyObserved`, `stopLatencyMs`). `stopLatencyMs` is the time from the end of the injected
+Stop speech to the last non-silent worker frame observed in the quiescence window (0 if none).
+Every window edge is a client observation: events are seen through 50 ms polls and injected
+audio through a 200 ms `AudioSource` queue, so these are coarse bounds, not perceived speed,
+and no per-pair PCM lineage is inferred from poll timestamps.
+
 This is a controlled synthetic path. It bypasses the physical microphone and acoustic
 echo cancellation. It does not prove source-attributed microphone qualification or the
 naturalness of the conversation.

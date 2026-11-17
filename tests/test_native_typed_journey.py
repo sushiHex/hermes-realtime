@@ -2713,7 +2713,11 @@ def test_media_route_is_allowed_on_the_v1_endpoint(monkeypatch):
         client.request_json("http://127.0.0.1:1", "audio-diagnostic")
 
 
-def test_execute_gives_a_speak_journey_exactly_the_worker_bound_voice(tmp_path, monkeypatch):
+@pytest.mark.parametrize("scenario_step", [SPEAK_STEP, {"label": "stop", "kind": "speak_barge"}],
+                         ids=["speak", "speak_barge"])
+def test_execute_gives_a_speak_journey_exactly_the_worker_bound_voice(
+    tmp_path, monkeypatch, scenario_step
+):
     import hashlib
     import sys
 
@@ -2763,7 +2767,7 @@ def test_execute_gives_a_speak_journey_exactly_the_worker_bound_voice(tmp_path, 
     monkeypatch.setattr(client.Journey, "step", step)
     receipt = {"outcome": "refused"}
     with pytest.raises(ValueError, match="journey_stop_here"):
-        asyncio.run(client.execute(options, [SPEAK_STEP], receipt))
+        asyncio.run(client.execute(options, [scenario_step], receipt))
     voice = seen[0]
     assert voice.meter.worker_identity == credential["workerIdentity"]
     assert rooms[0].options == {"auto_subscribe": False}
@@ -3148,3 +3152,361 @@ def test_a_failed_warmup_fails_the_step_even_when_readiness_arrives_without_it(
     idle, trace, window, frames = asyncio.run(run())
     assert idle is None and trace is None and window == "closed"
     assert not any(any(frame.data) for frame in frames)  # the clip was never streamed
+
+# Synthetic barge-in `speak_barge` step (#237): a long reply is requested, then the pinned
+# Stop clip is injected over it on the same microphone track. Controlled synthetic path only.
+
+BARGE_STEP = {"label": "stop", "kind": "speak_barge"}
+TARGET_PAIR = {"turnId": "target_turn", "turnGeneration": 1}
+FRESH_PAIR = {"turnId": "fresh_turn", "turnGeneration": 1}
+OTHER_PAIR = {"turnId": "other_turn", "turnGeneration": 1}
+LONG_TEXT = "Please tell me a long story about the ocean."
+CLOCK_STEP = 0.25  # fake client seconds per events poll
+
+
+def user_say(text):
+    return ("transcript_final", {"role": "user", "text": text})
+
+
+def barge_pre(*, playable=True, complete=False, text=LONG_TEXT):
+    token = [("first_foreground_token", TARGET_PAIR), ("assistant_text_generated", TARGET_PAIR)]
+    if playable:
+        token.append(("first_playable_audio", TARGET_PAIR))
+    if complete:
+        token.append(("assistant_turn_completed", TARGET_PAIR))
+    return [
+        [], [("voice_input_ready", READY)],
+        [("voice_activity_started", {}), ("voice_activity_ended", {}), user_say(text)],
+        token,
+    ]
+
+
+def barge_post(*, vad=True, finals=("Stop.",), interrupt=True, silenced=True, interrupted=True,
+               completed=False, extra=(), request_turn="target_turn", merge=False):
+    first = [("voice_activity_started", {})] if vad else []
+    second = [("voice_activity_ended", {}), *[user_say(text) for text in finals]]
+    if interrupt:
+        second.append(("interrupt_requested", {"turnId": request_turn}))
+    if silenced:
+        second.append(("playback_silenced", {}))
+    if interrupted:
+        second.append(("assistant_turn_interrupted", TARGET_PAIR))
+    if completed:
+        second.append(("assistant_turn_completed", TARGET_PAIR))
+    if merge:  # everything arrives on the first post-injection poll
+        return [first + second, *extra]
+    return [first, second, *extra]
+
+
+def fresh_token(pair=FRESH_PAIR):
+    return [("first_foreground_token", pair), ("assistant_text_generated", pair)]
+
+
+def barge_journey(tmp_path, monkeypatch, *, pre=None, post=None, response_frames=3,
+                  quiesce_audio_polls=0, after_frames=0):
+    """A Journey with a fake mic transport and a state-driven fake host.
+
+    Events before the Stop's injection start come from ``pre``; afterwards from ``post``, one
+    batch per poll. Worker audio is injected per poll by window: ``response_frames`` while
+    TARGET plays, ``quiesce_audio_polls`` polls of audio right after the injection ends, and
+    ``after_frames`` once the quiescence window has closed. The client clock is fake and
+    advances CLOCK_STEP per poll, so every timing assertion is exact.
+    """
+    import scripts.native_typed_journey as client
+
+    for name, value in {
+        "_SPEAK_FRAME_SECONDS": 0.0, "_SPEAK_DRAIN_SECONDS": 0.0, "_SPEAK_TURN_TIMEOUT": 1.0,
+        "_SPEAK_SETTLE_TIMEOUT": 0.5, "_SPEAK_READY_TIMEOUT": 1.0, "_SPEAK_SETTLE_SECONDS": 0.0,
+        "_BARGE_MIN_TARGET_MS": 50, "_BARGE_BUDGET_MS": 500, "_BARGE_QUIET_MS": 400,
+        "_BARGE_PRECONDITION_TIMEOUT": 0.4, "_BARGE_INTERRUPT_TIMEOUT": 1.0,
+    }.items():
+        monkeypatch.setattr(client, name, value)
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              api_origin="http://127.0.0.1:1")
+    journey = Journey(options, {"expiresInSeconds": 3600}, "secret")
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+    rtc, room = fake_rtc(), FakeRoom()
+    journey.voice = client.SyntheticVoice(rtc, room, SPEAK_WORKER)
+    meter = journey.voice.meter
+    now, cursor, quiesce_polls = [1000.0], [1], [0]
+    meter._clock = lambda: now[0]
+    queues = {"pre": list(barge_pre() if pre is None else pre),
+              "post": list(barge_post() if post is None else post)}
+    journey.media, journey.rtc, journey.room = [], rtc, room
+
+    async def request(route, payload=None):
+        if route == "media":
+            journey.media.append(payload)
+            return {"mediaIncarnation": payload["mediaIncarnation"], "version": 1}
+        assert route == "events"
+        now[0] += CLOCK_STEP
+        window = meter.window
+        frames = 0
+        if window == "response":
+            frames = response_frames
+        elif window == "quiesce":
+            quiesce_polls[0] += 1
+            frames = 3 if quiesce_polls[0] <= quiesce_audio_polls else 0
+        elif window == "after":
+            frames = after_frames
+        for _ in range(frames):
+            meter.observe(fake_frame(8000))
+        queue = queues["post" if window in {"stop", "quiesce", "after"} else "pre"]
+        rows = numbered(queue.pop(0) if queue else [], cursor[0])
+        cursor[0] += len(rows)
+        return {"version": 2, "events": rows}
+
+    journey.request = request
+    return journey
+
+
+def barge(journey, seconds=10):
+    asyncio.run(asyncio.wait_for(journey.step(BARGE_STEP), seconds))
+
+
+def refused(journey, category):
+    with pytest.raises(ValueError, match=category):
+        barge(journey)
+    return journey.speak_receipt
+
+
+def test_barge_passes_when_stop_is_recognized_target_is_interrupted_and_audio_goes_quiet(
+    tmp_path, monkeypatch
+):
+    journey = barge_journey(tmp_path, monkeypatch)
+    barge(journey)
+    receipt = journey.speak_receipt
+    assert receipt["stopInjected"] and receipt["stopRecognized"]
+    assert receipt["targetInterrupted"] is True and receipt["targetCompleted"] is False
+    assert receipt["interruptEventObserved"] is True
+    assert receipt["quiescenceObserved"] is True and receipt["quiescenceInconclusive"] is False
+    assert receipt["freshReplyObserved"] is False
+    assert receipt["targetAudioMsBeforeStop"] >= 50
+    assert receipt["postStopAudioMs"] == 0 and receipt["stopLatencyMs"] == 0
+    assert receipt["quietTailMs"] >= 400
+
+
+def test_barge_uses_one_track_one_media_request_and_both_pinned_clips(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    journey = barge_journey(tmp_path, monkeypatch)
+    barge(journey)
+    target, _, stop, _, _ = client.load_barge_fixtures()
+    assert journey.media == [{"mediaIncarnation": 1}]
+    assert len(journey.room.published) == 1
+    pcm = [frame.data for frame in journey.room.published[0][0].source.frames]
+    assert pcm == list(target) + list(stop)
+
+
+def test_barge_receipt_is_metadata_only(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch)
+    barge(journey)
+    raw = json.dumps(journey.speak_receipt).lower()
+    for private in ("ocean", "stop.", "target_turn", "story"):
+        assert private not in raw
+    assert all(type(value) in {bool, int, str} for value in journey.speak_receipt.values())
+
+
+def test_barge_measures_stop_latency_from_injection_end_on_the_client_clock(
+    tmp_path, monkeypatch
+):
+    journey = barge_journey(tmp_path, monkeypatch, quiesce_audio_polls=2)
+    barge(journey)
+    receipt = journey.speak_receipt
+    assert receipt["stopLatencyMs"] == 500  # last audio two polls (2 x 250 ms) after the end
+    assert receipt["postStopAudioMs"] == 60
+    assert receipt["quiescenceObserved"] is True
+
+
+def test_barge_declared_thresholds_are_the_reviewed_values():
+    import scripts.native_typed_journey as client
+
+    assert (client._BARGE_MIN_TARGET_MS, client._BARGE_BUDGET_MS, client._BARGE_QUIET_MS) == (
+        1500, 1500, 500
+    )
+
+
+def test_a_target_that_ends_first_is_inconclusive_and_nothing_is_injected(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, pre=barge_pre(complete=True))
+    receipt = refused(journey, "journey_barge_target_terminal")
+    assert receipt["stopInjected"] is False and receipt["targetInterrupted"] is False
+    import scripts.native_typed_journey as client
+
+    # Only the first clip was ever streamed.
+    assert len(journey.room.published[0][0].source.frames) == len(
+        client.load_barge_fixtures()[0]
+    )
+
+
+def test_stop_is_not_injected_before_target_has_enough_audio(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, response_frames=0)
+    receipt = refused(journey, "journey_barge_precondition")
+    assert receipt["stopInjected"] is False
+
+
+def test_stop_is_not_injected_before_target_is_playable(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, pre=barge_pre(playable=False))
+    receipt = refused(journey, "journey_barge_precondition")
+    assert receipt["stopInjected"] is False
+
+
+def test_stop_needs_a_fresh_voice_start_after_injection(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, post=barge_post(vad=False))
+    receipt = refused(journey, "journey_barge_stop_vad")
+    assert receipt["stopInjected"] is True and receipt["stopRecognized"] is False
+
+
+@pytest.mark.parametrize("finals,category", [
+    ((), "journey_barge_stop_finals"),
+    (("Stop.", "Stop."), "journey_barge_stop_finals"),
+    (("Go on.",), "journey_barge_stop_transcript"),
+    (("Stop it now.",), "journey_barge_stop_transcript"),
+])
+def test_stop_needs_exactly_one_final_with_the_exact_words(tmp_path, monkeypatch, finals, category):
+    journey = barge_journey(tmp_path, monkeypatch, post=barge_post(finals=finals))
+    assert refused(journey, category)["stopRecognized"] is False
+
+
+def test_stop_words_are_normalized_by_case_and_punctuation_only(tmp_path, monkeypatch):
+    barge(barge_journey(tmp_path, monkeypatch, post=barge_post(finals=("STOP!",))))
+
+
+def test_an_interruption_of_a_different_turn_is_ambiguous(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, post=barge_post(request_turn="other_turn"))
+    refused(journey, "journey_barge_ambiguous")
+
+
+def test_an_interrupt_request_for_another_generation_is_ambiguous(tmp_path, monkeypatch):
+    post = barge_post(interrupt=False)
+    post[1].append(("interrupt_requested", {"turnId": "target_turn", "turnGeneration": 2}))
+    refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_barge_ambiguous")
+
+
+def test_another_pair_active_while_target_is_running_is_ambiguous(tmp_path, monkeypatch):
+    post = barge_post(interrupted=False, completed=False)
+    post[0].extend(fresh_token(OTHER_PAIR))  # a second pair starts before TARGET ends
+    post[1].append(("assistant_turn_interrupted", TARGET_PAIR))
+    refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_barge_ambiguous")
+
+
+def test_two_fresh_pairs_are_ambiguous(tmp_path, monkeypatch):
+    post = barge_post(extra=(fresh_token(), fresh_token(OTHER_PAIR)))
+    refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_barge_ambiguous")
+
+
+def test_an_unbound_assistant_terminal_after_injection_is_ambiguous(tmp_path, monkeypatch):
+    post = barge_post()
+    post[1].append(("assistant_turn_completed", {}))
+    refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_barge_ambiguous")
+
+
+def test_a_target_that_completes_is_never_an_interruption(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, post=barge_post(interrupted=False,
+                                                                   completed=True))
+    receipt = refused(journey, "journey_barge_target_completed")
+    assert receipt["targetCompleted"] is True and receipt["targetInterrupted"] is False
+
+
+def test_a_target_that_both_interrupts_and_completes_fails(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, post=barge_post(completed=True))
+    refused(journey, "journey_barge_target_completed")
+
+
+def test_a_target_that_is_never_interrupted_fails(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, post=barge_post(interrupted=False))
+    receipt = refused(journey, "journey_barge_target_not_interrupted")
+    assert receipt["targetInterrupted"] is False
+
+
+def test_the_exact_pair_interruption_needs_an_interrupt_or_silence_event(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch,
+                            post=barge_post(interrupt=False, silenced=False))
+    receipt = refused(journey, "journey_barge_no_interrupt_event")
+    assert receipt["interruptEventObserved"] is False
+
+
+@pytest.mark.parametrize("interrupt,silenced", [(True, False), (False, True)])
+def test_either_interrupt_event_alone_suffices(tmp_path, monkeypatch, interrupt, silenced):
+    post = barge_post(interrupt=interrupt, silenced=silenced)
+    barge(barge_journey(tmp_path, monkeypatch, post=post))
+
+
+def test_audio_that_continues_past_the_budget_fails(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, quiesce_audio_polls=3)
+    receipt = refused(journey, "journey_barge_audio_continued")
+    assert receipt["stopLatencyMs"] == 750 and receipt["quiescenceObserved"] is False
+
+
+def test_a_fresh_reply_before_a_whole_quiet_interval_is_inconclusive_not_a_pass(
+    tmp_path, monkeypatch
+):
+    post = barge_post(merge=True)  # the fresh token arrives on the first quiesce poll
+    post[0].extend(fresh_token())
+    journey = barge_journey(tmp_path, monkeypatch, post=post, after_frames=3)
+    receipt = refused(journey, "journey_barge_quiescence_inconclusive")
+    assert receipt["quiescenceInconclusive"] is True and receipt["quiescenceObserved"] is False
+    assert receipt["freshReplyObserved"] is True
+
+
+def test_a_fresh_reply_after_a_whole_quiet_interval_passes_and_its_audio_is_not_counted(
+    tmp_path, monkeypatch
+):
+    post = barge_post(extra=([], fresh_token()))  # fresh token on the second quiesce poll
+    journey = barge_journey(tmp_path, monkeypatch, post=post, after_frames=3)
+    barge(journey)
+    receipt = journey.speak_receipt
+    assert receipt["freshReplyObserved"] is True and receipt["quiescenceObserved"] is True
+    assert receipt["postStopAudioMs"] == 0  # audio after the fresh token is the fresh pair's
+
+
+def test_a_fresh_pair_that_precedes_its_interruption_in_order_is_ambiguous(tmp_path, monkeypatch):
+    post = barge_post(interrupted=False, merge=True)
+    post[0].extend(fresh_token())
+    post[0].append(("assistant_turn_interrupted", TARGET_PAIR))  # after the fresh token
+    refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_barge_ambiguous")
+
+
+def test_barge_refuses_new_work(tmp_path, monkeypatch):
+    post = barge_post()
+    post[1].append(("task_state", {"taskId": "task_new_barge", "status": "active"}))
+    refused(barge_journey(tmp_path, monkeypatch, post=post), "journey_followup_dispatched")
+
+
+def test_barge_refuses_an_ambiguous_worker_track(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch)
+    journey.voice.meter.ambiguous = True
+    refused(journey, "journey_speak_audio_track")
+
+
+def test_barge_refuses_a_first_utterance_that_is_not_the_exact_request(tmp_path, monkeypatch):
+    journey = barge_journey(tmp_path, monkeypatch, pre=barge_pre(text="Hello there"))
+    receipt = refused(journey, "journey_speak_transcript")
+    assert receipt["stopInjected"] is False
+
+
+def test_scenario_accepts_one_barge_step_and_never_a_second_microphone_step(tmp_path):
+    def scenario(*steps):
+        path = tmp_path / "barge.json"
+        path.write_text(json.dumps({"version": 1, "steps": list(steps)}), encoding="utf-8")
+        return load_scenario(path)
+
+    assert scenario({"label": "stop", "kind": "speak_barge"})[0]["kind"] == "speak_barge"
+    for bad in (
+        [{"label": "a", "kind": "speak"}, {"label": "b", "kind": "speak_barge"}],
+        [{"label": "a", "kind": "speak_barge"}, {"label": "b", "kind": "speak_barge"}],
+        [{"label": "a", "kind": "speak_barge", "text": "Stop"}],
+    ):
+        with pytest.raises(ValueError, match="journey_(speak|step)"):
+            scenario(*bad)
+
+
+@pytest.mark.parametrize("name", ["_BARGE_TARGET_SHA256", "_BARGE_STOP_SHA256"])
+def test_the_barge_fixtures_are_pinned_by_sha256(monkeypatch, name):
+    import scripts.native_typed_journey as client
+
+    assert client.load_barge_fixtures()[1] == (
+        "please", "tell", "me", "a", "long", "story", "about", "the", "ocean"
+    )
+    monkeypatch.setattr(client, name, "0" * 64)
+    with pytest.raises(ValueError, match="journey_speak_fixture"):
+        client.load_barge_fixtures()

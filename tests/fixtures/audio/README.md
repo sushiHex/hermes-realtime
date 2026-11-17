@@ -59,3 +59,15 @@ try {
 ```
 
 The same byte-reproducibility caveat applies: the checked-in SHA-256 is the authority.
+
+## `sapi_long_ocean_story.wav`
+
+Synthetic phrase `Please tell me a long story about the ocean.` for the native journey `speak_barge` step, which asks for a long reply to interrupt. It contains no human recording or user speech. The step then injects `sapi_stop.wav` (above) as the interruption.
+
+- SHA-256: `2d9ef11bd8f8ac01d62c585f70053f21b0de28aab4d2f7cbb5dc400bd17c48c5`
+- Voice: `Microsoft David Desktop` (SAPI, CPU)
+- PCM: mono, signed 16-bit little-endian, 22,050 Hz
+- Frames: `72,965` (approximately `3.309` seconds)
+- Expected words after lowercasing and stripping punctuation: `please tell me a long story about the ocean`
+
+Generation command: the same PowerShell recipe as `sapi_hello_can_you_hear_me.wav`, with output file `sapi_long_ocean_story.wav` and `$synth.Speak('Please tell me a long story about the ocean.')`.

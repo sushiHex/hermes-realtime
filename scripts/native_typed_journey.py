@@ -58,6 +58,19 @@ _SPEAK_FIXTURE = (
 )
 _SPEAK_FIXTURE_SHA256 = "8960e6f7223c5d47b0f31f4588f8d327e1bf6398cc9953015a528d906deef1bc"
 _SPEAK_WORDS = ("hello", "can", "you", "hear", "me")
+_BARGE_TARGET_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "tests/fixtures/audio/sapi_long_ocean_story.wav"
+)
+_BARGE_TARGET_SHA256 = "2d9ef11bd8f8ac01d62c585f70053f21b0de28aab4d2f7cbb5dc400bd17c48c5"
+_BARGE_TARGET_WORDS = ("please", "tell", "me", "a", "long", "story", "about", "the", "ocean")
+_BARGE_STOP_FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/audio/sapi_stop.wav"
+_BARGE_STOP_SHA256 = "3ef6a5a2465c5e4669e1998a3cbfdbdf7a15d39e81f6eb5ecd0ee47cdfc84233"
+_BARGE_STOP_WORDS = ("stop",)
+# Declared up front; never tuned to pass. Milliseconds of worker audio TARGET must have
+# played before Stop, the budget after injection end within which audio must cease, and
+# the whole quiet interval that must then be observed.
+_BARGE_MIN_TARGET_MS, _BARGE_BUDGET_MS, _BARGE_QUIET_MS = 1500, 1500, 500
+_BARGE_PRECONDITION_TIMEOUT, _BARGE_INTERRUPT_TIMEOUT = 30.0, 10.0
 _SPEAK_RATE, _SPEAK_FRAME_SAMPLES = 48_000, 480  # 10 ms mono frames
 _SPEAK_LEAD_FRAMES, _SPEAK_TRAIL_FRAMES = 30, 100  # bounded silence: 0.3 s and 1.0 s
 _SPEAK_FRAME_SECONDS = 0.01  # real-time pace
@@ -66,9 +79,9 @@ _SPEAK_MIN_AUDIO_MS = 50  # non-silent agent PCM required inside the response wi
 _SPEAK_SETTLE_SECONDS, _SPEAK_SETTLE_TIMEOUT = 1.0, 20.0
 _SPEAK_READY_TIMEOUT, _SPEAK_TURN_TIMEOUT, _SPEAK_DRAIN_SECONDS = 30.0, 60.0, 0.5
 # Windows only advance, so a later window can never re-open an earlier one or overlap it.
-_SPEAK_WINDOWS = ("settle", "input", "response", "closed")
+_SPEAK_WINDOWS = ("settle", "input", "response", "stop", "quiesce", "after", "closed")
 _SPEAK_IDLE_MAX_FRAMES, _SPEAK_IDLE_MAX_BYTES = 4_000, 4_000_000  # warm-up silence bounds
-_SPEAK_STREAM_MARGIN = 10.0 # seconds beyond the clip's real-time duration
+_SPEAK_STREAM_MARGIN = 10.0  # seconds beyond the clip's real-time duration
 _SPEAK_QUEUE_MS = 200 # AudioSource queue: capture_frame blocks once this much is buffered
 _SPEAK_MAX_FIXTURE_BYTES, _SPEAK_MAX_FIXTURE_SECONDS = 1_048_576, 5
 _SPEAK_LIFECYCLE = {
@@ -85,13 +98,29 @@ def _speak_words(text: object) -> tuple[str, ...]:
 
 def load_speak_fixture() -> tuple[tuple[bytes, ...], tuple[str, ...]]:
     """Verify the pinned synthetic clip and return 10 ms 48 kHz PCM frames plus its words."""
+    frames, _, _ = _load_clip(_SPEAK_FIXTURE, _SPEAK_FIXTURE_SHA256)
+    return frames, _SPEAK_WORDS
+
+
+def load_barge_fixtures() -> tuple[
+    tuple[bytes, ...], tuple[str, ...], tuple[bytes, ...], tuple[int, int], tuple[str, ...]
+]:
+    """The pinned long-reply request and the pinned Stop clip: (target frames, target words,
+    stop frames, stop speech span [first, end) in frames, stop words)."""
+    target, _, _ = _load_clip(_BARGE_TARGET_FIXTURE, _BARGE_TARGET_SHA256)
+    stop, first, end = _load_clip(_BARGE_STOP_FIXTURE, _BARGE_STOP_SHA256)
+    return target, _BARGE_TARGET_WORDS, stop, (first, end), _BARGE_STOP_WORDS
+
+
+def _load_clip(path: Path, sha256: str) -> tuple[tuple[bytes, ...], int, int]:
+    """Verify one pinned clip; return 10 ms 48 kHz frames and its speech span [first, end)."""
     try:
-        with _SPEAK_FIXTURE.open("rb") as stream:
+        with path.open("rb") as stream:
             raw = stream.read(_SPEAK_MAX_FIXTURE_BYTES + 1)
     except OSError:
         raise ValueError("journey_speak_fixture") from None
     # The read is capped, so an oversized file is truncated and can never match the pin.
-    require(hashlib.sha256(raw).hexdigest() == _SPEAK_FIXTURE_SHA256, "journey_speak_fixture")
+    require(hashlib.sha256(raw).hexdigest() == sha256, "journey_speak_fixture")
     try:
         with wave.open(io.BytesIO(raw), "rb") as clip:
             shape = (clip.getnchannels(), clip.getsampwidth(), clip.getframerate())
@@ -112,8 +141,9 @@ def load_speak_fixture() -> tuple[tuple[bytes, ...], tuple[str, ...]]:
         chunk = upsampled[offset : offset + _SPEAK_FRAME_SAMPLES]
         chunk += [0] * (_SPEAK_FRAME_SAMPLES - len(chunk))
         frames.append(struct.pack(f"<{_SPEAK_FRAME_SAMPLES}h", *chunk))
+    speech_end = len(frames)
     frames += [silence] * _SPEAK_TRAIL_FRAMES
-    return tuple(frames), _SPEAK_WORDS
+    return tuple(frames), _SPEAK_LEAD_FRAMES, speech_end
 
 
 class SpeakTrace:
@@ -151,9 +181,12 @@ class SpeakTrace:
                 return
             require(pair in self.pairs or len(self.pairs) < 16, "journey_speak_concurrent")
             record = self.pairs.setdefault(
-                pair, {"token": None, "completed": False, "interrupted": False}
+                pair, {"token": None, "playable": False, "completed": False,
+                       "interrupted": False}
             )
-            if kind == "first_foreground_token" and record["token"] is None:
+            if kind == "first_playable_audio":
+                record["playable"] = True
+            elif kind == "first_foreground_token" and record["token"] is None:
                 record["token"] = seq
             elif kind == "assistant_turn_completed":
                 record["completed"] = True
@@ -162,6 +195,72 @@ class SpeakTrace:
 
     def terminal(self) -> bool:
         return any(row["completed"] or row["interrupted"] for row in self.pairs.values())
+
+
+class BargeTrace(SpeakTrace):
+    """SpeakTrace plus a Stop injected over TARGET, the first reply's exact pair.
+
+    Events at or before the injection's browser-event cursor are the first utterance; later
+    ones are attributed to the Stop and to TARGET's exact pair only. Booleans and counts only.
+    """
+
+    def __init__(self, prior: frozenset[tuple[str, int]], expected: tuple[str, ...],
+                 incarnation: int, stop_words: tuple[str, ...]) -> None:
+        super().__init__(prior, expected, incarnation)
+        self.stop_words = stop_words
+        self.target: tuple[str, int] | None = None
+        self.inj_seq: int | None = None
+        self.stop_started = 0
+        self.stop_finals = 0
+        self.stop_matches = False
+        self.interrupt_requested = False
+        self.foreign_interrupt = False
+        self.silenced = False
+        self.overlap = False
+        self.fresh_token = False
+
+    def mark_injection(self, cursor: int) -> None:
+        self.inj_seq = cursor
+
+    def target_row(self) -> dict[str, Any]:
+        assert self.target is not None
+        return self.pairs[self.target]
+
+    def target_terminal(self) -> bool:
+        return self.target is not None and bool(
+            self.target_row()["completed"] or self.target_row()["interrupted"]
+        )
+
+    def fresh_pairs(self) -> int:
+        return len(self.pairs) - (0 if self.target is None else 1)
+
+    def observe(self, kind: str, data: dict, seq: int, pair: tuple[str, int] | None) -> None:
+        if self.inj_seq is None or seq <= self.inj_seq or self.target is None:
+            super().observe(kind, data, seq, pair)
+            return
+        target = self.target
+        if kind == "voice_activity_started":
+            self.stop_started += 1
+        elif kind == "transcript_final" and data.get("role") == "user":
+            self.stop_finals += 1
+            if self.stop_finals == 1:
+                self.stop_matches = _speak_words(data.get("text")) == self.stop_words
+        elif kind == "interrupt_requested":
+            generation = data.get("turnGeneration")
+            if data.get("turnId") == target[0] and generation in {None, target[1]}:
+                self.interrupt_requested = True
+            else:
+                self.foreign_interrupt = True
+        elif kind == "playback_silenced":
+            self.silenced = True
+        elif kind in _SPEAK_LIFECYCLE:
+            if pair is not None and pair != target:
+                # Any other pair active while TARGET is still non-terminal overlaps it.
+                if not self.target_terminal():
+                    self.overlap = True
+                if kind == "first_foreground_token":
+                    self.fresh_token = True
+            super().observe(kind, data, seq, pair)
 
 
 class WorkerAudioMeter:
@@ -174,6 +273,10 @@ class WorkerAudioMeter:
         self.windows: dict[str, list[float]] = {}
         self.last_audio_at: float | None = None
         self.ambiguous = False
+        # Client-local times only: when each window was entered, and the last non-silent
+        # frame observed inside each. Never mixed with server monotonic values.
+        self.entered_at: dict[str, float] = {}
+        self.last_by_window: dict[str, float] = {}
         self._track_sid: object = None
         self._tasks: list[asyncio.Task] = []
 
@@ -184,6 +287,7 @@ class WorkerAudioMeter:
             "journey_speak_window",
         )
         self.window = name
+        self.entered_at[name] = self._clock()
 
     def start(self) -> None:
         self.room.on("track_published", self._published)
@@ -231,7 +335,7 @@ class WorkerAudioMeter:
         row = self.windows.setdefault(self.window, [0, 0.0])
         row[0] += 1
         row[1] += frame.samples_per_channel * 1000 / frame.sample_rate
-        self.last_audio_at = self._clock()
+        self.last_audio_at = self.last_by_window[self.window] = self._clock()
 
     def window_totals(self, name: str) -> tuple[int, int]:
         row = self.windows.get(name, [0, 0.0])
@@ -272,6 +376,7 @@ class SyntheticVoice:
         self._idle_task: asyncio.Future | None = None
         self._streaming = False
         self.warmup_failed = False
+        self.fresh_closed = False
 
     async def activate(self, post_media: Any) -> None:
         require(self.source is None, "journey_speak_once")
@@ -286,7 +391,9 @@ class SyntheticVoice:
         require(reply == {"mediaIncarnation": self.incarnation, "version": 1},
                 "journey_speak_media")
 
-    async def stream(self, frames: tuple[bytes, ...]) -> None:
+    async def stream(self, frames: tuple[bytes, ...],
+                     marks: dict[int, Any] | None = None) -> None:
+        """Feed frames paced in real time. ``marks[i]`` runs just before frame ``i``."""
         require(self.source is not None, "journey_speak_media")
         # Exactly one PCM producer at a time: the warm-up must have settled first.
         require(self._idle_task is None and not self._streaming, "journey_speak_producer")
@@ -297,6 +404,8 @@ class SyntheticVoice:
                 delay = begin + index * _SPEAK_FRAME_SECONDS - time.monotonic()
                 if delay > 0:
                     await asyncio.sleep(delay)
+                if marks is not None and index in marks:
+                    marks[index]()
                 await self.source.capture_frame(self.rtc.AudioFrame(
                     data=pcm, sample_rate=_SPEAK_RATE, num_channels=1,
                     samples_per_channel=_SPEAK_FRAME_SAMPLES,
@@ -348,6 +457,11 @@ class SyntheticVoice:
         # The response window opens when the user's final is first observed.
         if trace is not None and trace.final_count and self.meter.window == "input":
             self.meter.advance("response")
+        # A fresh reply's first token closes the quiescence window: later audio belongs
+        # to the fresh pair, never to TARGET.
+        if isinstance(trace, BargeTrace) and trace.fresh_token and self.meter.window == "quiesce":
+            self.meter.advance("after")
+            self.fresh_closed = True
 
     async def aclose(self) -> None:
         await self.meter.aclose()
@@ -388,18 +502,19 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
             and LABEL.fullmatch(label) is not None
             and label not in labels
             and kind in {"dispatch", "status", "recall", "cancel", "natural_cancel",
-                         "conversation", "speak"},
+                         "conversation", "speak", "speak_barge"},
             "journey_step_identity",
         )
         labels.add(label)
         if kind == "cancel":
             require(set(step) == {"label", "kind", "task"}, "journey_cancel_shape")
-        elif kind == "speak":
-            # One fixed pinned synthetic clip, once: no text, task or repeat.
+        elif kind in {"speak", "speak_barge"}:
+            # One fixed pinned synthetic clip set, once: no text, task or repeat. A barge and a
+            # plain speak share the one microphone track, so a scenario holds only one of them.
             require(set(step) == {"label", "kind"}, "journey_speak_shape")
             require(not speaking, "journey_speak_count")
             speaking = True
-            load_speak_fixture()
+            load_barge_fixtures() if kind == "speak_barge" else load_speak_fixture()
             continue
         else:
             require(
@@ -875,17 +990,11 @@ class Journey:
         self.speak_receipt["mediaRequests"] += 1
         return await self.request("media", payload)
 
-    async def speak(self, step: dict) -> None:
-        """Send the pinned synthetic clip as microphone audio through the real pipeline.
-
-        Microphone input emits no typed admission, so attribution is strict instead: a quiet
-        start, one user final with the exact words, one new foreground pair bound by its
-        first token after that final, that completes, and worker audio inside its window.
-        Anything ambiguous fails. The receipt keeps booleans and counts only.
-        """
-        voice, tracker = self.voice, self.tracker
-        require(voice is not None, "journey_speak_unavailable")
-        assert voice is not None
+    async def _mic_quiet_start(
+        self, voice: SyntheticVoice, make_trace: Any
+    ) -> tuple[Any, Any, Any]:
+        """Require a quiet session (no active task, no open turn, no recent worker audio)."""
+        tracker = self.tracker
         # A preceding typed step must be settled, never erased while active or ambiguous. Only
         # its completed per-step observation state is cleared, so its input and text cannot
         # also claim the microphone's user final (journey_input_source). Seen identities,
@@ -894,14 +1003,6 @@ class Journey:
                 "journey_speak_previous_turn_active")
         tracker.current = None
         tracker.text = ""
-        frames, words = load_speak_fixture()
-        receipt = self.speak_receipt = {
-            "label": step["label"], "clipFrames": len(frames), "mediaRequests": 0,
-            "voiceActivityOrdered": False, "finalsCount": 0, "transcriptMatches": False,
-            "pairBound": False, "pairCompleted": False, "agentAudioFrames": 0,
-            "agentAudioMs": 0, "inputWindowAudioFrames": 0, "inputWindowAudioMs": 0,
-            "cueAudioObserved": False, "quietGateMs": 0,
-        }
 
         def quiet() -> bool:
             return (all(status in TERMINAL for status in tracker.tasks.values())
@@ -913,69 +1014,73 @@ class Journey:
         except TimeoutError:
             require(False, "journey_speak_not_quiet")
         before_tasks, before_runs = set(tracker.tasks), set(self.admissions)
-        trace = tracker.speak = SpeakTrace(
-            frozenset(tracker.seen), words, voice.incarnation + 1
-        )
+        trace = tracker.speak = make_trace(frozenset(tracker.seen), voice.incarnation + 1)
+        return trace, before_tasks, before_runs
+
+    async def _mic_ready(self, voice: SyntheticVoice, trace: SpeakTrace,
+                         receipt: dict[str, Any]) -> None:
+        """Publish the one microphone track, activate media, await this incarnation's
+        readiness, then require the post-ready quiet gate."""
+        tracker = self.tracker
         try:
-            try:
-                await asyncio.wait_for(voice.activate(self._post_media), _SPEAK_READY_TIMEOUT)
-            except TimeoutError:
-                require(False, "journey_speak_publish_timeout")
-            # The worker confirms readiness only once it receives PCM, so feed bounded
-            # silence on the published track until the clip starts.
-            voice.start_idle()
-            try:
-                await self.wait(lambda: trace.ready, _SPEAK_READY_TIMEOUT)
-            except TimeoutError:
-                require(False, "journey_speak_not_ready")
-            # The host schedules the readiness cue after publishing readiness, and audio
-            # input is suppressed while it plays. Require one whole local quiet interval,
-            # measured from the later of gate entry and the last observed worker audio, so
-            # a cue that has not started yet cannot pass for silence. Client clock only.
-            entry = voice.meter.now()
-            cue_frames = voice.meter.window_totals("settle")[0]
-            try:
-                await self.wait(
-                    lambda: not tracker.open_turns
-                    and voice.meter.quiet_since(entry, _SPEAK_SETTLE_SECONDS),
-                    _SPEAK_SETTLE_TIMEOUT,
-                )
-            except TimeoutError:
-                gate_failed = True
-            else:
-                gate_failed = False
-            receipt["quietGateMs"] = int((voice.meter.now() - entry) * 1000)
-            receipt["cueAudioObserved"] = voice.meter.window_totals("settle")[0] > cue_frames
-            require(not gate_failed, "journey_speak_not_quiet")
-            await voice.stop_idle()  # before the clip: nothing else is fed from here on
-            require(not voice.warmup_failed, "journey_speak_warmup_failed")
-            voice.meter.advance("input")
-            streaming = asyncio.ensure_future(voice.stream(frames))
-            try:
-                # Real-time pace plus a fixed margin: a capture that never returns cannot
-                # hold the step (or its cleanup) open.
-                async with asyncio.timeout(len(frames) * _SPEAK_FRAME_SECONDS
-                                           + _SPEAK_STREAM_MARGIN):
-                    while not streaming.done():
-                        await self.poll()
-                        await asyncio.sleep(0.05)
-                    await streaming
-            except TimeoutError:
-                require(False, "journey_speak_stream_timeout")
-            finally:
-                if not streaming.done():
-                    streaming.cancel()
-                    await asyncio.gather(streaming, return_exceptions=True)
-            with contextlib.suppress(TimeoutError):
-                await self.wait(trace.terminal, _SPEAK_TURN_TIMEOUT)
-            await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
-            await self.poll()
+            await asyncio.wait_for(voice.activate(self._post_media), _SPEAK_READY_TIMEOUT)
+        except TimeoutError:
+            require(False, "journey_speak_publish_timeout")
+        # The worker confirms readiness only once it receives PCM, so feed bounded
+        # silence on the published track until the clip starts.
+        voice.start_idle()
+        try:
+            await self.wait(lambda: trace.ready, _SPEAK_READY_TIMEOUT)
+        except TimeoutError:
+            require(False, "journey_speak_not_ready")
+        # The host schedules the readiness cue after publishing readiness, and audio
+        # input is suppressed while it plays. Require one whole local quiet interval,
+        # measured from the later of gate entry and the last observed worker audio, so
+        # a cue that has not started yet cannot pass for silence. Client clock only.
+        entry = voice.meter.now()
+        cue_frames = voice.meter.window_totals("settle")[0]
+        try:
+            await self.wait(
+                lambda: not tracker.open_turns
+                and voice.meter.quiet_since(entry, _SPEAK_SETTLE_SECONDS),
+                _SPEAK_SETTLE_TIMEOUT,
+            )
+        except TimeoutError:
+            gate_failed = True
+        else:
+            gate_failed = False
+        receipt["quietGateMs"] = int((voice.meter.now() - entry) * 1000)
+        receipt["cueAudioObserved"] = voice.meter.window_totals("settle")[0] > cue_frames
+        require(not gate_failed, "journey_speak_not_quiet")
+        await voice.stop_idle()  # before the clip: nothing else is fed from here on
+        require(not voice.warmup_failed, "journey_speak_warmup_failed")
+        voice.meter.advance("input")
+
+    async def _stream_bounded(self, voice: SyntheticVoice, frames: tuple[bytes, ...],
+                              marks: dict[int, Any] | None = None) -> None:
+        streaming = asyncio.ensure_future(voice.stream(frames, marks))
+        try:
+            # Real-time pace plus a fixed margin: a capture that never returns cannot
+            # hold the step (or its cleanup) open.
+            async with asyncio.timeout(len(frames) * _SPEAK_FRAME_SECONDS
+                                       + _SPEAK_STREAM_MARGIN):
+                while not streaming.done():
+                    await self.poll()
+                    await asyncio.sleep(0.05)
+                await streaming
+        except TimeoutError:
+            require(False, "journey_speak_stream_timeout")
         finally:
-            await voice.stop_idle()  # every exit path: cancel and settle the idle feeder
-            voice.meter.advance("closed")
-            tracker.speak = None
-        agent_frames, agent_ms = voice.meter.window_totals("response")
-        input_frames, input_ms = voice.meter.window_totals("input")
+            if not streaming.done():
+                streaming.cancel()
+                await asyncio.gather(streaming, return_exceptions=True)
+
+    @staticmethod
+    def _require_first_utterance(
+        trace: SpeakTrace, receipt: dict[str, Any]
+    ) -> tuple[tuple[str, int], dict[str, Any]]:
+        """Voice activity ordered, exactly one user final with the exact words, and exactly
+        one new foreground pair bound by its first token after that final."""
         first = trace.first_final
         ordered = (trace.started is not None and trace.ended is not None
                    and trace.started < trace.ended
@@ -983,8 +1088,6 @@ class Journey:
         receipt.update(
             voiceActivityOrdered=ordered, finalsCount=trace.final_count,
             transcriptMatches=first is not None and first[1],
-            agentAudioFrames=agent_frames, agentAudioMs=agent_ms,
-            inputWindowAudioFrames=input_frames, inputWindowAudioMs=input_ms,
         )
         require(ordered, "journey_speak_voice_activity")
         require(trace.final_count == 1, "journey_speak_finals")
@@ -997,6 +1100,169 @@ class Journey:
         receipt["pairBound"] = (pair not in trace.prior and row["token"] is not None
                                 and row["token"] > first[0])
         require(receipt["pairBound"], "journey_speak_pair_unbound")
+        return pair, row
+
+    async def speak_barge(self, step: dict) -> None:
+        """Ask for a long reply, then interrupt it with the pinned Stop clip on the same track.
+
+        TARGET is the first reply's exact pair. Stop is injected only once TARGET has played
+        at least _BARGE_MIN_TARGET_MS of worker audio and is still running; a TARGET that
+        ends first is inconclusive, never an interruption. Pass needs: Stop recognized (a
+        fresh voice start and one final with the exact words), TARGET's exact pair
+        interrupted and never completed, and worker audio quiescent for a whole interval
+        that starts within _BARGE_BUDGET_MS of injection end. Client clock only; windows are
+        observed through polls and a bounded AudioSource queue, so the bounds are coarse.
+        """
+        voice, tracker = self.voice, self.tracker
+        require(voice is not None, "journey_speak_unavailable")
+        assert voice is not None
+        target_frames, target_words, stop_frames, (stop_first, stop_end), stop_words = (
+            load_barge_fixtures()
+        )
+        receipt = self.speak_receipt = {
+            "label": step["label"], "kind": "speak_barge", "mediaRequests": 0,
+            "voiceActivityOrdered": False, "finalsCount": 0, "transcriptMatches": False,
+            "pairBound": False, "cueAudioObserved": False, "quietGateMs": 0,
+            "targetAudioMsBeforeStop": 0, "stopInjected": False, "stopVadObserved": False,
+            "stopFinalsCount": 0, "stopRecognized": False, "targetInterrupted": False,
+            "targetCompleted": False, "interruptEventObserved": False, "postStopAudioMs": 0,
+            "quiescenceObserved": False, "quiescenceInconclusive": False,
+            "freshReplyObserved": False, "stopLatencyMs": 0, "quietTailMs": 0,
+        }
+        trace, before_tasks, before_runs = await self._mic_quiet_start(
+            voice,
+            lambda prior, incarnation: BargeTrace(prior, target_words, incarnation, stop_words),
+        )
+        meter = voice.meter
+        try:
+            await self._mic_ready(voice, trace, receipt)
+            await self._stream_bounded(voice, target_frames)
+            with contextlib.suppress(TimeoutError):
+                await self.wait(lambda: any(row["token"] is not None
+                                            for row in trace.pairs.values()), _SPEAK_TURN_TIMEOUT)
+            pair, row = self._require_first_utterance(trace, receipt)
+            trace.target = pair
+
+            def injectable() -> bool:
+                return trace.target_terminal() or (
+                    row["playable"] and meter.window_totals("response")[1] >= _BARGE_MIN_TARGET_MS
+                )
+
+            with contextlib.suppress(TimeoutError):
+                await self.wait(injectable, _BARGE_PRECONDITION_TIMEOUT)
+            receipt["targetAudioMsBeforeStop"] = meter.window_totals("response")[1]
+            # A TARGET that ended first can never show an interruption: inconclusive.
+            require(not trace.target_terminal(), "journey_barge_target_terminal")
+            require(row["playable"] and receipt["targetAudioMsBeforeStop"] >= _BARGE_MIN_TARGET_MS,
+                    "journey_barge_precondition")
+
+            def inject_start() -> None:
+                trace.mark_injection(tracker.cursor)
+                receipt["targetAudioMsBeforeStop"] = meter.window_totals("response")[1]
+                receipt["stopInjected"] = True
+                meter.advance("stop")
+
+            def inject_end() -> None:
+                meter.advance("quiesce")
+                voice.sync(trace)
+
+            await self._stream_bounded(
+                voice, stop_frames, {stop_first: inject_start, stop_end: inject_end}
+            )
+            injection_end = meter.entered_at["quiesce"]
+            horizon = (_BARGE_BUDGET_MS + _BARGE_QUIET_MS) / 1000
+            try:
+                await self.wait(
+                    lambda: meter.window != "quiesce" or meter.now() - injection_end >= horizon,
+                    horizon + _BARGE_INTERRUPT_TIMEOUT,
+                )
+            except TimeoutError:
+                require(False, "journey_barge_quiescence_timeout")
+            if meter.window == "quiesce":
+                meter.advance("after")  # bounded drain elapsed with no fresh reply
+            with contextlib.suppress(TimeoutError):
+                await self.wait(trace.target_terminal, _BARGE_INTERRUPT_TIMEOUT)
+            await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
+            await self.poll()
+        finally:
+            await voice.stop_idle()  # every exit path: cancel and settle the idle feeder
+            meter.advance("closed")
+            tracker.speak = None
+        start, close = meter.entered_at["quiesce"], meter.entered_at["after"]
+        last = meter.last_by_window.get("quiesce")
+        tail_start = start if last is None else max(start, last)
+        latency_ms = int(round((tail_start - start) * 1000))
+        tail_ms = int(round((close - tail_start) * 1000))
+        target = trace.target_row()
+        receipt.update(
+            stopVadObserved=trace.stop_started >= 1, stopFinalsCount=trace.stop_finals,
+            stopRecognized=trace.stop_started >= 1 and trace.stop_finals == 1
+            and trace.stop_matches,
+            targetInterrupted=target["interrupted"], targetCompleted=target["completed"],
+            interruptEventObserved=trace.interrupt_requested or trace.silenced,
+            postStopAudioMs=meter.window_totals("quiesce")[1],
+            freshReplyObserved=trace.fresh_token, stopLatencyMs=latency_ms,
+            quietTailMs=max(tail_ms, 0),
+        )
+        require(trace.stop_started >= 1, "journey_barge_stop_vad")
+        require(trace.stop_finals == 1, "journey_barge_stop_finals")
+        require(trace.stop_matches, "journey_barge_stop_transcript")
+        require(trace.unbound == 0 and not trace.overlap and not trace.foreign_interrupt
+                and trace.fresh_pairs() <= 1, "journey_barge_ambiguous")
+        require(not target["completed"], "journey_barge_target_completed")
+        require(target["interrupted"], "journey_barge_target_not_interrupted")
+        require(receipt["interruptEventObserved"], "journey_barge_no_interrupt_event")
+        require(set(tracker.tasks) == before_tasks and self.admissions == before_runs,
+                "journey_followup_dispatched")
+        require(not meter.ambiguous, "journey_speak_audio_track")
+        require(latency_ms <= _BARGE_BUDGET_MS, "journey_barge_audio_continued")
+        if tail_ms < _BARGE_QUIET_MS:
+            # A fresh reply closed the window before a whole quiet interval was observable.
+            receipt["quiescenceInconclusive"] = True
+            require(False, "journey_barge_quiescence_inconclusive")
+        receipt["quiescenceObserved"] = True
+
+    async def speak(self, step: dict) -> None:
+        """Send the pinned synthetic clip as microphone audio through the real pipeline.
+
+        Microphone input emits no typed admission, so attribution is strict instead: a quiet
+        start, one user final with the exact words, one new foreground pair bound by its
+        first token after that final, that completes, and worker audio inside its window.
+        Anything ambiguous fails. The receipt keeps booleans and counts only.
+        """
+        voice, tracker = self.voice, self.tracker
+        require(voice is not None, "journey_speak_unavailable")
+        assert voice is not None
+        frames, words = load_speak_fixture()
+        receipt = self.speak_receipt = {
+            "label": step["label"], "clipFrames": len(frames), "mediaRequests": 0,
+            "voiceActivityOrdered": False, "finalsCount": 0, "transcriptMatches": False,
+            "pairBound": False, "pairCompleted": False, "agentAudioFrames": 0,
+            "agentAudioMs": 0, "inputWindowAudioFrames": 0, "inputWindowAudioMs": 0,
+            "cueAudioObserved": False, "quietGateMs": 0,
+        }
+
+        trace, before_tasks, before_runs = await self._mic_quiet_start(
+            voice, lambda prior, incarnation: SpeakTrace(prior, words, incarnation)
+        )
+        try:
+            await self._mic_ready(voice, trace, receipt)
+            await self._stream_bounded(voice, frames)
+            with contextlib.suppress(TimeoutError):
+                await self.wait(trace.terminal, _SPEAK_TURN_TIMEOUT)
+            await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
+            await self.poll()
+        finally:
+            await voice.stop_idle()  # every exit path: cancel and settle the idle feeder
+            voice.meter.advance("closed")
+            tracker.speak = None
+        agent_frames, agent_ms = voice.meter.window_totals("response")
+        input_frames, input_ms = voice.meter.window_totals("input")
+        receipt.update(
+            agentAudioFrames=agent_frames, agentAudioMs=agent_ms,
+            inputWindowAudioFrames=input_frames, inputWindowAudioMs=input_ms,
+        )
+        _, row = self._require_first_utterance(trace, receipt)
         receipt["pairCompleted"] = row["completed"] and not row["interrupted"]
         require(receipt["pairCompleted"], "journey_speak_turn_incomplete")
         require(set(tracker.tasks) == before_tasks and self.admissions == before_runs,
@@ -1006,8 +1272,8 @@ class Journey:
 
     async def step(self, step: dict) -> None:
         kind, label = step["kind"], step["label"]
-        if kind == "speak":
-            await self.speak(step)
+        if kind in {"speak", "speak_barge"}:
+            await (self.speak_barge(step) if kind == "speak_barge" else self.speak(step))
             return
         if kind == "recall":
             await self.collect(step["task"])
@@ -1170,7 +1436,7 @@ async def execute(options, steps, receipt) -> None:
             ),
             15,
         )
-        if any(step.get("kind") == "speak" for step in steps):
+        if any(step.get("kind") in {"speak", "speak_barge"} for step in steps):
             # Subscribe only to the worker's audio, by the identity validated above.
             journey.voice = SyntheticVoice(rtc, room, credential["workerIdentity"])
             journey.voice.meter.start()
