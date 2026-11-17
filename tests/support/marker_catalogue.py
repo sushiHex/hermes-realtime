@@ -465,6 +465,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "test-ownership": {
         "scripts/release_gate.py": 1,
     },
+    "typed-lineage": {
+        "src/hermes_realtime/conversation/actions.py": 1,
+    },
     "voice-archive": {
         "src/hermes_realtime/companion/archive.py": 1,
     },
