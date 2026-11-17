@@ -182,8 +182,14 @@ the sha256-pinned synthetic clip `tests/fixtures/audio/sapi_hello_can_you_hear_m
 room as microphone audio: one `microphone-1` track at 48 kHz mono in 10 ms frames at
 real-time pace, with bounded leading and trailing silence, then one `/api/v1/media`
 activation. The audio crosses the real VAD, STT, foreground model and TTS. Only the
-worker's audio track (the exact validated worker identity) is subscribed, and received
-PCM is measured by RMS and discarded; nothing is written to disk or the receipt.
+worker's audio track (the exact validated worker identity) is subscribed before
+readiness, one track only (a second distinct worker track is ambiguity), and received
+PCM is measured by RMS and discarded; nothing is written to disk or the receipt. The
+clip's bytes, duration, channels, sample rate and SHA-256 are verified before anything
+is published. After readiness the readiness cue is drained to a bounded quiet gate
+before speaking. Frames are paced in real time through a queue-bounded `AudioSource`,
+and measurement windows (settle, input, response) only advance, so they never overlap.
+Client and server clocks are never mixed; the step computes no latency.
 
 Microphone input emits no `typed_input_admitted`, so the step is attributed strictly.
 It passes only when the session starts quiet (no active task, no open foreground turn,

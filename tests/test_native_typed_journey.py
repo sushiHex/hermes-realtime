@@ -2038,8 +2038,12 @@ SPEAK_WORKER = "worker_preview_speak"
 
 
 class FakeAudioSource:
-    def __init__(self, rate, channels):
-        self.rate, self.channels, self.frames = rate, channels, []
+    def __init__(self, rate, channels, queue_size_ms=1000):
+        self.rate, self.channels, self.queue_size_ms = rate, channels, queue_size_ms
+        self.frames, self.played_out = [], False
+
+    async def wait_for_playout(self):
+        self.played_out = True
 
     async def capture_frame(self, frame):
         self.frames.append(frame)
@@ -2317,17 +2321,157 @@ def test_speak_refuses_audio_that_is_below_the_threshold(tmp_path, monkeypatch):
 
 
 def test_speak_audio_before_the_final_cannot_satisfy_the_response_window(tmp_path, monkeypatch):
-    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {2: 20, 3: 20}})
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {3: 40}})
     with pytest.raises(ValueError, match="journey_speak_no_audio"):
         speak(journey)
     assert journey.speak_receipt["inputWindowAudioFrames"] == 40
 
 
 def test_speak_splits_worker_audio_between_the_input_and_response_windows(tmp_path, monkeypatch):
-    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {2: 20, 3: 20, 4: 6}})
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {3: 40, 4: 6}})
     speak(journey)
     receipt = journey.speak_receipt
     assert (receipt["inputWindowAudioFrames"], receipt["agentAudioFrames"]) == (40, 6)
+
+
+def test_speak_drains_the_readiness_cue_to_a_quiet_gate_before_speaking(tmp_path, monkeypatch):
+    # Worker audio (the cue) arrives with the ready event: the gate must not open.
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {2: 5, 4: 6}})
+    with pytest.raises(ValueError, match="journey_speak_not_quiet"):
+        speak(journey)
+    assert journey.room.published[0][0].source.frames == []  # nothing was spoken
+
+
+def test_a_drained_cue_never_counts_toward_the_response(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {2: 5}})
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 0.0)
+    with pytest.raises(ValueError, match="journey_speak_no_audio"):
+        speak(journey)
+    assert journey.speak_receipt["agentAudioFrames"] == 0
+    assert journey.speak_receipt["inputWindowAudioFrames"] == 0
+
+
+def test_the_audio_source_is_queue_bounded_paced_and_played_out(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    journey = passing_speak(tmp_path, monkeypatch)
+    monkeypatch.setattr(client, "_SPEAK_FRAME_SECONDS", 0.001)
+    started = time.monotonic()
+    speak(journey)
+    source = journey.room.published[0][0].source
+    assert source.queue_size_ms <= 200 and source.played_out is True
+    frames = len(source.frames)
+    assert time.monotonic() - started >= (frames - 1) * 0.001  # not dumped at once
+
+
+def test_a_second_distinct_worker_audio_track_is_ambiguous(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    room = FakeRoom()
+    voice = client.SyntheticVoice(fake_rtc(), room, SPEAK_WORKER)
+    worker = SimpleNamespace(identity=SPEAK_WORKER)
+
+    async def run():
+        voice.meter.start()
+        for sid in ("TR_one", "TR_one", "TR_two"):
+            room.emit("track_subscribed", SimpleNamespace(kind="audio", sid=sid, tag=sid),
+                      None, worker)
+        await asyncio.gather(*voice.meter._tasks)
+
+    asyncio.run(run())
+    assert [track.tag for track in FakeAudioStream.tracks] == ["TR_one"]
+    assert voice.meter.ambiguous is True
+
+
+def test_speak_refuses_when_the_worker_track_was_ambiguous(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch)
+    journey.voice.meter.ambiguous = True
+    with pytest.raises(ValueError, match="journey_speak_audio_track"):
+        speak(journey)
+
+
+def test_measurement_windows_only_advance(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    meter = client.SyntheticVoice(fake_rtc(), FakeRoom(), SPEAK_WORKER).meter
+    meter.advance("input")
+    meter.advance("response")
+    with pytest.raises(ValueError, match="journey_speak_window"):
+        meter.advance("input")
+    meter.advance("closed")
+    with pytest.raises(ValueError, match="journey_speak_window"):
+        meter.advance("response")
+
+
+def test_speak_never_reads_server_monotonic_values(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch)
+    inner = journey.request
+
+    async def request(route, payload=None):
+        value = await inner(route, payload)
+        for row in value.get("events", []):
+            row["monotonicMs"] = 9e12 if row["sequence"] % 2 else 0.5
+        return value
+
+    journey.request = request
+    speak(journey)
+    assert not any("ms" in key.lower() and key not in {"agentAudioMs", "inputWindowAudioMs"}
+                   for key in journey.speak_receipt)
+
+
+def fixture_wav(tmp_path, *, channels=1, rate=22_050, frames=2_205, width=2):
+    import wave
+
+    path = tmp_path / "clip.wav"
+    with wave.open(str(path), "wb") as clip:
+        clip.setnchannels(channels)
+        clip.setsampwidth(width)
+        clip.setframerate(rate)
+        clip.writeframes(bytes(width * channels * frames))
+    return path
+
+
+@pytest.mark.parametrize("shape", [
+    {"channels": 2}, {"rate": 16_000}, {"width": 1}, {"frames": 22_050 * 5 + 1},
+])
+def test_fixture_shape_and_duration_are_bounded_even_when_the_hash_matches(
+    tmp_path, monkeypatch, shape
+):
+    import hashlib
+
+    import scripts.native_typed_journey as client
+
+    path = fixture_wav(tmp_path, **shape)
+    monkeypatch.setattr(client, "_SPEAK_FIXTURE", path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setattr(client, "_SPEAK_FIXTURE_SHA256", digest)
+    with pytest.raises(ValueError, match="journey_speak_fixture"):
+        client.load_speak_fixture()
+
+
+def test_fixture_bytes_are_bounded_before_decoding(tmp_path, monkeypatch):
+    import hashlib
+
+    import scripts.native_typed_journey as client
+
+    path = fixture_wav(tmp_path)
+    monkeypatch.setattr(client, "_SPEAK_FIXTURE", path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setattr(client, "_SPEAK_FIXTURE_SHA256", digest)
+    assert client.load_speak_fixture()
+    monkeypatch.setattr(client, "_SPEAK_MAX_FIXTURE_BYTES", 100)
+    with pytest.raises(ValueError, match="journey_speak_fixture"):
+        client.load_speak_fixture()
+
+
+def test_a_missing_fixture_is_a_categorized_refusal(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    monkeypatch.setattr(client, "_SPEAK_FIXTURE", tmp_path / "absent.wav")
+    with pytest.raises(ValueError, match="journey_speak_fixture"):
+        client.load_speak_fixture()
 
 
 def test_a_second_activation_never_publishes_another_track_or_media_request(tmp_path, monkeypatch):
@@ -2384,6 +2528,7 @@ def test_speak_requires_no_open_foreground_turn_at_start(tmp_path, monkeypatch):
     journey = passing_speak(tmp_path, monkeypatch, kwargs={"before": before, "audio_at": {4: 6}})
     with pytest.raises(ValueError, match="journey_speak_not_quiet"):
         speak(journey)
+    assert journey.media == [] and journey.room.published == []  # refused before publishing
 
 
 def test_only_the_worker_identity_audio_is_counted(tmp_path, monkeypatch):

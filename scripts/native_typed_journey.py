@@ -65,7 +65,10 @@ _SPEAK_RMS_THRESHOLD = 300  # a received frame below this RMS is silence
 _SPEAK_MIN_AUDIO_MS = 50  # non-silent agent PCM required inside the response window
 _SPEAK_SETTLE_SECONDS, _SPEAK_SETTLE_TIMEOUT = 1.0, 20.0
 _SPEAK_READY_TIMEOUT, _SPEAK_TURN_TIMEOUT, _SPEAK_DRAIN_SECONDS = 30.0, 60.0, 0.5
-_SPEAK_WINDOWS = {"settle", "input", "response", "closed"}
+# Windows only advance, so a later window can never re-open an earlier one or overlap it.
+_SPEAK_WINDOWS = ("settle", "input", "response", "closed")
+_SPEAK_QUEUE_MS = 200  # AudioSource queue: capture_frame blocks once this much is buffered
+_SPEAK_MAX_FIXTURE_BYTES, _SPEAK_MAX_FIXTURE_SECONDS = 1_048_576, 5
 _SPEAK_LIFECYCLE = {
     "first_foreground_token", "first_playable_audio", "assistant_text_generated",
     "assistant_turn_completed", "assistant_turn_interrupted",
@@ -82,17 +85,18 @@ def load_speak_fixture() -> tuple[tuple[bytes, ...], tuple[str, ...]]:
     """Verify the pinned synthetic clip and return 10 ms 48 kHz PCM frames plus its words."""
     try:
         with _SPEAK_FIXTURE.open("rb") as stream:
-            raw = stream.read(1_048_577)
+            raw = stream.read(_SPEAK_MAX_FIXTURE_BYTES + 1)
     except OSError:
         raise ValueError("journey_speak_fixture") from None
-    require(
-        len(raw) <= 1_048_576 and hashlib.sha256(raw).hexdigest() == _SPEAK_FIXTURE_SHA256,
-        "journey_speak_fixture",
-    )
+    # The read is capped, so an oversized file is truncated and can never match the pin.
+    require(hashlib.sha256(raw).hexdigest() == _SPEAK_FIXTURE_SHA256, "journey_speak_fixture")
     try:
         with wave.open(io.BytesIO(raw), "rb") as clip:
             shape = (clip.getnchannels(), clip.getsampwidth(), clip.getframerate())
-            original = struct.unpack(f"<{clip.getnframes()}h", clip.readframes(clip.getnframes()))
+            count = clip.getnframes()
+            # Bound the duration before decoding any PCM.
+            require(0 < count <= _SPEAK_MAX_FIXTURE_SECONDS * 22_050, "journey_speak_fixture")
+            original = struct.unpack(f"<{count}h", clip.readframes(count))
     except (wave.Error, struct.error, EOFError):
         raise ValueError("journey_speak_fixture") from None
     require(shape == (1, 2, 22_050), "journey_speak_fixture")
@@ -162,7 +166,17 @@ class WorkerAudioMeter:
         self.window = "settle"
         self.windows: dict[str, list[float]] = {}
         self.last_audio_at: float | None = None
+        self.ambiguous = False
+        self._track_sid: object = None
         self._tasks: list[asyncio.Task] = []
+
+    def advance(self, name: str) -> None:
+        require(
+            name in _SPEAK_WINDOWS
+            and _SPEAK_WINDOWS.index(name) >= _SPEAK_WINDOWS.index(self.window),
+            "journey_speak_window",
+        )
+        self.window = name
 
     def start(self) -> None:
         self.room.on("track_published", self._published)
@@ -178,8 +192,16 @@ class WorkerAudioMeter:
 
     def _subscribed(self, track: Any, publication: Any, participant: Any) -> None:
         if (participant.identity != self.worker_identity
-                or track.kind != self.rtc.TrackKind.KIND_AUDIO or len(self._tasks) >= 4):
+                or track.kind != self.rtc.TrackKind.KIND_AUDIO):
             return
+        # PCM is bound to one actual worker track; a second distinct one is ambiguity.
+        sid = getattr(track, "sid", None)
+        if self._tasks and sid != self._track_sid:
+            self.ambiguous = True
+            return
+        if self._tasks:
+            return
+        self._track_sid = sid
         stream = self.rtc.AudioStream(track, sample_rate=_SPEAK_RATE, num_channels=1)
         self._tasks.append(asyncio.get_running_loop().create_task(self._consume(stream)))
 
@@ -233,7 +255,7 @@ class SyntheticVoice:
     async def activate(self, post_media: Any) -> None:
         require(self.source is None, "journey_speak_once")
         rtc = self.rtc
-        self.source = rtc.AudioSource(_SPEAK_RATE, 1)
+        self.source = rtc.AudioSource(_SPEAK_RATE, 1, queue_size_ms=_SPEAK_QUEUE_MS)
         track = rtc.LocalAudioTrack.create_audio_track("microphone-1", self.source)
         await self.room.local_participant.publish_track(
             track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
@@ -254,11 +276,12 @@ class SyntheticVoice:
                 data=pcm, sample_rate=_SPEAK_RATE, num_channels=1,
                 samples_per_channel=_SPEAK_FRAME_SAMPLES,
             ))
+        await self.source.wait_for_playout()
 
     def sync(self, trace: SpeakTrace | None) -> None:
         # The response window opens when the user's final is first observed.
         if trace is not None and trace.final_count and self.meter.window == "input":
-            self.meter.window = "response"
+            self.meter.advance("response")
 
     async def aclose(self) -> None:
         await self.meter.aclose()
@@ -816,13 +839,22 @@ class Journey:
             require(False, "journey_speak_not_quiet")
         before_tasks, before_runs = set(tracker.tasks), set(self.admissions)
         trace = tracker.speak = SpeakTrace(frozenset(tracker.seen), words)
-        voice.meter.window = "input"
         try:
             await voice.activate(self._post_media)
             try:
                 await self.wait(lambda: trace.ready, _SPEAK_READY_TIMEOUT)
             except TimeoutError:
                 require(False, "journey_speak_not_ready")
+            # The readiness cue is worker audio: drain it to the quiet gate before speaking,
+            # so it can never be counted as the response.
+            try:
+                await self.wait(
+                    lambda: not tracker.open_turns and voice.meter.quiet_for(_SPEAK_SETTLE_SECONDS),
+                    _SPEAK_SETTLE_TIMEOUT,
+                )
+            except TimeoutError:
+                require(False, "journey_speak_not_quiet")
+            voice.meter.advance("input")
             streaming = asyncio.ensure_future(voice.stream(frames))
             try:
                 while not streaming.done():
@@ -838,7 +870,7 @@ class Journey:
             await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
             await self.poll()
         finally:
-            voice.meter.window = "closed"
+            voice.meter.advance("closed")
             tracker.speak = None
         agent_frames, agent_ms = voice.meter.window_totals("response")
         input_frames, input_ms = voice.meter.window_totals("input")
@@ -867,6 +899,7 @@ class Journey:
         require(receipt["pairCompleted"], "journey_speak_turn_incomplete")
         require(set(tracker.tasks) == before_tasks and self.admissions == before_runs,
                 "journey_followup_dispatched")
+        require(not voice.meter.ambiguous, "journey_speak_audio_track")
         require(agent_ms >= _SPEAK_MIN_AUDIO_MS, "journey_speak_no_audio")
 
     async def step(self, step: dict) -> None:
