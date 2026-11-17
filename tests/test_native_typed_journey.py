@@ -3124,3 +3124,27 @@ def test_speak_rejects_a_previous_typed_turn_that_is_still_active(tmp_path, monk
     # It was rejected, not erased: the active turn is still the tracker's current step.
     assert journey.tracker.current is not None and journey.tracker.text == "Hi there"
     assert journey.media == []
+
+
+def test_a_failed_warmup_fails_the_step_even_when_readiness_arrives_without_it(
+    tmp_path, monkeypatch
+):
+    import scripts.native_typed_journey as client
+
+    async def failing_idle(self):
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(client.SyntheticVoice, "_idle", failing_idle)
+    # Readiness arrives anyway (implicit transport silence): the step must still fail.
+    journey = speak_journey(tmp_path, monkeypatch, speak_flow(), audio_at={4: 6})
+
+    async def run():
+        with pytest.raises(ValueError, match="journey_speak_warmup_failed"):
+            await asyncio.wait_for(journey.step(SPEAK_STEP), 5)
+        # Cleanup still ran: nothing is left feeding, tracing or windowed.
+        return (journey.voice._idle_task, journey.tracker.speak, journey.voice.meter.window,
+                journey.room.published[0][0].source.frames)
+
+    idle, trace, window, frames = asyncio.run(run())
+    assert idle is None and trace is None and window == "closed"
+    assert not any(any(frame.data) for frame in frames)  # the clip was never streamed

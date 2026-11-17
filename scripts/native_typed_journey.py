@@ -271,6 +271,7 @@ class SyntheticVoice:
         self.incarnation = 0
         self._idle_task: asyncio.Future | None = None
         self._streaming = False
+        self.warmup_failed = False
 
     async def activate(self, post_media: Any) -> None:
         require(self.source is None, "journey_speak_once")
@@ -334,7 +335,14 @@ class SyntheticVoice:
         task, self._idle_task = self._idle_task, None
         if task is not None:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            outcome, = await asyncio.gather(task, return_exceptions=True)
+            # Our own cancellation is expected; any other error means the explicit warm-up
+            # failed, even if readiness arrived through implicit transport silence. Record
+            # it (cleanup must keep running); the caller fails the step.
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                self.warmup_failed = True
 
     def sync(self, trace: SpeakTrace | None) -> None:
         # The response window opens when the user's final is first observed.
@@ -940,6 +948,7 @@ class Journey:
             receipt["cueAudioObserved"] = voice.meter.window_totals("settle")[0] > cue_frames
             require(not gate_failed, "journey_speak_not_quiet")
             await voice.stop_idle()  # before the clip: nothing else is fed from here on
+            require(not voice.warmup_failed, "journey_speak_warmup_failed")
             voice.meter.advance("input")
             streaming = asyncio.ensure_future(voice.stream(frames))
             try:
