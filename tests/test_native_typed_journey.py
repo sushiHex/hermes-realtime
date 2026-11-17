@@ -815,7 +815,7 @@ async def test_client_requires_v2_event_response_without_downgrade(tmp_path, mon
         await journey.poll()
 
 
-@pytest.mark.parametrize("route,version", [("events", 2), ("input", 1)])
+@pytest.mark.parametrize("route,version", [("events", 2), ("input", 1), ("media", 1)])
 def test_client_uses_versioned_events_without_changing_other_routes(monkeypatch, route, version):
     import scripts.native_typed_journey as client
 
@@ -2027,3 +2027,541 @@ def test_terminal_diagnostics_are_bounded_per_step():
     record = tracker.records[-1]
     assert len(record["terminals"]) == 8 and record["omitted"] == 3
     assert record["kinds"] == {"completed": 11, "interrupted": 0}
+
+
+# Synthetic microphone `speak` step (#237). A mechanism proof of the controlled synthetic
+# path: it bypasses the physical microphone and AEC.
+
+SPEAK_TEXT = "Hello, can you hear me?"
+SPEAK_STEP = {"label": "greet", "kind": "speak"}
+SPEAK_WORKER = "worker_preview_speak"
+
+
+class FakeAudioSource:
+    def __init__(self, rate, channels):
+        self.rate, self.channels, self.frames = rate, channels, []
+
+    async def capture_frame(self, frame):
+        self.frames.append(frame)
+        await asyncio.sleep(0)
+
+
+def fake_frame(level, samples=480):
+    import array
+
+    pcm = array.array("h", [level, -level] * (samples // 2))
+    return SimpleNamespace(
+        data=pcm, sample_rate=48_000, num_channels=1, samples_per_channel=samples
+    )
+
+
+class FakeAudioStream:
+    tracks: list = []
+
+    def __init__(self, track, **kwargs):
+        self.track = track
+        FakeAudioStream.tracks.append(track)
+
+    def __aiter__(self):
+        return self._frames()
+
+    async def _frames(self):
+        for _ in range(3):
+            yield SimpleNamespace(frame=fake_frame(8000))
+
+    async def aclose(self):
+        return None
+
+
+def fake_rtc():
+    FakeAudioStream.tracks = []
+    return SimpleNamespace(
+        AudioSource=FakeAudioSource,
+        AudioStream=FakeAudioStream,
+        AudioFrame=lambda **kwargs: SimpleNamespace(**kwargs),
+        LocalAudioTrack=SimpleNamespace(
+            create_audio_track=lambda name, source: SimpleNamespace(name=name, source=source)
+        ),
+        TrackPublishOptions=lambda **kwargs: kwargs,
+        TrackSource=SimpleNamespace(SOURCE_MICROPHONE="microphone"),
+        TrackKind=SimpleNamespace(KIND_AUDIO="audio"),
+    )
+
+
+class FakeRoom:
+    def __init__(self):
+        self.published, self.handlers, self.remote_participants = [], {}, {}
+        self.local_participant = SimpleNamespace(publish_track=self._publish)
+
+    async def _publish(self, track, options):
+        self.published.append((track, options))
+
+    def on(self, event, callback=None):
+        self.handlers.setdefault(event, []).append(callback)
+        return callback
+
+    def emit(self, event, *args):
+        for callback in self.handlers.get(event, []):
+            callback(*args)
+
+
+SPEAK_PAIR = {"turnId": "speak_turn", "turnGeneration": 1}
+
+
+def speak_flow(text=SPEAK_TEXT, *, finals=1, pairs=(SPEAK_PAIR,), complete=True, vad=True):
+    """Event batches for one spoken step; the last batch holds the terminal."""
+    final = ("transcript_final", {"role": "user", "text": text})
+    voice = [("voice_activity_started", {}), ("voice_activity_ended", {})] if vad else []
+    # The empty first batch is the step's flush poll, before its trace starts.
+    batches = [[], [("voice_input_ready", {})], [*voice, *[final] * finals]]
+    for pair in pairs:
+        batches.append([("first_foreground_token", pair), ("assistant_text_generated", pair)])
+    tail = [("assistant_turn_completed", pair) for pair in pairs] if complete else []
+    batches.append(tail)
+    return batches
+
+
+def speak_journey(tmp_path, monkeypatch, batches, *, audio_at=None, before=(), settle=None):
+    """A Journey with a fake mic transport. ``audio_at[n]`` frames of worker audio arrive
+    just before the n-th events response (1-based)."""
+    import scripts.native_typed_journey as client
+
+    for name, value in {
+        "_SPEAK_FRAME_SECONDS": 0.0,
+        "_SPEAK_DRAIN_SECONDS": 0.0,
+        "_SPEAK_TURN_TIMEOUT": 0.5,
+        "_SPEAK_SETTLE_TIMEOUT": 0.2,
+    }.items():
+        monkeypatch.setattr(client, name, value)
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              api_origin="http://127.0.0.1:1")
+    journey = Journey(options, {"expiresInSeconds": 3600}, "secret")
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+    rtc, room = fake_rtc(), FakeRoom()
+    journey.voice = client.SyntheticVoice(rtc, room, SPEAK_WORKER)
+    if before:
+        journey.tracker.consume(numbered(list(before), 1))
+    cursor = len(before) + 1
+    pending = []
+    for rows in batches:
+        pending.append(numbered(rows, cursor))
+        cursor += len(rows)
+    journey.media, journey.inputs, calls = [], [], [0]
+    if settle is not None:
+        journey.voice.meter.observe(fake_frame(8000))
+
+    async def request(route, payload=None):
+        if route == "media":
+            journey.media.append(payload)
+            return {"mediaIncarnation": payload["mediaIncarnation"], "version": 1}
+        if route == "input":
+            journey.inputs.append(payload)
+            return {}
+        assert route == "events"
+        calls[0] += 1
+        for _ in range((audio_at or {}).get(calls[0], 0)):
+            journey.voice.meter.observe(fake_frame(8000))
+        return {"version": 2, "events": pending.pop(0) if pending else []}
+
+    journey.request = request
+    journey.rtc, journey.room = rtc, room
+    return journey
+
+
+def speak(journey, seconds=5):
+    asyncio.run(asyncio.wait_for(journey.step(SPEAK_STEP), seconds))
+
+
+def passing_speak(tmp_path, monkeypatch, **overrides):
+    kwargs = {"audio_at": {4: 6}} | overrides.pop("kwargs", {})
+    journey = speak_journey(tmp_path, monkeypatch, speak_flow(**overrides), **kwargs)
+    return journey
+
+
+def test_speak_passes_with_one_final_one_completed_pair_and_worker_audio(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch)
+    speak(journey)
+    receipt = journey.speak_receipt
+    assert receipt["transcriptMatches"] is True
+    assert receipt["finalsCount"] == 1
+    assert receipt["pairBound"] is True and receipt["pairCompleted"] is True
+    assert receipt["voiceActivityOrdered"] is True
+    assert receipt["agentAudioFrames"] == 6 and receipt["agentAudioMs"] == 60
+    assert journey.inputs == []  # the microphone path never fakes a typed admission
+    assert journey.tracker.turns == []
+
+
+def test_speak_makes_exactly_one_media_request_and_publishes_one_microphone_track(
+    tmp_path, monkeypatch
+):
+    journey = passing_speak(tmp_path, monkeypatch)
+    speak(journey)
+    assert journey.media == [{"mediaIncarnation": 1}]
+    assert len(journey.room.published) == 1
+    track, options = journey.room.published[0]
+    assert track.name == "microphone-1" and options == {"source": "microphone"}
+    assert track.source.rate == 48_000 and track.source.channels == 1
+    frames = track.source.frames
+    assert {frame.samples_per_channel for frame in frames} == {480}
+    assert frames[0].data == bytes(960) and frames[-1].data == bytes(960)
+    assert any(any(frame.data) for frame in frames)
+
+
+def test_speak_receipt_is_metadata_only(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch)
+    speak(journey)
+    raw = json.dumps(journey.speak_receipt)
+    for private in ("hello", "speak_turn", "can you hear"):
+        assert private not in raw.lower()
+    assert all(type(value) in {bool, int, str} for value in journey.speak_receipt.values())
+
+
+@pytest.mark.parametrize("text", ["Hello, can you hear you?", "Hello can you hear me please",
+                                  "", "hello"])
+def test_speak_refuses_wrong_words(tmp_path, monkeypatch, text):
+    journey = passing_speak(tmp_path, monkeypatch, text=text)
+    with pytest.raises(ValueError, match="journey_speak_transcript"):
+        speak(journey)
+    assert journey.speak_receipt["transcriptMatches"] is False
+
+
+def test_speak_normalizes_case_and_punctuation_only(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, text="hello -- CAN you hear, me!")
+    speak(journey)
+    assert journey.speak_receipt["transcriptMatches"] is True
+
+
+def test_speak_refuses_two_finals_even_when_both_match(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, finals=2)
+    with pytest.raises(ValueError, match="journey_speak_finals"):
+        speak(journey)
+    assert journey.speak_receipt["finalsCount"] == 2
+
+
+def test_speak_refuses_zero_finals(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, finals=0)
+    with pytest.raises(ValueError, match="journey_speak_finals"):
+        speak(journey)
+
+
+def test_speak_refuses_a_missing_pair(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, pairs=())
+    with pytest.raises(ValueError, match="journey_speak_no_pair"):
+        speak(journey)
+    assert journey.speak_receipt["pairBound"] is False
+
+
+def test_speak_refuses_a_concurrent_turn(tmp_path, monkeypatch):
+    other = {"turnId": "other_turn", "turnGeneration": 1}
+    journey = passing_speak(tmp_path, monkeypatch, pairs=(SPEAK_PAIR, other))
+    with pytest.raises(ValueError, match="journey_speak_concurrent"):
+        speak(journey)
+
+
+def test_speak_refuses_an_unbound_terminal_beside_the_pair(tmp_path, monkeypatch):
+    flow = speak_flow()
+    flow[-1].append(("assistant_turn_completed", {}))  # a terminal with no turn identity
+    journey = speak_journey(tmp_path, monkeypatch, flow, audio_at={4: 6})
+    with pytest.raises(ValueError, match="journey_speak_pair_unbound"):
+        speak(journey)
+
+
+def test_speak_refuses_a_turn_that_does_not_complete(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, complete=False)
+    with pytest.raises(ValueError, match="journey_speak_turn_incomplete"):
+        speak(journey)
+    assert journey.speak_receipt["pairCompleted"] is False
+
+
+def test_speak_refuses_a_pair_whose_token_precedes_the_final(tmp_path, monkeypatch):
+    flow = speak_flow()
+    flow[2], flow[3] = flow[3], flow[2]  # the token arrives before the user final
+    journey = speak_journey(tmp_path, monkeypatch, flow, audio_at={4: 6})
+    with pytest.raises(ValueError, match="journey_speak_pair_unbound"):
+        speak(journey)
+
+
+def test_speak_refuses_a_pair_already_seen_before_the_step(tmp_path, monkeypatch):
+    before = [("assistant_turn_completed", SPEAK_PAIR)]
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"before": before, "audio_at": {4: 6}})
+    with pytest.raises(ValueError, match="journey_speak_pair_unbound"):
+        speak(journey)
+
+
+def test_speak_refuses_missing_voice_activity(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, vad=False)
+    with pytest.raises(ValueError, match="journey_speak_voice_activity"):
+        speak(journey)
+    assert journey.speak_receipt["voiceActivityOrdered"] is False
+
+
+def test_speak_refuses_ended_before_started(tmp_path, monkeypatch):
+    flow = speak_flow()
+    flow[2][0], flow[2][1] = flow[2][1], flow[2][0]
+    journey = speak_journey(tmp_path, monkeypatch, flow, audio_at={4: 6})
+    with pytest.raises(ValueError, match="journey_speak_voice_activity"):
+        speak(journey)
+
+
+def test_speak_refuses_a_turn_with_no_agent_audio(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {}})
+    with pytest.raises(ValueError, match="journey_speak_no_audio"):
+        speak(journey)
+    assert journey.speak_receipt["agentAudioFrames"] == 0
+
+
+def test_speak_refuses_audio_that_is_below_the_threshold(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {4: 1}})
+    with pytest.raises(ValueError, match="journey_speak_no_audio"):
+        speak(journey)
+
+
+def test_speak_audio_before_the_final_cannot_satisfy_the_response_window(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {2: 20, 3: 20}})
+    with pytest.raises(ValueError, match="journey_speak_no_audio"):
+        speak(journey)
+    assert journey.speak_receipt["inputWindowAudioFrames"] == 40
+
+
+def test_speak_splits_worker_audio_between_the_input_and_response_windows(tmp_path, monkeypatch):
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"audio_at": {2: 20, 3: 20, 4: 6}})
+    speak(journey)
+    receipt = journey.speak_receipt
+    assert (receipt["inputWindowAudioFrames"], receipt["agentAudioFrames"]) == (40, 6)
+
+
+def test_a_second_activation_never_publishes_another_track_or_media_request(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    room = FakeRoom()
+    voice = client.SyntheticVoice(fake_rtc(), room, SPEAK_WORKER)
+    posted = []
+
+    async def post(payload):
+        posted.append(payload)
+        return {"mediaIncarnation": payload["mediaIncarnation"], "version": 1}
+
+    async def twice():
+        await voice.activate(post)
+        await voice.activate(post)
+
+    with pytest.raises(ValueError, match="journey_speak_once"):
+        asyncio.run(twice())
+    assert len(room.published) == 1 and posted == [{"mediaIncarnation": 1}]
+
+
+def test_speak_refuses_new_work(tmp_path, monkeypatch):
+    task = ("task_state", {"taskId": "task_new_speak", "status": "active"})
+    flow = speak_flow()
+    flow[2].append(task)
+    journey = speak_journey(tmp_path, monkeypatch, flow, audio_at={4: 6})
+    with pytest.raises(ValueError, match="journey_followup_dispatched"):
+        speak(journey)
+
+
+def test_speak_requires_a_quiet_start_with_no_active_task(tmp_path, monkeypatch):
+    journey = passing_speak(
+        tmp_path, monkeypatch,
+        kwargs={"before": [task_state("active")], "audio_at": {4: 6}},
+    )
+    with pytest.raises(ValueError, match="journey_speak_not_quiet"):
+        speak(journey)
+    assert journey.media == []
+
+
+def test_speak_requires_playback_to_settle_first(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"settle": True, "audio_at": {4: 6}})
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 60.0)
+    with pytest.raises(ValueError, match="journey_speak_not_quiet"):
+        speak(journey)
+    assert journey.media == [] and journey.room.published == []
+
+
+def test_speak_requires_no_open_foreground_turn_at_start(tmp_path, monkeypatch):
+    before = [("first_foreground_token", {"turnId": "old_turn", "turnGeneration": 1})]
+    journey = passing_speak(tmp_path, monkeypatch, kwargs={"before": before, "audio_at": {4: 6}})
+    with pytest.raises(ValueError, match="journey_speak_not_quiet"):
+        speak(journey)
+
+
+def test_only_the_worker_identity_audio_is_counted(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    rtc, room = fake_rtc(), FakeRoom()
+    voice = client.SyntheticVoice(rtc, room, SPEAK_WORKER)
+
+    async def run():
+        voice.meter.start()
+        audio = SimpleNamespace(kind="audio", name="audio")
+        for identity in ("someone_else", SPEAK_WORKER, "worker_preview_speak_two"):
+            participant = SimpleNamespace(identity=identity)
+            room.emit("track_subscribed", SimpleNamespace(kind="audio", tag=identity),
+                      audio, participant)
+        await asyncio.gather(*voice.meter._tasks)
+
+    asyncio.run(run())
+    assert [track.tag for track in FakeAudioStream.tracks] == [SPEAK_WORKER]
+    assert voice.meter.totals() == (3, 30)
+
+
+def test_only_the_worker_audio_publication_is_subscribed(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    rtc, room = fake_rtc(), FakeRoom()
+    voice = client.SyntheticVoice(rtc, room, SPEAK_WORKER)
+    asked = []
+    publication = lambda kind, name: SimpleNamespace(  # noqa: E731
+        kind=kind, set_subscribed=lambda value: asked.append((name, value))
+    )
+    voice.meter.start()
+    room.emit("track_published", publication("audio", "other"), SimpleNamespace(identity="x"))
+    room.emit("track_published", publication("video", "video"),
+              SimpleNamespace(identity=SPEAK_WORKER))
+    room.emit("track_published", publication("audio", "worker"),
+              SimpleNamespace(identity=SPEAK_WORKER))
+    assert asked == [("worker", True)]
+
+
+def test_audio_frames_are_never_retained_or_written(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    meter = client.SyntheticVoice(fake_rtc(), FakeRoom(), SPEAK_WORKER).meter
+    meter.observe(fake_frame(8000))
+    meter.observe(fake_frame(0))
+    assert meter.totals() == (1, 10)
+    assert not any(isinstance(v, (bytes, bytearray, memoryview)) for v in vars(meter).values())
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_scenario_accepts_one_exact_speak_step_and_refuses_a_second_or_extra_fields(tmp_path):
+    def scenario(*steps):
+        path = tmp_path / "speak.json"
+        path.write_text(json.dumps({"version": 1, "steps": list(steps)}), encoding="utf-8")
+        return load_scenario(path)
+
+    assert scenario({"label": "hello", "kind": "speak"})[0]["kind"] == "speak"
+    for bad in (
+        [{"label": "a", "kind": "speak"}, {"label": "b", "kind": "speak"}],
+        [{"label": "a", "kind": "speak", "text": "Hi"}],
+        [{"label": "a", "kind": "speak", "task": "x"}],
+    ):
+        with pytest.raises(ValueError, match="journey_(speak|step)"):
+            scenario(*bad)
+
+
+def test_the_speak_fixture_is_pinned_by_sha256(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    assert client.load_speak_fixture()[1] == ("hello", "can", "you", "hear", "me")
+    monkeypatch.setattr(client, "_SPEAK_FIXTURE_SHA256", "0" * 64)
+    with pytest.raises(ValueError, match="journey_speak_fixture"):
+        client.load_speak_fixture()
+
+
+def test_the_fixture_is_streamed_as_ten_millisecond_frames_with_bounded_silence():
+    import scripts.native_typed_journey as client
+
+    frames, _ = client.load_speak_fixture()
+    assert {len(frame) for frame in frames} == {960}
+    assert 100 <= len(frames) <= 600
+    assert frames[0] == bytes(960) and frames[-1] == bytes(960)
+
+
+def test_media_route_is_allowed_on_the_v1_endpoint(monkeypatch):
+    import scripts.native_typed_journey as client
+
+    seen = []
+
+    class Response:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return b'{"mediaIncarnation":1,"version":1}'
+
+    def opened(request, **_kwargs):
+        seen.append((request.full_url, request.data))
+        return Response()
+
+    monkeypatch.setattr(
+        client.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=opened),
+    )
+    code, value = client.request_json(
+        "http://127.0.0.1:1", "media", token="t", payload={"mediaIncarnation": 1}
+    )
+    assert (code, value) == (202, {"mediaIncarnation": 1, "version": 1})
+    assert seen == [("http://127.0.0.1:1/api/v1/media", b'{"mediaIncarnation": 1}')]
+    with pytest.raises(ValueError, match="journey_route"):
+        client.request_json("http://127.0.0.1:1", "audio-diagnostic")
+
+
+def test_execute_gives_a_speak_journey_exactly_the_worker_bound_voice(tmp_path, monkeypatch):
+    import hashlib
+    import sys
+
+    import scripts.native_typed_journey as client
+    from hermes_realtime import host_launcher
+
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              browser_origin="http://127.0.0.1:1", api_origin="http://127.0.0.1:3",
+                              livekit_url="ws://127.0.0.1:2")
+    suffix = hashlib.sha256(str(tmp_path / "active.private.json").encode()).hexdigest()[:16]
+    credential = dict(
+        workerIdentity="worker_preview_" + suffix, roomName="hermes-preview-" + suffix,
+        url=options.livekit_url, token="synthetic-lease", participantIdentity="synthetic",
+        expiresInSeconds=3600,
+    )
+    rooms = []
+
+    class Room(FakeRoom):
+        def __init__(self):
+            super().__init__()
+            rooms.append(self)
+
+        async def connect(self, url, token, options=None):
+            self.options = options
+
+        async def disconnect(self):
+            return None
+
+    rtc = fake_rtc()
+    rtc.Room, rtc.RoomOptions = Room, lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, "livekit", SimpleNamespace(rtc=rtc))
+    monkeypatch.setattr(host_launcher, "_load_api_bearer", lambda _: "synthetic")
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+
+    def request(origin, route, **kwargs):
+        if route == "events":
+            return 200, {"version": 2, "events": []}
+        return (200, credential) if route == "stable-bootstrap" else (200, {})
+
+    monkeypatch.setattr(client, "request_json", request)
+    seen = []
+
+    async def step(self, value):
+        seen.append(self.voice)
+        raise ValueError("journey_stop_here")
+
+    monkeypatch.setattr(client.Journey, "step", step)
+    receipt = {"outcome": "refused"}
+    with pytest.raises(ValueError, match="journey_stop_here"):
+        asyncio.run(client.execute(options, [SPEAK_STEP], receipt))
+    voice = seen[0]
+    assert voice.meter.worker_identity == credential["workerIdentity"]
+    assert rooms[0].options == {"auto_subscribe": False}
+    assert rooms[0].published == []  # the mic track is published inside the step only
+    assert set(rooms[0].handlers) == {"track_published", "track_subscribed"}
+    # A typed-only scenario gets no voice, no handlers and no subscription.
+    seen.clear()
+    rooms.clear()
+    with pytest.raises(ValueError, match="journey_stop_here"):
+        asyncio.run(client.execute(options, [{"label": "a", "kind": "conversation",
+                                              "text": "Hi"}], {"outcome": "refused"}))
+    assert seen == [None] and rooms[0].handlers == {}

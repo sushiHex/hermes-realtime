@@ -174,4 +174,29 @@ evidence takes precedence. The client does not infer semantic
 recall accuracy, source quality, phonemes, microphone recognition, or voice
 interruption from an HTTP transcript. Those remain separate acceptance checks.
 
+## Synthetic `speak` step
+
+A `speak` step has exactly `label` and `kind`; a scenario may hold one. It streams
+the sha256-pinned synthetic clip `tests/fixtures/audio/sapi_hello_can_you_hear_me.wav`
+(`Hello, can you hear me?`, Windows SAPI, no human speech) into the preview's LiveKit
+room as microphone audio: one `microphone-1` track at 48 kHz mono in 10 ms frames at
+real-time pace, with bounded leading and trailing silence, then one `/api/v1/media`
+activation. The audio crosses the real VAD, STT, foreground model and TTS. Only the
+worker's audio track (the exact validated worker identity) is subscribed, and received
+PCM is measured by RMS and discarded; nothing is written to disk or the receipt.
+
+Microphone input emits no `typed_input_admitted`, so the step is attributed strictly.
+It passes only when the session starts quiet (no active task, no open foreground turn,
+no worker audio for a settle period), voice activity started then ended, exactly one
+new user `transcript_final` whose lowercased, punctuation-stripped words equal the
+fixture's, exactly one new foreground pair bound by `first_foreground_token` after that
+final and completed, no new task, and non-silent worker audio inside that response
+window. More than one final, an unbound or concurrent turn, a missing pair or no audio
+fails. The receipt's `speak` object holds booleans and counts only: no transcript text,
+identity or audio.
+
+This is a controlled synthetic path. It bypasses the physical microphone and acoustic
+echo cancellation. It does not prove source-attributed microphone qualification or the
+naturalness of the conversation.
+
 Offline checks: `uv run pytest -q tests/test_native_typed_journey.py`.
