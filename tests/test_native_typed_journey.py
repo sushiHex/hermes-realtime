@@ -1745,3 +1745,285 @@ def test_receipt_reports_host_refused_classification(tmp_path, monkeypatch):
         "web": {"classification": "host_refused", "refusal": "insufficient"}
     }
     assert receipt["outcome"] == "refused"
+
+
+# Content-free per-step diagnostics (#237). They explain a verdict; they never change it.
+
+PRIVATE_MARKERS = ("cancel_turn", "old_turn", CANCEL_TASK, CANCEL_RUN, CANCEL_TEXT)
+
+
+def diagnose_execute(tmp_path, monkeypatch, step_rows, *, witness="cancelled",
+                     cleanup_rows=(), fail="journey_turn_incomplete", prior_rows=(),
+                     collected=None, cleanup=None):
+    """Run execute() with one synthetic step that consumes ``step_rows`` then fails.
+
+    ``collected`` retains a collect() result for the step's task before it fails.
+    ``cleanup`` collects mandatory cleanup calls in order, plus whether any other
+    callback ran (a suspension) between the step's failure and settle_owned.
+    Returns the receipt, cleanup inputs, and the native witnesses constructed.
+    """
+    import hashlib
+    import sys
+
+    import scripts.native_typed_journey as client
+    from hermes_realtime import host_launcher
+
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              browser_origin="http://127.0.0.1:1", api_origin="http://127.0.0.1:3",
+                              livekit_url="ws://127.0.0.1:2")
+    suffix = hashlib.sha256(str(tmp_path / "active.private.json").encode()).hexdigest()[:16]
+    credential = dict(
+        workerIdentity="worker_preview_" + suffix, roomName="hermes-preview-" + suffix,
+        url=options.livekit_url, token="synthetic-lease", participantIdentity="synthetic",
+        expiresInSeconds=3600,
+    )
+
+    class Room:
+        async def connect(self, *args, **kwargs):
+            pass
+
+        async def disconnect(self):
+            if cleanup is not None:
+                cleanup.append("disconnect")
+
+    monkeypatch.setitem(sys.modules, "livekit", SimpleNamespace(rtc=SimpleNamespace(
+        Room=Room, RoomOptions=lambda **kwargs: kwargs)))
+    monkeypatch.setattr(host_launcher, "_load_api_bearer", lambda _: "synthetic")
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+    constructed = []
+
+    def witness_factory(*args, **kwargs):
+        constructed.append(True)
+        return SimpleNamespace(read=lambda: {"terminal": witness, "toolCalls": []})
+
+    monkeypatch.setattr(client, "NativeRunWitness", witness_factory)
+    suspended = []
+    if cleanup is not None:
+        real_settle = client.Journey.settle_owned
+
+        async def settle_owned(self):
+            cleanup.append("settle_owned_after_suspension" if suspended else "settle_owned")
+            return await real_settle(self)
+
+        monkeypatch.setattr(client.Journey, "settle_owned", settle_owned)
+    inputs, pending = [], []
+
+    def request(origin, route, **kwargs):
+        if route == "stop" and cleanup is not None:
+            cleanup.append("stop")
+        if route == "input":
+            inputs.append(kwargs["payload"])
+            start = len(history) + 1
+            pending.append(numbered(list(cleanup_rows), start))
+            return 202, {}
+        if route == "events":
+            return 200, {"version": 2, "events": pending.pop(0) if pending else []}
+        return (200, credential) if route == "stable-bootstrap" else (200, {})
+
+    monkeypatch.setattr(client, "request_json", request)
+    before = [task_state("active"), *prior_rows]
+    history = [*before, *step_rows]
+
+    async def step(self, value):
+        self.tracker.consume(numbered(before, 1))
+        self.bindings["work"] = (CANCEL_TASK, CANCEL_RUN)
+        self.sequence += 1
+        self.tracker.begin(value["label"], self.sequence, CANCEL_TEXT)
+        self.tracker.records[-1]["task"] = "work"
+        self.tracker.consume(numbered(step_rows, len(before) + 1))
+        if collected is not None:
+            self.results["work"] = {"terminal": collected, "toolCalls": []}
+        # Runs only if execute() suspends before mandatory cleanup begins.
+        asyncio.get_running_loop().call_soon(suspended.append, True)
+        raise ValueError(fail)
+
+    monkeypatch.setattr(client.Journey, "step", step)
+    receipt = {"outcome": "refused"}
+    with pytest.raises(ValueError, match=fail):
+        asyncio.run(client.execute(options, [{"label": "stop"}], receipt))
+    return receipt, inputs, constructed
+
+
+def test_mandatory_cleanup_follows_the_failure_with_no_diagnostic_suspension(
+    tmp_path, monkeypatch,
+):
+    cleanup = []
+    rows = tokenless_cancel_turn() + settled()
+    receipt, inputs, constructed = diagnose_execute(tmp_path, monkeypatch, rows, cleanup=cleanup)
+    # No await precedes settle_owned, so nothing (not even a cancellation) can run between
+    # the failure and mandatory cleanup; all of it completes and the failure is kept.
+    assert cleanup == ["settle_owned", "stop", "disconnect"]
+    assert receipt["cleanup"] == {
+        "ownedTasksSettled": True, "sessionStopped": True, "roomDisconnected": True,
+    }
+    assert receipt["outcome"] == "refused" and inputs == [] and constructed == []
+    assert receipt["diagnostics"]["preCleanupTasks"] == {
+        "work": {"trackerStatus": "interrupted", "nativeTerminal": None},
+    }
+
+
+def test_diagnostics_never_construct_a_native_witness(tmp_path, monkeypatch):
+    # Already terminal, never collected: the one case a diagnostic read could tempt.
+    rows = tokenless_cancel_turn() + settled()
+    receipt, inputs, constructed = diagnose_execute(tmp_path, monkeypatch, rows)
+    assert constructed == [] and inputs == []
+    assert receipt["diagnostics"]["steps"][0]["nativeTerminal"] is None
+
+
+def test_diagnostics_explain_an_uncorrelated_cancel_turn_without_changing_the_verdict(
+    tmp_path, monkeypatch,
+):
+    rows = tokenless_cancel_turn()
+    rows[-1] = completed(sequence=None)  # The no-capture host omits the typed lineage.
+    rows += [("assistant_turn_completed", {"turnId": "old_turn", "turnGeneration": 2}),
+             *settled()]
+    receipt, inputs, constructed = diagnose_execute(tmp_path, monkeypatch, rows)
+    assert receipt["outcome"] == "refused" and receipt["turns"][0]["outcome"] == "pending"
+    assert receipt["cleanup"] == {
+        "ownedTasksSettled": True, "sessionStopped": True, "roomDisconnected": True,
+    }
+    assert inputs == [] and constructed == []  # Already terminal: no cleanup cancel.
+    assert receipt["diagnostics"] == {
+        "version": 1,
+        "steps": [{
+            "label": "stop",
+            "admissionObserved": True,
+            "admittedInputValid": True,
+            "terminalKinds": {"completed": 2, "interrupted": 0},
+            "terminals": [
+                {"kind": "completed", "turnIdPresent": True, "inputSequencePresent": False,
+                 "bindingGenerationPresent": False, "inputMatchesAdmitted": False,
+                 "priorPair": False, "bound": False},
+                {"kind": "completed", "turnIdPresent": True, "inputSequencePresent": False,
+                 "bindingGenerationPresent": False, "inputMatchesAdmitted": False,
+                 "priorPair": False, "bound": False},
+            ],
+            "terminalsOmitted": 0,
+            "targetCancelObserved": True,
+            "targetCancelAfterAdmission": True,
+            "nativeTerminal": None,  # Not read: collect() did not run for this task.
+        }],
+        "preCleanupTasks": {"work": {"trackerStatus": "interrupted", "nativeTerminal": None}},
+    }
+    assert not any(marker in json.dumps(receipt) for marker in PRIVATE_MARKERS)
+
+
+def test_diagnostics_report_a_bound_correlated_terminal_and_prior_pairs(tmp_path, monkeypatch):
+    rows = [admitted(), user_final(),
+            ("assistant_turn_interrupted", {"turnId": "old_turn", "turnGeneration": 1,
+                                            "inputSequence": 1, "bindingGeneration": 8}),
+            completed(), *settled()]
+    receipt, _, _ = diagnose_execute(tmp_path, monkeypatch, rows)
+    diagnosis = receipt["diagnostics"]["steps"][0]
+    assert diagnosis["terminalKinds"] == {"completed": 1, "interrupted": 1}
+    assert [(row["kind"], row["inputMatchesAdmitted"], row["bound"])
+            for row in diagnosis["terminals"]] == [
+        ("interrupted", False, False), ("completed", True, True),
+    ]
+    assert receipt["turns"][0]["terminalBinding"] == "admittedInput"
+
+
+def test_diagnostics_flag_a_terminal_whose_pair_predates_the_step(tmp_path, monkeypatch):
+    prior = [("assistant_turn_completed", {"turnId": "old_turn", "turnGeneration": 1})]
+    rows = [admitted(), user_final(), completed(turn="old_turn"), *settled()]
+    receipt, _, _ = diagnose_execute(tmp_path, monkeypatch, rows, prior_rows=prior)
+    terminal = receipt["diagnostics"]["steps"][0]["terminals"][0]
+    assert (terminal["inputMatchesAdmitted"], terminal["priorPair"], terminal["bound"]) == (
+        True, True, False,
+    )
+
+
+def test_diagnostics_count_only_the_steps_own_target_cancellation(tmp_path, monkeypatch):
+    rows = [admitted(), user_final(), task_state("active", "task_other"),
+            task_state("cancelling", "task_other"), completed()]
+    receipt, _, _ = diagnose_execute(tmp_path, monkeypatch, rows, cleanup_rows=settled())
+    diagnosis = receipt["diagnostics"]["steps"][0]
+    assert (diagnosis["targetCancelObserved"], diagnosis["targetCancelAfterAdmission"]) == (
+        False, False,
+    )
+    assert "task_other" not in json.dumps(receipt)
+
+
+def test_diagnostics_without_admission_leave_input_equality_unknown(tmp_path, monkeypatch):
+    rows = [user_final(), task_state("cancelling"), completed()]
+    receipt, _, _ = diagnose_execute(
+        tmp_path, monkeypatch, rows, cleanup_rows=settled(),
+    )
+    diagnosis = receipt["diagnostics"]["steps"][0]
+    assert (diagnosis["admissionObserved"], diagnosis["admittedInputValid"]) == (False, False)
+    assert diagnosis["terminals"][0]["inputMatchesAdmitted"] is None
+    assert diagnosis["targetCancelObserved"] is True
+    assert diagnosis["targetCancelAfterAdmission"] is False
+
+
+def test_pre_cleanup_snapshot_survives_cleanup(tmp_path, monkeypatch):
+    rows = [admitted(), user_final(), completed()]
+    receipt, inputs, constructed = diagnose_execute(
+        tmp_path, monkeypatch, rows, cleanup_rows=settled(),
+    )
+    # Cleanup still cancels the active task and collects it exactly as before.
+    assert inputs == [{"sequence": 2, "text": "cancel task: " + CANCEL_TASK}]
+    assert constructed == [True]  # cleanup's own collect(), never diagnostics.
+    assert receipt["tasks"]["work"]["terminal"] == "cancelled"
+    # The snapshot taken before cleanup is unchanged by what cleanup then did.
+    diagnostics = receipt["diagnostics"]
+    assert diagnostics["preCleanupTasks"] == {
+        "work": {"trackerStatus": "active", "nativeTerminal": None},
+    }
+    assert diagnostics["steps"][0]["targetCancelObserved"] is False
+    assert diagnostics["steps"][0]["nativeTerminal"] is None
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed", "cancelled", "surprising"])
+def test_native_terminal_is_the_retained_collect_category(tmp_path, monkeypatch, terminal):
+    rows = tokenless_cancel_turn() + settled()
+    receipt, _, constructed = diagnose_execute(tmp_path, monkeypatch, rows, collected=terminal)
+    expected = terminal if terminal != "surprising" else "other"
+    assert constructed == []
+    assert receipt["diagnostics"]["preCleanupTasks"]["work"]["nativeTerminal"] == expected
+    assert receipt["diagnostics"]["steps"][0]["nativeTerminal"] == expected
+
+
+def test_diagnostic_failure_never_changes_verdict_or_cleanup(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("synthetic diagnostic failure")
+
+    monkeypatch.setattr(client, "_journey_diagnostics", explode)
+    rows = tokenless_cancel_turn() + settled()
+    receipt, _, _ = diagnose_execute(tmp_path, monkeypatch, rows)
+    assert "diagnostics" not in receipt
+    assert receipt["cleanup"] == {
+        "ownedTasksSettled": True, "sessionStopped": True, "roomDisconnected": True,
+    }
+
+
+def test_diagnostics_never_overflow_an_otherwise_fitting_receipt(tmp_path, monkeypatch, capsys):
+    import scripts.native_typed_journey as client
+
+    _, receipt, argv = os_error_options(tmp_path)
+    baseline = {"version": 1, "outcome": "refused", "executed": True, "stepCount": 1,
+                "failure": "journey_turn_incomplete", "padding": ""}
+    padding = "x" * (65536 - len(json.dumps(baseline, sort_keys=True)))
+
+    async def execute(options, steps, result):
+        result.update(baseline | {"padding": padding})
+        result["diagnostics"] = {"version": 1, "steps": [{"label": "stop"}]}
+        raise ValueError("journey_turn_incomplete")
+
+    monkeypatch.setattr(client, "execute", execute)
+    assert client.main([*argv, "--execute"]) == 1
+    saved = json.loads(receipt.read_text())
+    assert saved == baseline | {"padding": padding}
+    capsys.readouterr()
+
+
+def test_terminal_diagnostics_are_bounded_per_step():
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.consume([event(index, "assistant_turn_completed", turnId=f"foreign_{index}",
+                           turnGeneration=1) for index in range(1, 12)])
+    record = tracker.records[-1]
+    assert len(record["terminals"]) == 8 and record["omitted"] == 3
+    assert record["kinds"] == {"completed": 11, "interrupted": 0}

@@ -32,6 +32,16 @@ TERMINAL = {"completed", "failed", "interrupted"}
 _HOST_REFUSALS = {notice: reason for reason, notice in _WEB_REFUSAL_NOTICES.items()} | {
     _WEB_UNVERIFIED_NOTICE: "unverified",
 }
+# Retained collect() categories; None means not read (collect() did not run).
+_NATIVE_DIAGNOSTIC_TERMINALS = {None, "completed", "failed", "cancelled"}
+
+
+def _native_category(value: object) -> str | None:
+    if value is None:
+        return None
+    return value if type(value) is str and value in _NATIVE_DIAGNOSTIC_TERMINALS else "other"
+
+
 _PUBLICATION_TIMING_FIELDS = (
     "firstPublicationMs", "tokenToPublicationMs", "publicationToPlayableMs",
 )
@@ -161,6 +171,8 @@ class EventTracker:
         self.step_cancels: dict[str, int] = {}
         # Tasks whose failed result is exactly a fixed host refusal notice.
         self.host_refusals: dict[str, str] = {}
+        # Per-step diagnosis inputs, in memory only; the receipt gets booleans/counts.
+        self.records: list[dict[str, Any]] = []
         self.started = 0.0
 
     def begin(self, label: str, sequence: int, text: str) -> None:
@@ -187,6 +199,11 @@ class EventTracker:
         self.terminals = {}
         self.admission_event = None
         self.step_cancels = {}
+        self.records.append({
+            "task": None, "admitted": False, "admittedInput": None, "admissionEvent": None,
+            "cancels": self.step_cancels, "pair": None, "priorSeen": self.prior_seen,
+            "kinds": {"completed": 0, "interrupted": 0}, "terminals": [], "omitted": 0,
+        })
         self.started = time.monotonic() * 1000
 
     @staticmethod
@@ -278,6 +295,8 @@ class EventTracker:
                 if not self.admitted:
                     self.admitted_input = self._input_correlation(data)
                     self.admission_event = seq
+                    self.records[-1].update(admitted=True, admittedInput=self.admitted_input,
+                                            admissionEvent=seq)
                 self.admitted = True
             if kind in {"first_foreground_token", "first_playable_audio"} and valid_pair:
                 require(pair in self.markers or len(self.markers) < 128, "journey_marker_bound")
@@ -300,6 +319,16 @@ class EventTracker:
                 require(len(self.seen) <= 128, "journey_identity_bound")
             if kind in {"assistant_turn_completed", "assistant_turn_interrupted"}:
                 outcome = kind.removeprefix("assistant_turn_")
+                record = self.records[-1]
+                record["kinds"][outcome] += 1
+                if len(record["terminals"]) < 8:
+                    record["terminals"].append((
+                        outcome, pair if valid_pair else None, type(pair[0]) is str,
+                        "inputSequence" in data, "bindingGeneration" in data,
+                        self._input_correlation(data),
+                    ))
+                else:
+                    record["omitted"] += 1
                 if valid_pair and pair == self.pair:
                     if self.current["outcome"] == "pending":
                         self.current["outcome"] = outcome
@@ -313,6 +342,7 @@ class EventTracker:
                                 "journey_terminal_bound")
                         self.terminals.setdefault(pair, (outcome, self._input_correlation(data)))
             self._reconcile_terminals()
+            self.records[-1]["pair"] = self.pair
             if not valid_pair or pair != self.pair:
                 continue
             if kind == "assistant_text_generated":
@@ -344,6 +374,53 @@ class EventTracker:
 
     def receipt(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.turns]
+
+
+def _journey_diagnostics(
+    tracker: EventTracker,
+    bindings: dict[str, tuple[str, str]],
+    pre_cleanup: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Content-free per-step facts: booleans, counts and fixed categories only.
+
+    No tuple, turn or task identity, or text leaves memory. Built from state captured
+    before cleanup, so cleanup can neither supply nor erase a step's evidence.
+    """
+    steps = []
+    for turn, record in zip(tracker.turns, tracker.records, strict=True):
+        admitted = record["admittedInput"]
+        cancels, admission = record["cancels"], record["admissionEvent"]
+        bound_task = bindings.get(record["task"]) if record["task"] is not None else None
+        task = None if bound_task is None else bound_task[0]
+        terminals = [
+            {
+                "kind": outcome,
+                "turnIdPresent": has_turn,
+                "inputSequencePresent": has_sequence,
+                "bindingGenerationPresent": has_binding,
+                "inputMatchesAdmitted": None if admitted is None else correlation == admitted,
+                "priorPair": pair is not None and pair in record["priorSeen"],
+                "bound": pair is not None and pair == record["pair"],
+            }
+            for outcome, pair, has_turn, has_sequence, has_binding, correlation
+            in record["terminals"]
+        ]
+        steps.append({
+            "label": turn["label"],
+            "admissionObserved": record["admitted"],
+            "admittedInputValid": admitted is not None,
+            "terminalKinds": dict(record["kinds"]),
+            "terminals": terminals,
+            "terminalsOmitted": record["omitted"],
+            "targetCancelObserved": None if task is None else task in cancels,
+            "targetCancelAfterAdmission": (
+                None if task is None
+                else task in cancels and admission is not None and cancels[task] > admission
+            ),
+            "nativeTerminal": (None if record["task"] is None else
+                               pre_cleanup.get(record["task"], {}).get("nativeTerminal")),
+        })
+    return {"version": 1, "steps": steps, "preCleanupTasks": pre_cleanup}
 
 
 def request_json(
@@ -479,6 +556,7 @@ class Journey:
             text = "cancel task: " + task
         self.sequence += 1
         self.tracker.begin(label, self.sequence, text)
+        self.tracker.records[-1]["task"] = step.get("task")
         await self.request("input", {"sequence": self.sequence, "text": text})
         if kind == "dispatch":
             await self.wait(lambda: bool(set(self.tracker.tasks) - before_tasks)
@@ -492,6 +570,7 @@ class Journey:
                         "journey_turn_interrupted")
             require(len(new_tasks) == len(new_runs) == 1, "journey_admission_binding")
             self.bindings[label] = (next(iter(new_tasks)), next(iter(new_runs)))
+            self.tracker.records[-1]["task"] = label
             require(self.tracker.current["outcome"] != "interrupted", "journey_turn_interrupted")
             if step.get("wait", "completed") == "completed":
                 await self.collect(label)
@@ -549,6 +628,24 @@ class Journey:
                 set(self.tracker.tasks) == before_tasks and self.admissions == before_runs,
                 "journey_followup_dispatched",
             )
+
+    def pre_cleanup_tasks(self) -> dict[str, dict[str, Any]]:
+        """Synchronous task state before cleanup, for diagnosis only; never a verdict input.
+
+        Nothing is awaited and no native witness is read: mandatory cleanup follows with
+        no suspension point in between. The native category is the one collect() already
+        retained, or null when collect() did not run for that task.
+        """
+        tasks: dict[str, dict[str, Any]] = {}
+        for label, (task, _) in self.bindings.items():
+            status = self.tracker.tasks.get(task)
+            native = self.results[label]["terminal"] if label in self.results else None
+            tasks[label] = {
+                "trackerStatus": status if status in {"active", "cancelling", *TERMINAL}
+                else None,
+                "nativeTerminal": _native_category(native),
+            }
+        return tasks
 
     async def settle_owned(self) -> bool:
         # Cleanup commands are not another measured foreground turn.
@@ -621,7 +718,14 @@ async def execute(options, steps, receipt) -> None:
             "sessionStopped": False,
             "roomDisconnected": room is None,
         }
+        diagnostics = None
         if journey is not None:
+            # Diagnosis only, captured synchronously before cleanup acts: no await and no
+            # native read may precede mandatory cleanup, and it never changes a verdict.
+            with contextlib.suppress(Exception):
+                diagnostics = _journey_diagnostics(
+                    journey.tracker, journey.bindings, journey.pre_cleanup_tasks(),
+                )
             with contextlib.suppress(Exception):
                 receipt["cleanup"]["ownedTasksSettled"] = await journey.settle_owned()
             credential = journey.credential
@@ -646,6 +750,8 @@ async def execute(options, steps, receipt) -> None:
             )
             if journey.failures:
                 receipt["taskFailures"] = journey.failures
+            if diagnostics is not None:
+                receipt["diagnostics"] = diagnostics
         if receipt["outcome"] == "completed":
             require(all(receipt["cleanup"].values()), "journey_cleanup_unsettled")
 
@@ -717,6 +823,10 @@ def main(argv: list[str] | None = None) -> int:
                 receipt["osError"] = _os_error_evidence(error)
     finally:
         raw = json.dumps(receipt, sort_keys=True)
+        if len(raw) > 65_536 and "diagnostics" in receipt:
+            # Diagnosis is the most optional evidence: it goes first, never the verdict.
+            receipt.pop("diagnostics")
+            raw = json.dumps(receipt, sort_keys=True)
         if len(raw) > 65_536 and type(receipt.get("turns")) is list:
             # Passive timings cannot reject a previously fitting receipt or
             # displace its existing failure evidence. Keep the original bound.

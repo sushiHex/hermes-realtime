@@ -128,6 +128,23 @@ are cancelled by exact task ID before the client stops its browser lease and
 disconnects; services and native processes remain owned by the preview owner.
 Unresolved cleanup is reported, never treated as a successful journey.
 
+An executed receipt may also carry `diagnostics`, which explains a verdict but
+never changes it or the cleanup status. For each step it records whether this
+step's `typed_input_admitted` arrived and carried a valid tuple. It counts the
+step's terminal kinds and, for up to eight terminals, records whether `turnId`,
+`inputSequence` and `bindingGeneration` were present, whether the correlation
+equalled the admitted tuple (null when none was admitted), whether the pair
+predates the step, and whether it was the bound one. For a task-bound step it
+records whether a `cancelling`/`interrupted` state for that step's task was seen
+during the step and after its admission, plus the native terminal category.
+`preCleanupTasks` records each task's tracker status and native category, captured
+synchronously before cleanup acts, so nothing optional can delay or skip mandatory
+cleanup. Diagnostics perform no native I/O: the native category is the one
+`collect()` already retained for that task, or null meaning "not read; collect()
+did not run". Cleanup's own later collection does not change the snapshot. No
+tuple, ID or text is recorded, and `diagnostics` is dropped first if it would
+overflow the receipt.
+
 When the existing failure handler catches an `OSError`, its receipt may include
 `osError`: a fixed source-context function and line, `journal`/`scenario`/`other`
 path role, fixed exception kind, and nullable bounded `errno`/`winerror` numbers.
