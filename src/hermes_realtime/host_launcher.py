@@ -786,6 +786,7 @@ async def _play_readiness_cue(
     participant_identity: str,
     generation: int,
     is_valid: Callable[[], bool],
+    on_input_ready: Callable[[], None],
     task_proposals: ConversationTaskProposals | None = None,
 ) -> None:
     """Play the readiness cue with this binding's audio input suppressed.
@@ -794,17 +795,29 @@ async def _play_readiness_cue(
     own hard stop, which releases its chunk. The binding's connection can then be unbound,
     and the page rebound, at once; a chunk still in flight would make the publisher refuse
     that unbind.
+
+    ``on_input_ready`` announces voice readiness only once this cue no longer suppresses
+    input: after its release on success or failure, or at once when the cue could not
+    suppress input. A cancelled cue (its binding or the host is closing) announces nothing.
     """
 
-    token = await conversation.suppress_audio_input(
-        participant_identity=participant_identity,
-        session_generation=generation,
-        speech=asyncio.current_task(),
-    )
+    try:
+        token = await conversation.suppress_audio_input(
+            participant_identity=participant_identity,
+            session_generation=generation,
+            speech=asyncio.current_task(),
+        )
+    except Exception:
+        on_input_ready()
+        raise
+    cancelled = False
     try:
         if task_proposals is not None:
             task_proposals.speech_started()
         await playback.play(chunk, is_valid=is_valid)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
         resume_task = asyncio.create_task(
             conversation.resume_audio_input(token),
@@ -815,6 +828,8 @@ async def _play_readiness_cue(
         except asyncio.CancelledError:
             await asyncio.gather(resume_task, return_exceptions=True)
             raise
+        if not cancelled:
+            on_input_ready()
 
 
 class _ReadinessCueAuthority:
@@ -2701,9 +2716,12 @@ def build_local_host_launcher(
         participant_identity: str,
         generation: int,
         media_incarnation: int,
+        announce_ready: Callable[[], None],
     ) -> None:
+        # Readiness is announced only where no cue suppresses this binding's input.
         template = readiness_cue_template
         if template is None:
+            announce_ready()
             return
         chunk = _readiness_cue_chunk(
             template,
@@ -2713,12 +2731,14 @@ def build_local_host_launcher(
 
         async def play_with_suppressed_input() -> None:
             if speech.active_turn_id is not None or playback_gate.locked():
+                announce_ready()
                 return
             async with playback_gate:
                 if speech.active_turn_id is not None or not readiness_cue_authority.admit(
                     generation,
                     media_incarnation,
                 ):
+                    announce_ready()
                     return
                 await _play_readiness_cue(
                     conversation=conversation,
@@ -2728,6 +2748,7 @@ def build_local_host_launcher(
                     generation=generation,
                     task_proposals=proposals,
                     is_valid=lambda: media_incarnations.get(generation) == media_incarnation,
+                    on_input_ready=announce_ready,
                 )
 
         readiness_cue_tasks.create(
@@ -2829,12 +2850,12 @@ def build_local_host_launcher(
 
         def voice_input_ready() -> None:
             media_incarnation = media_incarnations.get(generation)
-            _publish_voice_input_ready(projection, generation, media_incarnation)
             if media_incarnation is not None:
                 schedule_readiness_cue(
                     participant_identity,
                     generation,
                     media_incarnation,
+                    lambda: _publish_voice_input_ready(projection, generation, media_incarnation),
                 )
                 schedule_restart_announcement()
 
