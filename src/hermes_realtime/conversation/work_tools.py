@@ -67,6 +67,12 @@ WORK_ROUTING_POLICY_WITH_CANCEL = (
     "controls; for either, do not select task_status or propose work. "
     + _WORK_ROUTING_TAIL
 )
+WORK_ROUTING_POLICY_WITH_CANCEL_CHOICES = (
+    _WORK_ROUTING_HEAD
+    + "To stop one listed running task, select cancel_work with its choice; for approval, "
+    "direct the user to the controls; for either, do not select task_status or propose work. "
+    + _WORK_ROUTING_TAIL
+)
 
 _MAX_REASON_CHARS = 1024
 _UNAVAILABLE_REASON = "work control unavailable; restart required"
@@ -330,6 +336,40 @@ class ConversationWorkControlSurface:
             return None
         return active_tasks[0].task_id
 
+    def natural_cancel_candidates(self, maximum: int) -> tuple[str, ...] | None:
+        """The exact running tasks a confirmed natural cancel may nominate; else ``None``.
+
+        The same conditions as the sole target, for two to ``maximum`` running tasks. The
+        caller freezes the answer at final-input admission. A nomination is only ever a
+        question the host asks; nothing here authorizes a cancel.
+        """
+
+        if type(maximum) is not int or maximum < 2:
+            raise ValueError("candidate maximum must be an integer of at least two")
+        if self._health is not WorkControlHealth.OPEN:
+            return None
+        active_tasks = self._context.snapshot().active_tasks
+        if not 2 <= len(active_tasks) <= maximum:
+            return None
+        # task_status() reports a pending start (or is unavailable while intake and the
+        # controller disagree), and any cancel pending or accepted, so equality to only
+        # running tasks also excludes both.
+        if self.task_status() != TaskStatusSnapshot(active=len(active_tasks)):
+            return None
+        return tuple(task.task_id for task in active_tasks)
+
+    def natural_cancel_eligible(self, task_id: str) -> bool:
+        """Whether ``task_id`` is running with no start or cancellation in flight."""
+
+        _validate_task_id(task_id)
+        if self._health is not WorkControlHealth.OPEN:
+            return False
+        active_tasks = self._context.snapshot().active_tasks
+        if not any(task.task_id == task_id for task in active_tasks):
+            return False
+        # As above: only running tasks, with no start or cancel pending anywhere.
+        return self.task_status() == TaskStatusSnapshot(active=len(active_tasks))
+
     @staticmethod
     def _logical_work_count(
         active_tasks: tuple[Any, ...],
@@ -489,16 +529,36 @@ class ConversationWorkControlSurface:
         task_id: str,
         invocation_id: str,
         reason: str = "user requested task cancellation",
+        still_current: Callable[[], bool] | None = None,
     ) -> WorkCommandAdmission:
+        """Admit an exact public task cancel command; nothing else is ever selected.
+
+        ``still_current`` is the confirming input's own authority, read under the admission
+        lock as for ``cancel_work``: a command that is no longer current there is refused.
+        """
         _validate_task_id(task_id)
         _validate_identifier(invocation_id, "invocation_id")
         _validate_reason(reason)
+        if still_current is not None and not callable(still_current):
+            raise TypeError("still_current must be callable or None")
         admission = await self._admit_cancel_work(
             invocation_id=invocation_id,
             expected_task_id=task_id,
             reason=reason,
             semantic_kind="cancel_exact",
+            still_current=still_current,
         )
+        if (
+            type(admission) is WorkCancelResult
+            and not admission.accepted
+            and admission.reason == SUPERSEDED_REASON
+        ):
+            # Superseded before admission: a refusal of this command, not lost control.
+            try:
+                return WorkCommandAdmission.REFUSED
+            finally:
+                print('[task-command-refused] {"kind":"cancel","count":1,'
+                      '"category":"superseded"}', flush=True)
         return self._submit_command_admission(admission, kind="cancel")
 
     async def close(self) -> None:

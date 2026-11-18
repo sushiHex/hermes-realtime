@@ -41,6 +41,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "browser-start-lock": {
         "src/hermes_realtime/client/session.py": 1,
     },
+    "cancel-choice-refusal": {
+        "src/hermes_realtime/conversation/streaming.py": 1,
+    },
     "codex-access-credential": {
         "src/hermes_realtime/integration/codex_access_credentials.py": 1,
     },
@@ -421,7 +424,7 @@ EMIT_SITES: dict[str, dict[str, int]] = {
         "src/hermes_realtime/conversation/commands.py": 1,
     },
     "task-command-refused": {
-        "src/hermes_realtime/conversation/work_tools.py": 1,
+        "src/hermes_realtime/conversation/work_tools.py": 2,
     },
     "task-command-settlement": {
         "src/hermes_realtime/conversation/work_tools.py": 1,

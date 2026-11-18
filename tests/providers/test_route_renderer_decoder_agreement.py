@@ -107,12 +107,33 @@ async def _ollama_select(cell: Any, decision: dict[str, object]) -> tuple[Any, A
     return json.loads(request.data).get("format"), outcome
 
 
-def _ollama_decision(kind: str, length: int) -> dict[str, object]:
+def _ollama_decision(
+    kind: str, length: int, branches: Mapping[str, Any] | None = None,
+) -> dict[str, object]:
     if kind == "reply":
         return {"kind": "reply", "text": "Okay."}
     if kind in _ARGUMENT:
         return {"kind": kind, _ARGUMENT[kind]: "x" * length}
+    labels = _ollama_choice_labels(branches or {})
+    if kind == "cancel_work" and labels:
+        return {"kind": kind, "target": labels[-1]}
     return {"kind": kind}
+
+
+def _ollama_choice_labels(branches: Mapping[str, Any]) -> list[str]:
+    """The labels a cancel branch names, or none for the sole cancel."""
+    cancel = branches.get("cancel_work")
+    if cancel is None or "target" not in cancel["properties"]:
+        return []
+    return list(cancel["properties"]["target"]["enum"])
+
+
+# Every cancel argument the multi-task schema does not name, each refused by the decoder.
+_FOREIGN_CANCEL_ARGUMENTS: tuple[dict[str, object], ...] = (
+    {}, {"target": "choice_9"}, {"target": "choice_3"}, {"target": "all"},
+    {"target": "task_earlier"}, {"target": ["choice_1"]}, {"target": None},
+    {"target": "choice_1", "also": "choice_2"}, {"task_id": "task_earlier"},
+)
 
 
 @pytest.mark.asyncio
@@ -128,8 +149,11 @@ async def test_the_local_adapter_accepts_exactly_the_kinds_its_schema_names(
     else:
         bound = 1
 
+    labels = _ollama_choice_labels(branches)
     for kind in ("reply", *_ROUTE_NAMES):
-        sent_format, outcome = await _ollama_select(cell, _ollama_decision(kind, bound))
+        sent_format, outcome = await _ollama_select(
+            cell, _ollama_decision(kind, bound, branches),
+        )
         assert sent_format == expected_format
         if expected_format is None:
             # No envelope was requested, so nothing the model writes can select a route.
@@ -149,10 +173,22 @@ async def test_the_local_adapter_accepts_exactly_the_kinds_its_schema_names(
         elif kind == "cancel_work":
             (cancel,) = outcome
             assert type(cancel) is HostCancelRequest
+            # Exactly the label the schema names, or none for the sole cancel.
+            assert cancel == HostCancelRequest(target=labels[-1] if labels else None)
         else:
             (status,) = outcome
             assert type(status) is HostSpeechRequest
 
+    if labels:
+        for arguments in _FOREIGN_CANCEL_ARGUMENTS:
+            _, outcome = await _ollama_select(cell, {"kind": "cancel_work", **arguments})
+            assert type(outcome) is ModelOutputRefused, arguments
+            assert outcome.category == "decision_schema", arguments
+    elif "cancel_work" in branches:
+        # The sole cancel names no task, so even a well-formed label is refused.
+        _, outcome = await _ollama_select(cell, {"kind": "cancel_work", "target": "choice_1"})
+        assert type(outcome) is ModelOutputRefused
+        assert outcome.category == "decision_schema"
     if "start_work" in branches:
         _, outcome = await _ollama_select(cell, _ollama_decision("start_work", bound + 1))
         assert type(outcome) is ModelOutputRefused
@@ -162,13 +198,18 @@ async def test_the_local_adapter_accepts_exactly_the_kinds_its_schema_names(
 
 def test_the_local_matrix_reaches_every_schema_shape() -> None:
     kinds = {
-        tuple(sorted(_ollama_branches(_ollama_format(request))))
+        (
+            *sorted(_ollama_branches(_ollama_format(request))),
+            *_ollama_choice_labels(_ollama_branches(_ollama_format(request))),
+        )
         for request in _fixture_requests("ollama").values()
     }
 
     assert kinds == {
         (), ("reply",), ("reply", "start_work", "task_status"),
         ("cancel_work", "reply", "start_work", "task_status"),
+        # Two frozen running tasks: the cancel names exactly one of their labels.
+        ("cancel_work", "reply", "start_work", "task_status", "choice_1", "choice_2"),
     }
 
 
@@ -189,19 +230,38 @@ class _CapturingTransport(golden._CodexTransport):
         super().__init__()
         self.inference: Any = None
         self.advertised: Any = None
+        self.advertised_choices: Any = None
 
     async def send(self, message: Mapping[str, object]) -> None:
         if message.get("method") == "turn/start":
             self.advertised = self.inference._advertised_dynamic_tools.get("thread_golden")
+            self.advertised_choices = self.inference._advertised_cancel_choices.get(
+                "thread_golden",
+            )
         await super().send(message)
 
 
-def _probe(inference: Any, advertised: Any, thread: str, tool: str, argument: str) -> Any:
+def _codex_choice_labels(named: Mapping[str, Any]) -> list[str]:
+    """The labels the cancel tool's schema names, or none for the sole cancel."""
+    cancel = named.get("cancel_work")
+    if cancel is None or "target" not in cancel["inputSchema"]["properties"]:
+        return []
+    return list(cancel["inputSchema"]["properties"]["target"]["enum"])
+
+
+def _probe(
+    inference: Any, advertised: Any, thread: str, tool: str, argument: str,
+    *, choices: Any = frozenset(), arguments: dict[str, object] | None = None,
+) -> Any:
     inference._advertised_dynamic_tools[thread] = advertised
+    inference._advertised_cancel_choices[thread] = choices
     ready = asyncio.Event()
     ready.set()
     inference._server_turn_ready[thread] = ready
-    arguments = {_ARGUMENT[tool]: argument} if tool in _ARGUMENT else {}
+    if arguments is None:
+        arguments = {_ARGUMENT[tool]: argument} if tool in _ARGUMENT else {}
+        if tool == "cancel_work" and choices:
+            arguments = {"target": sorted(choices)[-1]}
     item: dict[str, object] = {
         "id": "call_probe", "type": "dynamicToolCall", "namespace": "hermes", "tool": tool,
         "arguments": arguments, "status": "inProgress",
@@ -255,6 +315,8 @@ async def test_the_codex_adapter_accepts_exactly_the_tools_its_request_names(
         assert _codex_tools(sent) == expected_tools
         # What the adapter holds as advertised is exactly what its request named.
         assert transport.advertised == frozenset(("hermes", name) for name in named)
+        labels = _codex_choice_labels(named)
+        assert transport.advertised_choices == frozenset(labels)
 
         bounds = {
             name: tool["inputSchema"]["properties"][_ARGUMENT[name]]["maxLength"]
@@ -265,11 +327,14 @@ async def test_the_codex_adapter_accepts_exactly_the_tools_its_request_names(
         for name in _ROUTE_NAMES:
             outcome = _probe(
                 inference, transport.advertised, f"thread_{name}", name,
-                "x" * bounds.get(name, 1),
+                "x" * bounds.get(name, 1), choices=transport.advertised_choices,
             )
             if name in named:
                 assert type(outcome) is not str, (name, outcome)
                 assert outcome.tool == name and outcome.response is None
+                if name == "cancel_work":
+                    expected = {"target": labels[-1]} if labels else {}
+                    assert outcome.arguments == expected
             elif cell.handler is None and not direct_lookup:
                 assert outcome == "Codex dynamic tool activity is prohibited", name
             elif name == "start_work" and cell.handler is None:
@@ -278,6 +343,20 @@ async def test_the_codex_adapter_accepts_exactly_the_tools_its_request_names(
                 assert outcome == "Codex knowledge search is unavailable"
             else:
                 assert outcome == "Codex invoked an unadvertised dynamic tool", name
+        if labels:
+            for index, arguments in enumerate(_FOREIGN_CANCEL_ARGUMENTS):
+                outcome = _probe(
+                    inference, transport.advertised, f"thread_foreign_{index}", "cancel_work",
+                    "", choices=transport.advertised_choices, arguments=dict(arguments),
+                )
+                assert outcome == "Codex cancel_work arguments are invalid", arguments
+        elif "cancel_work" in named:
+            # The sole cancel names no task, so even a well-formed label is refused.
+            outcome = _probe(
+                inference, transport.advertised, "thread_sole_label", "cancel_work", "",
+                arguments={"target": "choice_1"},
+            )
+            assert outcome == "Codex cancel_work arguments are invalid"
         for name, bound in bounds.items():
             outcome = _probe(
                 inference, transport.advertised, f"thread_over_{name}", name, "x" * (bound + 1),
@@ -293,7 +372,10 @@ async def test_the_codex_adapter_accepts_exactly_the_tools_its_request_names(
 
 def test_the_codex_matrix_reaches_every_tool_set_it_can_offer() -> None:
     tool_sets = {
-        tuple(sorted(_codex_named(_codex_tools(request))))
+        (
+            *sorted(_codex_named(_codex_tools(request))),
+            *_codex_choice_labels(_codex_named(_codex_tools(request))),
+        )
         for request in _fixture_requests("codex_app_server").values()
     }
 
@@ -310,4 +392,7 @@ def test_the_codex_matrix_reaches_every_tool_set_it_can_offer() -> None:
         # Only a host-frozen cancel target adds the cancel route, always beside status.
         ("cancel_work", "start_work", "task_status"),
         ("cancel_work", "search_knowledge", "start_work", "task_status"),
+        # Two frozen running tasks: the cancel names exactly one of their labels.
+        ("cancel_work", "start_work", "task_status", "choice_1", "choice_2"),
+        ("cancel_work", "search_knowledge", "start_work", "task_status", "choice_1", "choice_2"),
     }

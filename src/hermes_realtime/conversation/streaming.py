@@ -54,11 +54,22 @@ from .foreground import (
     ForegroundTurnCoordinator,
     ForegroundTurnLease,
 )
-from .natural_cancel import HostCancelRequest, NaturalCancellation, unaccepted_cancel_speech
+from .natural_cancel import (
+    CANCEL_NOT_ACCEPTED,
+    CANCEL_TARGET_ENDED,
+    MAX_CANCEL_CHOICES,
+    CancelChoice,
+    HostCancelRequest,
+    NaturalCancellation,
+    cancel_choice_label,
+    distinguishable,
+    unaccepted_cancel_speech,
+)
 from .task_proposals import (
     ConversationTaskProposals,
     HostTaskProposalRequest,
     TaskProposal,
+    cancel_readback,
     unaccepted_start_speech,
 )
 from .task_status import HostSpeechRequest, TaskStatusSnapshot
@@ -75,6 +86,19 @@ DEFAULT_MAX_RESPONSE_SEGMENTS = 256
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
 _LOGGER = logging.getLogger(__name__)
+
+
+def _validate_frozen_cancel(frozen: str | tuple[str, ...]) -> None:
+    """A sole target, or two to four distinct exact task identities."""
+    if type(frozen) is str:
+        _validate_task_id(frozen)
+        return
+    if type(frozen) is not tuple or not 2 <= len(frozen) <= MAX_CANCEL_CHOICES:
+        raise ValueError("a frozen cancel offer is one task or two to four tasks")
+    for task_id in frozen:
+        _validate_task_id(task_id)
+    if len(set(frozen)) != len(frozen):
+        raise ValueError("a frozen cancel offer names each task once")
 
 MODEL_OUTPUT_REFUSAL_CATEGORIES = frozenset({
     "call_imitation",
@@ -287,11 +311,14 @@ class ConversationInferenceRequest(ConversationContextSnapshot):
     """Immutable context snapshot plus separately framed proactive updates.
 
     ``cancel_offered`` records that the host froze the one active task as this turn's
-    natural cancel target; the target itself stays with the host.
+    natural cancel target; the target itself stays with the host. ``cancel_choices``
+    instead offers each of several frozen running tasks, in order, as a label the model may
+    nominate for the host to confirm with the user; task identities stay with the host.
     """
 
     updates: tuple[ConversationPromptUpdate, ...] = ()
     cancel_offered: bool = False
+    cancel_choices: tuple[CancelChoice, ...] = ()
 
     def __post_init__(self) -> None:
         ConversationContextSnapshot.__post_init__(self)
@@ -299,6 +326,21 @@ class ConversationInferenceRequest(ConversationContextSnapshot):
             raise TypeError("cancel_offered must be an exact boolean")
         if self.cancel_offered and len(self.active_tasks) != 1:
             raise ValueError("a natural cancel is offered only with exactly one active task")
+        if type(self.cancel_choices) is not tuple or any(
+            type(choice) is not CancelChoice for choice in self.cancel_choices
+        ):
+            raise TypeError("cancel choices must be an exact tuple of CancelChoice values")
+        if self.cancel_choices:
+            if self.cancel_offered:
+                raise ValueError("a request offers the sole cancel or choices, never both")
+            if not 2 <= len(self.cancel_choices) <= MAX_CANCEL_CHOICES:
+                raise ValueError("cancel choices are offered only for two to four tasks")
+            expected = tuple(
+                CancelChoice(cancel_choice_label(index), task.objective)
+                for index, task in enumerate(self.active_tasks, start=1)
+            )
+            if self.cancel_choices != expected:
+                raise ValueError("cancel choices must label exactly the active tasks in order")
         if type(self.updates) is not tuple:
             raise TypeError("inference request updates must be an exact tuple")
         if len(self.updates) > _MAX_PROMPT_UPDATES:
@@ -643,11 +685,13 @@ class StreamingSpeechLoop:
         finally:
             self._priority_admissions -= 1
 
-    def freeze_natural_cancel_target(self) -> str | None:
-        """Read the one natural cancel target at final-input admission; never later.
+    def freeze_natural_cancel_target(self) -> str | tuple[str, ...] | None:
+        """Read the natural cancel offer at final-input admission; never later.
 
-        The caller passes the answer, unchanged, to the turn it admits. The producer only
-        checks it again; it never resolves a target of its own.
+        The answer is the one sole target; or the exact set of several running tasks a
+        confirmed cancel may nominate, offered only where a proposal owner can confirm it;
+        or ``None``. The caller passes it, unchanged, to the turn it admits. The producer
+        only checks it again; it never resolves a target of its own.
         """
         owner = self._task_cancellation
         if owner is None:
@@ -655,7 +699,20 @@ class StreamingSpeechLoop:
         target = owner.natural_cancel_target()
         if target is not None:
             _validate_task_id(target)
-        return target
+            return target
+        candidates = getattr(owner, "natural_cancel_candidates", None)
+        if not callable(candidates):
+            return None
+        frozen: object = candidates(MAX_CANCEL_CHOICES)
+        if frozen is None:
+            return None
+        if type(frozen) is not tuple:
+            raise TypeError("cancel candidates must be an exact tuple or None")
+        candidate_ids = tuple(str(task_id) for task_id in frozen)
+        if candidate_ids != frozen:
+            raise TypeError("cancel candidates must be exact task identities")
+        _validate_frozen_cancel(candidate_ids)
+        return candidate_ids
 
     async def record_user_input(self, transcript: Transcript) -> None:
         """Record one final user input that starts no turn, such as an explicit command.
@@ -765,7 +822,7 @@ class StreamingSpeechLoop:
         updates: tuple[UpdateDecision, ...],
         evidence_lease: EvidenceTurnLease | None = None,
         *, typed_input: tuple[int, int] | None = None,
-        cancel_target: str | None = None,
+        cancel_target: str | tuple[str, ...] | None = None,
     ) -> None:
         self._require_update_authority(authority)
         self._require_update_operation(operation, turn_id)
@@ -773,7 +830,7 @@ class StreamingSpeechLoop:
             raise TypeError("evidence_lease must be exact or None")
         self._validate_transcript(transcript)
         if cancel_target is not None:
-            _validate_task_id(cancel_target)
+            _validate_frozen_cancel(cancel_target)
         prompt_updates = self._prompt_updates(updates)
         self._priority_admissions += 1
         try:
@@ -978,9 +1035,9 @@ class StreamingSpeechLoop:
         evidence_lease: EvidenceTurnLease | None = None,
         yield_to_live_speech: bool = False,
         typed_input: tuple[int, int] | None = None,
-        cancel_target: str | None = None,
+        cancel_target: str | tuple[str, ...] | None = None,
     ) -> bool:
-        # The natural cancel target frozen at final-input admission, if any.
+        # The natural cancel offer frozen at final-input admission, if any.
         intake_cancel_target = cancel_target if transcript is not None else None
         if sum(value is not None for value in (transcript, announcement, segments)) != 1:
             raise ValueError("exactly one turn input must be present")
@@ -1046,6 +1103,8 @@ class StreamingSpeechLoop:
 
             try:
                 cancel_target: str | None = None
+                # Several frozen tasks: each offered label maps to exactly one of them.
+                cancel_choices: dict[str, tuple[str, str]] = {}
                 inference: AsyncIterator[
                     str | HostSpeechRequest | HostTaskProposalRequest | HostCancelRequest
                 ]
@@ -1060,9 +1119,14 @@ class StreamingSpeechLoop:
                     # The target was frozen at final-input admission. Here it is only
                     # checked against this snapshot; the selection below cancels exactly
                     # it or nothing, and nothing is resolved again.
-                    cancel_target = self._natural_cancel_target(
-                        source_snapshot, intake_cancel_target,
-                    )
+                    if type(intake_cancel_target) is tuple:
+                        cancel_choices = self._natural_cancel_choices(
+                            source_snapshot, intake_cancel_target,
+                        )
+                    elif type(intake_cancel_target) is str:
+                        cancel_target = self._natural_cancel_target(
+                            source_snapshot, intake_cancel_target,
+                        )
                     snapshot = ConversationInferenceRequest(
                         revision=source_snapshot.revision,
                         messages=source_snapshot.messages,
@@ -1072,6 +1136,10 @@ class StreamingSpeechLoop:
                         recent_task_results=source_snapshot.recent_task_results,
                         updates=updates,
                         cancel_offered=cancel_target is not None,
+                        cancel_choices=tuple(
+                            CancelChoice(label, objective)
+                            for label, (_task_id, objective) in cancel_choices.items()
+                        ),
                     )
                     committed_conversation_context_snapshot = (
                         _committed_conversation_context_snapshot_bytes(
@@ -1110,6 +1178,7 @@ class StreamingSpeechLoop:
                 host_item_seen = False
                 automatic_proposal: HostTaskProposalRequest | None = None
                 cancel_selected = False
+                cancel_nominated: tuple[str, str] | None = None
                 iteration_error: BaseException | None = None
                 pending_initial_segment: str | None = None
                 coalesce_initial_segment = transcript is not None and segments is None
@@ -1119,13 +1188,22 @@ class StreamingSpeechLoop:
                             self._refuse_host_speech("after_terminal")
                         source = "conversation"
                         if type(segment) is HostCancelRequest:
-                            # Only the target frozen for this turn; never resolved now.
-                            if cancel_target is None:
-                                self._refuse_host_speech("unadvertised_cancel", kind="cancel_work")
+                            # Only the target, or one of the choices, frozen for this turn;
+                            # never resolved now.
+                            if segment.target is None:
+                                if cancel_target is None:
+                                    self._refuse_host_speech(
+                                        "unadvertised_cancel", kind="cancel_work",
+                                    )
+                            elif segment.target not in cancel_choices:
+                                self._refuse_host_speech("unoffered_choice", kind="cancel_work")
                             if not lease.is_current:
                                 break
                             host_item_seen = True
-                            cancel_selected = True
+                            if segment.target is None:
+                                cancel_selected = True
+                            else:
+                                cancel_nominated = cancel_choices[segment.target]
                             coalesce_initial_segment = False
                             pending_initial_segment = None
                             continue
@@ -1240,9 +1318,12 @@ class StreamingSpeechLoop:
                     close_error,
                     producer_after_text=text_seen,
                 )
-                async def speak_host_refusal(refusal: str) -> None:
+                async def speak_host_refusal(
+                    refusal: str, *, source: str = "host_task_status",
+                ) -> None:
                     # A fixed host sentence chosen by result category, never the
-                    # result's reason; spoken only under this still-current lease.
+                    # result's reason, or a host readback; spoken only under this
+                    # still-current lease.
                     nonlocal segment_count, text_seen
                     if not lease.is_current:
                         return
@@ -1251,9 +1332,7 @@ class StreamingSpeechLoop:
                             or len(refusal) > self._max_segment_chars):
                         raise ValueError("host refusal speech capacity exceeded")
                     text_seen = True
-                    await lease.publish(
-                        refusal, on_admit=admit_generated, source="host_task_status",
-                    )
+                    await lease.publish(refusal, on_admit=admit_generated, source=source)
 
                 async def acknowledge(
                     acknowledged: AcceptedStartInferenceRequest | AcceptedCancelInferenceRequest,
@@ -1356,6 +1435,35 @@ class StreamingSpeechLoop:
                                 ),
                                 stop_when_inactive=False,
                             )
+                if cancel_nominated is not None and lease.is_current:
+                    # A nomination mutates nothing: the host asks about exactly the frozen
+                    # task, and only a fresh affirmative of that heard question cancels it.
+                    nominated_task_id, nominated_objective = cancel_nominated
+                    owner = self._task_cancellation
+                    proposals = self._task_proposals
+                    assert owner is not None and proposals is not None
+                    eligible = getattr(owner, "natural_cancel_eligible", None)
+                    if not any(
+                        task.task_id == nominated_task_id
+                        for task in self._context.snapshot().active_tasks
+                    ):
+                        await speak_host_refusal(CANCEL_TARGET_ENDED)
+                    elif (
+                        not callable(eligible)
+                        or eligible(nominated_task_id) is not True
+                        or proposals.has_pending
+                    ):
+                        await speak_host_refusal(CANCEL_NOT_ACCEPTED)
+                    else:
+                        # A question that cannot be spoken in full is retired when the turn
+                        # settles its readback as inexact, so none is left unheard.
+                        proposal = proposals.offer_cancel(
+                            task_id=nominated_task_id, objective=nominated_objective,
+                        )
+                        proposal_readback.append(proposal)
+                        await speak_host_refusal(
+                            proposal.readback, source="host_task_proposal",
+                        )
             except asyncio.CancelledError:
                 producer_result.cancel()
                 raise
@@ -2636,6 +2744,49 @@ class StreamingSpeechLoop:
         if len(messages) >= 2 and messages[-2].source == "host_task_proposal":
             return None
         return target
+
+    def _natural_cancel_choices(
+        self, snapshot: ConversationContextSnapshot, frozen: tuple[str, ...],
+    ) -> dict[str, tuple[str, str]]:
+        """Offer the set frozen at admission only if it is still exactly this snapshot's tasks.
+
+        Each label maps to one frozen task and its stored objective. A changed set offers
+        nothing, never the sole route. So does a set whose objectives cannot be told apart in
+        speech, or whose readback would not fit: the task cards remain. A reply to a readback
+        may nominate, because a nomination is only a question.
+        """
+        owner = self._task_cancellation
+        proposals = self._task_proposals
+        if owner is None or proposals is None:
+            return {}
+        _validate_frozen_cancel(frozen)
+        candidates = getattr(owner, "natural_cancel_candidates", None)
+        # The owner reads the same context, so equality also fixes the snapshot's tasks
+        # and order; the request's own invariant rechecks the labels against them.
+        if not callable(candidates) or candidates(MAX_CANCEL_CHOICES) != frozen:
+            return self._withdraw_cancel_choices("set_changed", len(frozen))
+        # Told apart by the question the user will hear, not the stored text: objectives
+        # that differ only in trailing punctuation read back identically.
+        readbacks = tuple(cancel_readback(task.objective) for task in snapshot.active_tasks)
+        if not distinguishable(readbacks):
+            return self._withdraw_cancel_choices("indistinguishable", len(frozen))
+        limit = min(self._max_segment_chars, self._context.max_item_chars)
+        if any(len(readback) > limit for readback in readbacks):
+            return self._withdraw_cancel_choices("readback_capacity", len(frozen))
+        return {
+            cancel_choice_label(index): (task.task_id, task.objective)
+            for index, task in enumerate(snapshot.active_tasks, start=1)
+        }
+
+    @staticmethod
+    def _withdraw_cancel_choices(category: str, tasks: int) -> dict[str, tuple[str, str]]:
+        """Offer no choices, with one bounded evidence line: a category and a task count,
+        never an objective or a task identity."""
+        try:
+            return {}
+        finally:
+            print("[cancel-choice-refusal] " + json.dumps(
+                {"category": category, "tasks": tasks}, separators=(",", ":")), flush=True)
 
     @staticmethod
     def _natural_cancel_invocation_id() -> str:

@@ -391,6 +391,107 @@ the neutral-turn behavior #205 demonstrated. Only the model's judgment guards ag
 that; the instructions are not a validator, and no intent classifier is added. The
 #205 and #280 observations remain counter-evidence and are not reinterpreted.
 
+## Confirmed natural cancel with several tasks
+
+Amended by owner decision on 2026-11-18
+([#237](https://github.com/sushiHex/hermes-realtime/issues/237)). The section above
+still governs one running task unchanged. With two to four running tasks, the host may
+instead offer the tasks as turn-local choices. This revises that section's invariant
+for several tasks only. The model may now nominate one task, but a nomination never
+cancels anything. The host speaks its own question about exactly that task, and only a
+fresh spoken affirmative of that question authorizes the cancel.
+
+**Freeze.** At final-input admission, with the same conditions as the sole route, the
+host freezes the exact set of running task identities. Those conditions are: work
+control open, no start awaiting acknowledgment, no cancellation requested, and the
+controller's running count equal to the context's tasks. Choices are offered only when a
+proposal owner exists to ask the question. When the request is built, the set must
+still equal both the snapshot's tasks, in order, and the owner's current candidates.
+Otherwise the turn offers no cancel at all. It never falls back to the sole route
+because another task ended or began stopping. More than four tasks, or objectives that
+would be read back as the same question once case and spacing are ignored, offer no
+choices, and the task card's **Cancel** control remains. So does a readback that would
+not fit one speech segment. Text that differs but sounds alike remains a residual risk.
+
+**Shape.** Each frozen task gets a label, `choice_1` to `choice_4`, in snapshot order.
+The model sees each label with the task's stored objective as untrusted reference data,
+never a task or run identity.
+- **Codex:** `cancel_work` takes exactly `{"target": <label>}`, and its schema names
+  only the advertised labels.
+- **Ollama:** the decision is exactly `{"kind":"cancel_work","target":<label>}`.
+
+Both adapters refuse a missing, extra, unknown, raw-identity, list or `all` selection
+with no effect. Ollama also refuses duplicate keys. Codex arguments arrive as an
+already-parsed object, where a repeated key can only yield another offered label, and
+so at most a question. The sole route refuses any label, and a
+nomination is still the turn's one terminal host selection. The instructions tell the
+model to ask which task in an ordinary reply when the request does not identify exactly
+one listed task. That is guidance, not a validator.
+
+**Question.** After the provider stream closes successfully and while the admitting
+lease is current, the host checks two things. The nominated task must still be running
+with nothing starting or stopping, and no other proposal may be pending. If either check
+fails, the host speaks one fixed refusal sentence:
+- "That task is no longer running" if the task ended;
+- "The request to cancel that task was not accepted" otherwise.
+
+If both pass, it places a cancel question in the start proposal's one pending slot and
+speaks a fixed readback built from the stored objective, "Stop background task.
+<objective>?", containing no assent phrase. The slot holds one host question at a time,
+so a single affirmative always answers exactly one question.
+
+**Confirmation.** The cancel question reuses the start proposal's spoken-confirmation
+rules unchanged:
+- the same participant and generation binding and the 60-second deadline;
+- exact transport-confirmed readback delivery, and invalidation by any later speech;
+- a clean capture latched at speech onset, and the same whole-utterance affirmative
+  list;
+- retirement on any other final input, so "no", "don't" and "the other one" all cancel
+  nothing;
+- synchronous one-use consumption before any await.
+
+The question has no card and no typed confirmation. A typed affirmative never arms it, a
+start card decision never consumes it, and the per-task **Cancel** control remains the
+typed path. Unlike a start, a question has no card to fall back to. So an affirmative
+that is not a clean capture of its completed readback retires it, and the input
+continues as an ordinary turn, which may at most ask again. Such an affirmative is a
+typed, echoed, interrupted or late one. A readback that was not delivered exactly also
+retires the question. No question is held when the turn has no speech segment left to
+ask it. The question is retired before confirmation if its task is no longer running
+with nothing starting or stopping. A later "yes" is therefore an ordinary turn and never
+moves to another task, including a successor with the same objective.
+
+A consumed question calls the same exact-task command path as the card's **Cancel**,
+`cancel task: <id>` intake for the frozen task. It carries the confirming input's own
+authority, not the nomination turn's. A synchronous predicate is re-read under the work
+surface's admission lock, which is the commit point, with no suspension before the cancel
+binds. The commit is refused, and nothing is cancelled, unless all of these still hold
+when the cancel gets that lock:
+- the session binding is unchanged;
+- no newer user input, spoken or typed, has begun since the affirmative was accepted as
+  this question's answer. That input epoch is frozen before the router suspends to
+  record the affirmative, so input that begins while it is recorded is newer;
+- the question's deadline has not passed;
+- the task is still running with nothing starting or stopping.
+
+A superseded commit is a refusal of that command, not lost task control. The stale-target
+refusal still applies at the commit. The generation-bound task
+identity selects that task's own run through the existing context, API and controller
+checks; no separate run authority is added.
+
+A reply to a heard readback offers no sole route, as before, but may nominate again,
+since a nomination is only a question. After "no, the other one", the other task
+therefore needs its own readback and a fresh affirmative. What the user hears after
+"yes" is the task card and the terminal update. Only the acknowledged terminal state
+says the task stopped.
+
+Invariant: with several tasks, no model selection can cancel a task until the user
+affirms a host question naming exactly that task. A wrong nomination, an ambiguous
+request or a guess yields at most a question. The residual risks are those of spoken
+start confirmation: recognition errors, late echoes, the user not hearing the question,
+and bystander assent. Confirmation establishes which question the host accepted an
+answer to, not who answered it or whether they understood it.
+
 ## Trust and limits
 
 Under this path, the foreground model still proposes objectives
