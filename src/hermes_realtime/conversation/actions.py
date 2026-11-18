@@ -719,7 +719,7 @@ class ConversationUpdateExecutor:
         evidence_lease: EvidenceTurnLease | None = None,
         typed_input: tuple[int, int] | None = None,
         *,
-        cancel_target: str | None = None,
+        cancel_target: str | tuple[str, ...] | None = None,
     ) -> None:
         claims = self._director._claim_pending_mentions(
             self,

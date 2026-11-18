@@ -60,6 +60,7 @@ from hermes_realtime.conversation.context import (
     DurableConversation,
 )
 from hermes_realtime.conversation.knowledge import KnowledgeConsumeResult
+from hermes_realtime.conversation.natural_cancel import CancelChoice, cancel_choice_label
 from hermes_realtime.conversation.streaming import (
     AcceptedCancelInferenceRequest,
     AcceptedStartInferenceRequest,
@@ -104,6 +105,8 @@ class Cell:
     tasks: int = 0
     # The host froze the one active task as this turn's natural cancel target (#237).
     cancel: bool = False
+    # The host froze several running tasks as cancel choices to confirm (#237).
+    choices: bool = False
     clock: str = "morning"
     # The host.
     handler: int | None = 2048
@@ -204,6 +207,10 @@ def _matrix() -> tuple[Cell, ...]:
         replace(Cell(tasks=1, cancel=True), lookup=lookup) for lookup in _LOOKUPS
     ]
     cells += [Cell(purpose="cancel_ack"), Cell(purpose="cancel_ack", handler=None)]
+    # Confirmed cancel choices: two running tasks, under every lookup configuration.
+    cells += [
+        replace(Cell(tasks=2, choices=True), lookup=lookup) for lookup in _LOOKUPS
+    ]
     return tuple(dict.fromkeys(cell for cell in cells if _coherent(cell)))
 
 
@@ -350,6 +357,11 @@ def _request(cell: Cell) -> ConversationContextSnapshot:
             task_id="task_earlier", run_id="deleg_earlier",
             objective="Collect the example weekly notes.",
         )
+    if cell.tasks > 1:
+        store.record_task_accepted(
+            task_id="task_second", run_id="deleg_second",
+            objective="Compare the example release notes.",
+        )
     if cell.purpose == "cancel_ack":
         store.record_task_accepted(
             task_id=_ACCEPTED_TASK, run_id="deleg_golden", objective=_ACCEPTED_OBJECTIVE,
@@ -396,6 +408,10 @@ def _request(cell: Cell) -> ConversationContextSnapshot:
         recent_task_results=snapshot.recent_task_results,
         updates=_UPDATES[: cell.updates],
         cancel_offered=cell.cancel,
+        cancel_choices=tuple(
+            CancelChoice(cancel_choice_label(index), task.objective)
+            for index, task in enumerate(snapshot.active_tasks, start=1)
+        ) if cell.choices else (),
     )
 
 

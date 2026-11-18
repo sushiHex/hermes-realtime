@@ -7,6 +7,7 @@ answer and never re-derives it from the request's type or its last row.
 from dataclasses import dataclass
 
 from .context import ConversationContextSnapshot, ConversationRole
+from .natural_cancel import CancelChoice
 from .streaming import (
     AcceptedCancelInferenceRequest,
     AcceptedStartInferenceRequest,
@@ -55,7 +56,7 @@ class ForegroundTurn:
                 active_tasks=request.active_tasks,
                 terminal_task_count=request.terminal_task_count, memory=request.memory,
                 recent_task_results=request.recent_task_results, updates=request.updates,
-                cancel_offered=request.cancel_offered,
+                cancel_offered=request.cancel_offered, cancel_choices=request.cancel_choices,
             )
         elif type(request) is ConversationContextSnapshot:
             rebuilt = ConversationContextSnapshot(
@@ -113,6 +114,12 @@ class ForegroundTurn:
         return type(request) is ConversationInferenceRequest and request.cancel_offered
 
     @property
+    def cancel_choices(self) -> tuple[CancelChoice, ...]:
+        """The frozen running tasks a confirmed cancel may nominate on this user turn."""
+        request = self.request
+        return request.cancel_choices if type(request) is ConversationInferenceRequest else ()
+
+    @property
     def awaiting_reply(self) -> bool:
         """Whether the last heard row is the user's."""
         messages = self.request.messages
@@ -126,6 +133,9 @@ class TurnRoutes:
     start_work: bool
     task_status: bool
     cancel_work: bool = False
+    # Empty: the sole-task cancel takes no argument. Otherwise cancel_work takes exactly
+    # one of these labels, and a selection only asks the host to confirm that task.
+    cancel_choices: tuple[CancelChoice, ...] = ()
 
     def __post_init__(self) -> None:
         _require_bool("start_work", self.start_work)
@@ -133,6 +143,12 @@ class TurnRoutes:
         _require_bool("cancel_work", self.cancel_work)
         if self.cancel_work and not self.task_status:
             raise ValueError("cancel_work is offered only where task_status is")
+        if type(self.cancel_choices) is not tuple or any(
+            type(choice) is not CancelChoice for choice in self.cancel_choices
+        ):
+            raise TypeError("cancel choices must be an exact tuple of CancelChoice values")
+        if self.cancel_choices and not self.cancel_work:
+            raise ValueError("cancel choices are offered only with cancel_work")
 
 
 def turn_routes(
@@ -148,7 +164,8 @@ def turn_routes(
     Every route needs a bound work handler, a user row to answer, a turn that is not an
     acknowledgment, and no private material. A lookup already attempted for the turn
     withdraws only the start. The status route also needs an admitted user turn, and the
-    cancel route needs that plus a cancel target the host froze for this turn.
+    cancel route needs that plus a cancel target, or a set of choices, the host froze for
+    this turn.
 
     ``start_requires_admission`` records the one point on which the two adapters differ
     today: whether an unadmitted request may still be offered the start.
@@ -173,5 +190,8 @@ def turn_routes(
             and (turn.admitted or not start_requires_admission)
         ),
         task_status=offered and turn.admitted,
-        cancel_work=offered and turn.admitted and turn.cancel_offered,
+        cancel_work=(
+            offered and turn.admitted and (turn.cancel_offered or bool(turn.cancel_choices))
+        ),
+        cancel_choices=turn.cancel_choices if offered and turn.admitted else (),
     )

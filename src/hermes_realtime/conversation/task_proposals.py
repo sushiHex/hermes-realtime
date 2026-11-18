@@ -19,6 +19,7 @@ from .work_tools import (
     WorkCommandAdmission,
     WorkStartResult,
     _validate_exact_text,
+    _validate_task_id,
 )
 
 _AFFIRMATIVES = frozenset({"yes", "yeah", "yep", "sure", "okay", "go ahead", "do it", "please do"})
@@ -68,16 +69,34 @@ class HostTaskProposalRequest:
         _validate_exact_text(self.objective, "objective", maximum=MAX_TASK_PROPOSAL_OBJECTIVE_CHARS)
 
 
+def cancel_readback(objective: str) -> str:
+    """The host's question about one exact running task, built from its stored objective."""
+    _validate_exact_text(objective, "objective", maximum=MAX_TASK_PROPOSAL_OBJECTIVE_CHARS)
+    subject = objective.strip().rstrip(".!?").rstrip() or objective.strip()
+    # Never teach an assent phrase in outgoing audio: it can return through STT.
+    return "Stop background task. " + subject + "?"
+
+
 @dataclass(frozen=True, slots=True)
 class TaskProposal:
+    """One pending host question: a start, or (with ``cancel_task_id``) a confirmed cancel.
+
+    The two kinds share one slot so that a single affirmative always answers exactly one
+    question, and they never share a consequence: a start card or start decision cannot
+    confirm a cancel, and a cancel can only stop its own exact task.
+    """
+
     proposal_id: str
     objective: str
     participant: str
     generation: int
     expires_at: float
+    cancel_task_id: str | None = None
 
     @property
     def readback(self) -> str:
+        if self.cancel_task_id is not None:
+            return cancel_readback(self.objective)
         # Never teach an assent phrase in outgoing audio: it can return through STT.
         return "Proposed background task. " + self.objective + " Shall I send this task?"
 
@@ -96,6 +115,10 @@ class _Surface(Protocol):
     async def start_work(
         self, *, objective: str, invocation_id: str, anchor_turn_id: str | None = None,
     ) -> WorkStartResult: ...
+
+    async def submit_cancel_command(
+        self, *, task_id: str, invocation_id: str, reason: str = ...,
+    ) -> WorkCommandAdmission: ...
 
 
 class ConversationTaskProposals:
@@ -196,6 +219,9 @@ class ConversationTaskProposals:
         else:
             self._readback_complete = None
             self._evidence("readback_not_exact")
+            if proposal.cancel_task_id is not None:
+                # A cancel question that was not heard exactly can never be confirmed.
+                self.retire("cancel_readback_not_exact")
 
     def speech_started(self, proposal: TaskProposal | None = None) -> None:
         """Any other host/assistant speech invalidates the spoken binding."""
@@ -224,17 +250,52 @@ class ConversationTaskProposals:
         )
 
     def typed_input_started(self, *, participant: str, generation: int) -> None:
-        # The exact full-text card was published synchronously by offer().
+        # The exact full-text card was published synchronously by offer(). A cancel question
+        # has no card, so typed input never arms it; the task card's Cancel control remains.
+        pending = self._pending
         self._capture_binding = (
-            self._pending if self._matches_binding(participant, generation) else None
+            pending
+            if pending is not None
+            and pending.cancel_task_id is None
+            and self._matches_binding(participant, generation)
+            else None
         )
 
     def intervening_input(self) -> None:
         self.retire("intervening_input")
 
     def confirmation_target(self, text: str) -> TaskProposal | None:
-        """Freeze the exact pending object before user-input recording can suspend."""
-        return self._pending if self.is_confirmation(text) else None
+        """Freeze the exact pending object before user-input recording can suspend.
+
+        A cancel question whose task is no longer eligible is retired first, so a later
+        affirmative is an ordinary turn and never moves to another task.
+        """
+        if not self._cancel_still_eligible():
+            return None
+        if not self.is_confirmation(text):
+            return None
+        pending = self._pending
+        if (
+            pending is not None
+            and pending.cancel_task_id is not None
+            and self._capture_binding is not pending
+        ):
+            # A cancel question has no card to fall back to: an affirmative that was not a
+            # clean capture of its completed readback (typed, echoed, interrupted or late)
+            # retires it, and the input continues as an ordinary turn the host can answer.
+            self.retire("cancel_confirmation_not_clean")
+            return None
+        return pending
+
+    def _cancel_still_eligible(self) -> bool:
+        pending = self._pending
+        if pending is None or pending.cancel_task_id is None:
+            return True
+        eligible = getattr(self._surface, "natural_cancel_eligible", None)
+        if callable(eligible) and eligible(pending.cancel_task_id) is True:
+            return True
+        self.retire("cancel_target_ineligible")
+        return False
 
     async def consume_input(
         self,
@@ -251,17 +312,27 @@ class ConversationTaskProposals:
         if self._deadline is None or self._clock() >= self._deadline:
             self.retire("expired")
             return WorkCommandAdmission.REFUSED
+        if not self._cancel_still_eligible():
+            return WorkCommandAdmission.REFUSED
         if capture is not proposal:
             reason = (
                 "use_confirmation_card"
                 if self._readback_settled and self._readback_complete is not proposal
                 else "spoken_confirmation_not_ready"
             )
+            if proposal.cancel_task_id is not None:
+                self.retire("cancel_confirmation_not_clean")
+                return WorkCommandAdmission.REFUSED
             try:
                 self._publish(proposal, "pending", reason=reason)
             finally:
                 self._evidence(reason)
             return WorkCommandAdmission.REFUSED
+        if proposal.cancel_task_id is not None:
+            # The clean capture latched this exact question for the current binding.
+            result = await self._consume(proposal, decision="confirm")
+            assert isinstance(result, WorkCommandAdmission)
+            return result
         return await self.decide(
             participant=proposal.participant,
             generation=proposal.generation,
@@ -318,6 +389,39 @@ class ConversationTaskProposals:
     def offer(self, request: HostTaskProposalRequest) -> TaskProposal:
         return self._offer(request, visible=True)
 
+    def offer_cancel(self, *, task_id: str, objective: str) -> TaskProposal:
+        """Hold one host question about stopping exactly ``task_id``; nothing is cancelled.
+
+        It has no card and no typed confirmation: only a clean spoken affirmative of its
+        completed readback, under the same binding and deadline as a start, consumes it.
+        """
+        category = "invalid_cancel_question"
+        try:
+            _validate_task_id(task_id)
+            _validate_exact_text(objective, "objective", maximum=MAX_TASK_PROPOSAL_OBJECTIVE_CHARS)
+            if self._binding is None:
+                category = "no_binding"
+                raise PermissionError("cancel question has no current session binding")
+            if self._pending is not None:
+                category = "pending_proposal"
+                raise PermissionError("another proposal is pending")
+            if self._proposal_serial >= (1 << 53) - 1:
+                category = "identity_capacity"
+                raise PermissionError("proposal identity capacity exhausted")
+            self._proposal_serial += 1
+            proposal = TaskProposal(
+                f"proposal_{self._proposal_prefix}_{self._proposal_serial:014x}",
+                objective, *self._binding, self._clock() + 60.0, cancel_task_id=task_id,
+            )
+            self._pending = proposal
+            self._pending_visible = False
+            self._deadline = proposal.expires_at
+            self._readback_settled = False
+            category = "cancel_offered"
+            return proposal
+        finally:
+            self._evidence(category)
+
     def _offer(self, request: HostTaskProposalRequest, *, visible: bool) -> TaskProposal:
         category = "invalid_proposal"
         try:
@@ -366,6 +470,8 @@ class ConversationTaskProposals:
             proposal = self._pending
             if (
                 proposal is None
+                # A card decision belongs to starts; it never answers a cancel question.
+                or proposal.cancel_task_id is not None
                 or type(participant) is not str
                 or type(generation) is not int
                 or type(proposal_id) is not str
@@ -399,6 +505,15 @@ class ConversationTaskProposals:
             self._readback_complete = None
             self._capture_binding = None
             self._deadline = None
+            if proposal.cancel_task_id is not None:
+                category = "cancel_consumed"
+                if decision != "confirm" or wait_for_ack:
+                    raise ValueError("a cancel question is only ever confirmed by speech")
+                # The same exact-task command path as the task card; Hermes owns the ack.
+                return await self._surface.submit_cancel_command(
+                    task_id=proposal.cancel_task_id,
+                    invocation_id="confirmed_cancel_" + proposal.proposal_id,
+                )
             if decision is not None:
                 self._publish(proposal, "confirmed" if decision == "confirm" else "declined")
             category = "automatic_consumed" if decision is None else (
@@ -435,6 +550,8 @@ class ConversationTaskProposals:
                 self._publish(proposal, "retired")
             finally:
                 self._evidence(category)
+        elif proposal is not None and proposal.cancel_task_id is not None:
+            self._evidence(category)
 
     def _publish(self, proposal: TaskProposal, status: str, *, reason: str | None = None) -> None:
         self._observer(

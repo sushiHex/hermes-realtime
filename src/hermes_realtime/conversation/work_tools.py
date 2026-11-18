@@ -67,6 +67,12 @@ WORK_ROUTING_POLICY_WITH_CANCEL = (
     "controls; for either, do not select task_status or propose work. "
     + _WORK_ROUTING_TAIL
 )
+WORK_ROUTING_POLICY_WITH_CANCEL_CHOICES = (
+    _WORK_ROUTING_HEAD
+    + "To stop one listed running task, select cancel_work with its choice; for approval, "
+    "direct the user to the controls; for either, do not select task_status or propose work. "
+    + _WORK_ROUTING_TAIL
+)
 
 _MAX_REASON_CHARS = 1024
 _UNAVAILABLE_REASON = "work control unavailable; restart required"
@@ -329,6 +335,40 @@ class ConversationWorkControlSurface:
         if self.task_status() != TaskStatusSnapshot(active=1):
             return None
         return active_tasks[0].task_id
+
+    def natural_cancel_candidates(self, maximum: int) -> tuple[str, ...] | None:
+        """The exact running tasks a confirmed natural cancel may nominate; else ``None``.
+
+        The same conditions as the sole target, for two to ``maximum`` running tasks. The
+        caller freezes the answer at final-input admission. A nomination is only ever a
+        question the host asks; nothing here authorizes a cancel.
+        """
+
+        if type(maximum) is not int or maximum < 2:
+            raise ValueError("candidate maximum must be an integer of at least two")
+        if self._health is not WorkControlHealth.OPEN:
+            return None
+        active_tasks = self._context.snapshot().active_tasks
+        if not 2 <= len(active_tasks) <= maximum:
+            return None
+        # task_status() reports a pending start (or is unavailable while intake and the
+        # controller disagree), and any cancel pending or accepted, so equality to only
+        # running tasks also excludes both.
+        if self.task_status() != TaskStatusSnapshot(active=len(active_tasks)):
+            return None
+        return tuple(task.task_id for task in active_tasks)
+
+    def natural_cancel_eligible(self, task_id: str) -> bool:
+        """Whether ``task_id`` is running with no start or cancellation in flight."""
+
+        _validate_task_id(task_id)
+        if self._health is not WorkControlHealth.OPEN:
+            return False
+        active_tasks = self._context.snapshot().active_tasks
+        if not any(task.task_id == task_id for task in active_tasks):
+            return False
+        # As above: only running tasks, with no start or cancel pending anywhere.
+        return self.task_status() == TaskStatusSnapshot(active=len(active_tasks))
 
     @staticmethod
     def _logical_work_count(
