@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -1884,13 +1885,18 @@ class Journey:
         return task, run
 
     def _require_confirm_live(self, trace: ConfirmCancelTrace, tasks: tuple[str, ...],
-                              cancel_category: str) -> None:
+                              cancel_category: str,
+                              failures: Callable[[], None] | None = None) -> None:
         """Each task still active: any cancel seen fails as ``cancel_category``; a natural end
         is inconclusive (journey_confirm_target_terminal), never replaced. Failure precedes
-        inconclusive: every task's cancels are checked before any task's natural end."""
+        inconclusive: every task's cancels, then every other failure-only check
+        (``failures``: competing work, unexpected input, bounds), run before any task's
+        natural end is named."""
         statuses = [self.tracker.tasks.get(task) for task in tasks]
         for task, status in zip(tasks, statuses, strict=True):
             require(status not in _CONFIRM_CANCELS and not trace.cancels(task), cancel_category)
+        if failures is not None:
+            failures()
         for status in statuses:
             require(status not in TERMINAL, "journey_confirm_target_terminal")
             require(status == "active", "journey_confirm_not_active")
@@ -1975,8 +1981,7 @@ class Journey:
             except TimeoutError:
                 require(False, "journey_confirm_not_quiet")
             receipt[key] = int((meter.now() - entry) * 1000)
-            self._require_confirm_live(trace, (task_a, task_b), cancel_category)
-            scope()
+            self._require_confirm_live(trace, (task_a, task_b), cancel_category, scope)
 
         async def inject(index: int, cancel_category: str) -> None:
             frames, words = clips[index]
@@ -1984,9 +1989,11 @@ class Journey:
             def start() -> None:
                 # Re-checked at the first speech frame, after the clip's leading silence: both
                 # still active, nothing competing. Abort before any speech if not.
-                self._require_confirm_live(trace, (task_a, task_b), cancel_category)
-                scope()
-                require(self.pending == 0, "journey_confirm_competing")
+                def failures() -> None:
+                    scope()
+                    require(self.pending == 0, "journey_confirm_competing")
+
+                self._require_confirm_live(trace, (task_a, task_b), cancel_category, failures)
                 trace.mark(tracker.cursor, words)
                 receipt[_CONFIRM_CLIPS[index] + "Injected"] = True
 
@@ -2004,8 +2011,7 @@ class Journey:
             # A readback is only a question: nothing may be cancelling yet. Side effects are
             # proven absent before any reply is classified, so a mismatch or a clarification
             # can never mask one. From the No onward a cancel is a No side effect.
-            self._require_confirm_live(trace, (task_a, task_b), cancel_category)
-            scope()
+            self._require_confirm_live(trace, (task_a, task_b), cancel_category, scope)
             require_clip(index)
             final = trace.clip(index)[3]
             assert final is not None
@@ -2040,8 +2046,8 @@ class Journey:
             with contextlib.suppress(TimeoutError):
                 await self.wait(disturbed, _CONFIRM_NO_DRAIN_SECONDS)
             await self.poll()
-            self._require_confirm_live(trace, (task_a, task_b), "journey_confirm_no_cancelled")
-            scope()
+            self._require_confirm_live(trace, (task_a, task_b), "journey_confirm_no_cancelled",
+                                       scope)
             require_clip(1)
             receipt["bothActiveAfterNo"] = True
             await quiet("quietBeforeRequestAMs", "journey_confirm_no_cancelled")
@@ -2066,13 +2072,14 @@ class Journey:
             receipt["bystanderCancelObserved"] = (bool(trace.cancels(task_b))
                                                   or status_b in _CONFIRM_CANCELS)
             require(not receipt["bystanderCancelObserved"], "journey_confirm_wrong_target")
-            require(status_b == "active", "journey_confirm_bystander_ended")
+            # Every failure-only check before the inconclusive ended-bystander outcome.
             scope()
             require_clip(3)
             final = trace.clip(3)[3]
             assert final is not None
             require(all(seq > final for seq in trace.cancels(task_a)),
                     "journey_confirm_premature_cancel")
+            require(status_b == "active", "journey_confirm_bystander_ended")
             armed = trace.arming(task_a, 3)
             receipt["targetCancelObserved"] = armed is not None
             if armed is None:

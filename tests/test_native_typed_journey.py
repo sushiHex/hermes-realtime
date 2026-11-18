@@ -4903,6 +4903,37 @@ def test_an_early_end_beside_a_cancel_fails_and_is_not_inconclusive(tmp_path, mo
     confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases), category)
 
 
+@pytest.mark.parametrize("phase", ["b", "a"])
+@pytest.mark.parametrize("other", ["active", "cancelling"])
+def test_competing_work_beside_an_early_end_fails_and_is_not_inconclusive(
+    tmp_path, monkeypatch, phase, other,
+):
+    """Astra 9263: a third task or admission next to an early end is competing work, a failure;
+    the early end must never be what is reported."""
+    obj_a, obj_b = confirm_objectives()
+    spoken, pair, said = ((REQ_B_SPOKEN, P_B, readback_of(obj_b)) if phase == "b"
+                          else (REQ_A_SPOKEN, P_A, readback_of(obj_a)))
+    extra = [task_result_row(C_A, "completed"), task_state_row(C_OTHER, other), admit(RUN_X)]
+    phases = confirm_phases(**{phase: confirm_reply(spoken, pair, said=said, extra=extra)})
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                    "journey_confirm_competing")
+
+
+@pytest.mark.parametrize("other", ["active", "cancelling"])
+def test_competing_work_beside_an_ended_bystander_after_yes_fails(tmp_path, monkeypatch, other):
+    yes = confirm_yes(extra=[task_result_row(C_B, "completed"), task_state_row(C_OTHER, other),
+                             admit(RUN_X)])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(yes=yes))
+    confirm_refused(journey, "journey_confirm_competing")
+
+
+def test_a_premature_a_cancel_beside_an_ended_bystander_fails_premature(tmp_path, monkeypatch):
+    yes = confirm_yes(before_final=[task_state_row(C_A, "cancelling")],
+                      cancel=[task_result_row(C_B, "completed")])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(yes=yes))
+    confirm_refused(journey, "journey_confirm_premature_cancel")
+
+
 def test_a_ends_early_and_b_cancelled_after_yes_is_the_wrong_target(tmp_path, monkeypatch):
     yes = confirm_yes(cancel=[task_result_row(C_A, "completed"),
                               task_state_row(C_B, "cancelling")])
