@@ -54,6 +54,15 @@ _AUTHORIZED_GIT_IDENTITIES = frozenset(
             "git version 2.56.0.windows.4",
             4,
         ),
+        # Official https://github.com/git-for-windows/git/releases/tag/v2.56.1.windows.1
+        # Git-2.56.1-64-bit.tar.bz2 SHA256: d7d89e69855f00e73d957b513c49538a420c465c84b9d212cf1add400eecdf54.
+        # Independently hashed ucrt64/bin/git.exe matches the hosted executable.
+        # Version and four installed links are observed hosted gates, not archive proofs.
+        (
+            "9bf8ee81d79f38a11eaf7799499a634c46a718e009a4a9b2b20b115804643302",
+            "git version 2.56.1.windows.1",
+            4,
+        ),
     }
 )
 
@@ -1764,6 +1773,24 @@ def test_hosted_git_2564_qualification_requires_exact_identity(monkeypatch):
     for changed in (
         replace(qualified, sha256="0" * 64),
         replace(qualified, version="git version 2.56.0.windows.999"),
+        replace(qualified, link_count=3),
+    ):
+        monkeypatch.setitem(globals(), "_measure_git_pin", lambda _, value=changed: value)
+        with pytest.raises(RuntimeError, match="unapproved Git fixture identity"):
+            _initialize_git_fixture(GIT)
+
+
+def test_hosted_git_2561_qualification_requires_exact_identity(monkeypatch):
+    qualified = replace(
+        _GIT_FIXTURE_PIN,
+        sha256="9bf8ee81d79f38a11eaf7799499a634c46a718e009a4a9b2b20b115804643302",
+        version="git version 2.56.1.windows.1", link_count=4,
+    )
+    monkeypatch.setitem(globals(), "_measure_git_pin", lambda _: qualified)
+    assert _initialize_git_fixture(GIT) == qualified
+    for changed in (
+        replace(qualified, sha256="0" * 64),
+        replace(qualified, version="git version 2.56.1.windows.999"),
         replace(qualified, link_count=3),
     ):
         monkeypatch.setitem(globals(), "_measure_git_pin", lambda _, value=changed: value)
