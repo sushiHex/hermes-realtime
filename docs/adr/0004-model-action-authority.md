@@ -465,9 +465,9 @@ A consumed question calls the same exact-task command path as the card's **Cance
 `cancel task: <id>` intake for the frozen task. It carries the confirming input's own
 authority, not the nomination turn's. A synchronous predicate is re-read under the work
 surface's admission lock, which is the commit point, with no suspension before the cancel
-binds. The commit is refused, and nothing is cancelled, if any of these has changed while
-the cancel waits for that lock:
-- the session binding;
+binds. The commit is refused, and nothing is cancelled, unless all of these still hold
+when the cancel gets that lock:
+- the session binding is unchanged;
 - no newer user input has begun, spoken or typed;
 - the question's deadline has not passed;
 - the task is still running with nothing starting or stopping.
