@@ -529,16 +529,36 @@ class ConversationWorkControlSurface:
         task_id: str,
         invocation_id: str,
         reason: str = "user requested task cancellation",
+        still_current: Callable[[], bool] | None = None,
     ) -> WorkCommandAdmission:
+        """Admit an exact public task cancel command; nothing else is ever selected.
+
+        ``still_current`` is the confirming input's own authority, read under the admission
+        lock as for ``cancel_work``: a command that is no longer current there is refused.
+        """
         _validate_task_id(task_id)
         _validate_identifier(invocation_id, "invocation_id")
         _validate_reason(reason)
+        if still_current is not None and not callable(still_current):
+            raise TypeError("still_current must be callable or None")
         admission = await self._admit_cancel_work(
             invocation_id=invocation_id,
             expected_task_id=task_id,
             reason=reason,
             semantic_kind="cancel_exact",
+            still_current=still_current,
         )
+        if (
+            type(admission) is WorkCancelResult
+            and not admission.accepted
+            and admission.reason == SUPERSEDED_REASON
+        ):
+            # Superseded before admission: a refusal of this command, not lost control.
+            try:
+                return WorkCommandAdmission.REFUSED
+            finally:
+                print('[task-command-refused] {"kind":"cancel","count":1,'
+                      '"category":"superseded"}', flush=True)
         return self._submit_command_admission(admission, kind="cancel")
 
     async def close(self) -> None:

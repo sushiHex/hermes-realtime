@@ -2764,19 +2764,29 @@ class StreamingSpeechLoop:
         # The owner reads the same context, so equality also fixes the snapshot's tasks
         # and order; the request's own invariant rechecks the labels against them.
         if not callable(candidates) or candidates(MAX_CANCEL_CHOICES) != frozen:
-            return {}
+            return self._withdraw_cancel_choices("set_changed", len(frozen))
         # Told apart by the question the user will hear, not the stored text: objectives
         # that differ only in trailing punctuation read back identically.
         readbacks = tuple(cancel_readback(task.objective) for task in snapshot.active_tasks)
         if not distinguishable(readbacks):
-            return {}
+            return self._withdraw_cancel_choices("indistinguishable", len(frozen))
         limit = min(self._max_segment_chars, self._context.max_item_chars)
         if any(len(readback) > limit for readback in readbacks):
-            return {}
+            return self._withdraw_cancel_choices("readback_capacity", len(frozen))
         return {
             cancel_choice_label(index): (task.task_id, task.objective)
             for index, task in enumerate(snapshot.active_tasks, start=1)
         }
+
+    @staticmethod
+    def _withdraw_cancel_choices(category: str, tasks: int) -> dict[str, tuple[str, str]]:
+        """Offer no choices, with one bounded evidence line: a category and a task count,
+        never an objective or a task identity."""
+        try:
+            return {}
+        finally:
+            print("[cancel-choice-refusal] " + json.dumps(
+                {"category": category, "tasks": tasks}, separators=(",", ":")), flush=True)
 
     @staticmethod
     def _natural_cancel_invocation_id() -> str:

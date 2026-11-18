@@ -295,6 +295,36 @@ async def test_a_readback_that_would_not_fit_one_segment_offers_no_choices():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("category", ["set_changed", "indistinguishable", "readback_capacity"])
+async def test_each_withdrawal_of_the_choices_leaves_one_bounded_evidence_line(category, capsys):
+    inference = Nominations("Use the task cards.")
+    loop, context, controller, proposals, _synth, _events = _owner(
+        inference=inference,
+        max_segment_chars=(len(_READBACK_A) - 1) if category == "readback_capacity" else 4096,
+    )
+    second = "Inspect alpha." if category == "indistinguishable" else "Inspect beta"
+    context.record_task_accepted(task_id="task_one", run_id="deleg_private_1",
+                                 objective="Inspect alpha")
+    context.record_task_accepted(task_id="task_two", run_id="deleg_private_2",
+                                 objective=second)
+    frozen = loop.freeze_natural_cancel_target()
+    assert frozen == ("task_one", "task_two")
+    if category == "set_changed":
+        controller.cancel_requested.add("task_two")
+    capsys.readouterr()
+    await loop._run_turn(
+        "turn_1", transcript=Transcript(text="Stop one.", final=True), announcement=None,
+        updates=(), update_operation=None, cancel_target=frozen,
+    )
+    assert inference.calls[0].cancel_choices == ()
+    lines = [line for line in capsys.readouterr().out.splitlines()
+             if line.startswith("[cancel-choice-refusal] ")]
+    assert lines == [
+        '[cancel-choice-refusal] {"category":"' + category + '","tasks":2}'
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_pending_start_withdraws_the_choices():
     gate = asyncio.Event()
     inference = Nominations("Which one?")
@@ -431,6 +461,146 @@ async def test_confirmation_requires_clean_current_binding_and_live_readback(cha
     await _settle()
     assert controller.cancellations == []
     assert not proposals.has_pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["rebind", "close", "newer_speech", "newer_typed", "expired", "card_cancel"],
+)
+async def test_the_confirming_authority_is_rechecked_at_the_locked_commit_point(change):
+    """Astra 9177: the consumed question waits for the work surface's admission lock; a
+    rebind, close, newer input or expiry while it waits must cancel nothing."""
+    inference = Nominations(HostCancelRequest(target="choice_1"))
+    loop, _context, controller, proposals, _synth, _events = _owner(
+        "alpha", "beta", inference=inference,
+    )
+    surface = loop._task_cancellation
+    await _say(loop, proposals, "Stop alpha.", "turn_1")
+    proposals.capture_started(participant="participant", generation=1, clean=True)
+    target = proposals.confirmation_target("yes")
+    assert target is not None
+    await surface._lock.acquire()
+    try:
+        consume = asyncio.create_task(proposals.consume_input("yes", expected_proposal=target))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not consume.done()  # waiting for the admission lock
+        if change == "rebind":
+            proposals.bind("participant", 2)
+        elif change == "close":
+            proposals.close_binding()
+        elif change == "newer_speech":
+            proposals.capture_started(participant="participant", generation=1, clean=True)
+        elif change == "newer_typed":
+            proposals.typed_input_started(participant="participant", generation=1)
+        elif change == "card_cancel":
+            controller.cancel_requested.add("task_beta")
+        else:
+            proposals._clock = lambda: float("inf")
+    finally:
+        surface._lock.release()
+    assert await consume is WorkCommandAdmission.REFUSED
+    await _settle()
+    assert controller.cancellations == []
+
+
+def _router(loop, proposals):
+    from hermes_realtime.conversation.commands import ConversationTaskCommandRouter
+    from hermes_realtime.evidence import CommandDisposition, InputSource
+    from hermes_realtime.evidence.lifecycle import EvidenceLifecycleOwner
+
+    owner = EvidenceLifecycleOwner(owner_generation=71)
+    owner.activate_binding(
+        binding_id="00000000-0000-4000-8000-0000000002be",
+        binding_generation=1,
+        consent_epoch_id="00000000-0000-4000-8000-0000000002bf",
+        logical_session_id="00000000-0000-4000-8000-0000000002c0",
+    )
+    accepted: list[object] = []
+    router_events: list[tuple[str, dict[str, object]]] = []
+    router = ConversationTaskCommandRouter(
+        surface=loop._task_cancellation,
+        observer=lambda kind, data: router_events.append((kind, dict(data))),
+        reserve_observer_capacity=lambda: None,
+        lifecycle_owner=owner.conversation_authority,
+        on_command_accepted=lambda authority: (
+            accepted.append(authority) or CommandDisposition.ADMITTED
+        ),
+        task_proposals=proposals,
+    )
+
+    def mint():
+        return owner.mint_final_input(
+            source=InputSource.MICROPHONE, input_incarnation=1, media_incarnation=1,
+            typed_sequence=None,
+        )
+
+    router.events = router_events
+    return router, mint, accepted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "rebind", "newer_speech"])
+async def test_route_spoken_carries_the_confirming_authority_to_the_locked_commit(change):
+    """The real spoken route: a rebind or newer speech while the confirmed cancel waits for
+    the admission lock cancels nothing; otherwise exactly the named task is cancelled."""
+    from hermes_realtime.evidence import CommandRoutingOutcome
+
+    inference = Nominations(HostCancelRequest(target="choice_1"))
+    loop, _context, controller, proposals, _synth, _events = _owner(
+        "alpha", "beta", inference=inference,
+    )
+    router, mint, accepted = _router(loop, proposals)
+    surface = loop._task_cancellation
+    await _say(loop, proposals, "Stop alpha.", "turn_1")
+    proposals.capture_started(participant="participant", generation=1, clean=True)
+    await surface._lock.acquire()
+    try:
+        routed = asyncio.create_task(router.route_spoken("yes", mint()))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not routed.done()  # the consumed question waits for the admission lock
+        assert not proposals.has_pending
+        if change == "rebind":
+            proposals.bind("participant", 2)
+        elif change == "newer_speech":
+            proposals.capture_started(participant="participant", generation=1, clean=True)
+    finally:
+        surface._lock.release()
+    result = await routed
+    await _settle()
+    if change is None:
+        assert result.outcome is CommandRoutingOutcome.ACCEPTED
+        assert len(accepted) == 1
+        assert controller.cancellations == [("task_alpha", "user requested task cancellation")]
+    else:
+        assert result.outcome is CommandRoutingOutcome.REJECTED
+        assert accepted == []
+        assert controller.cancellations == []
+        # Superseded is a refusal of this command, never reported as lost task control.
+        assert router.events == []
+
+
+@pytest.mark.asyncio
+async def test_an_uninterrupted_confirmation_still_commits_after_waiting_for_the_lock():
+    inference = Nominations(HostCancelRequest(target="choice_1"))
+    loop, _context, controller, proposals, _synth, _events = _owner(
+        "alpha", "beta", inference=inference,
+    )
+    surface = loop._task_cancellation
+    await _say(loop, proposals, "Stop alpha.", "turn_1")
+    proposals.capture_started(participant="participant", generation=1, clean=True)
+    target = proposals.confirmation_target("yes")
+    await surface._lock.acquire()
+    try:
+        consume = asyncio.create_task(proposals.consume_input("yes", expected_proposal=target))
+        for _ in range(20):
+            await asyncio.sleep(0)
+    finally:
+        surface._lock.release()
+    assert await consume is WorkCommandAdmission.ADMITTED
+    await _settle()
+    assert controller.cancellations == [("task_alpha", "user requested task cancellation")]
 
 
 @pytest.mark.asyncio

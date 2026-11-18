@@ -118,6 +118,7 @@ class _Surface(Protocol):
 
     async def submit_cancel_command(
         self, *, task_id: str, invocation_id: str, reason: str = ...,
+        still_current: Callable[[], bool] | None = None,
     ) -> WorkCommandAdmission: ...
 
 
@@ -154,6 +155,9 @@ class ConversationTaskProposals:
         self._capture_binding: TaskProposal | None = None
         self._deadline: float | None = None
         self._readback_settled = False
+        # Advanced at every user input onset, spoken or typed: a confirmed cancel commits
+        # only if no newer input began before its admission.
+        self._input_serial = 0
 
     @property
     def max_objective_chars(self) -> int:
@@ -241,6 +245,7 @@ class ConversationTaskProposals:
 
     def capture_started(self, *, participant: str, generation: int, clean: bool) -> None:
         """Latch at captured speech onset; delayed STT can never upgrade this fact."""
+        self._input_serial += 1
         self._capture_binding = (
             self._pending
             if clean is True
@@ -252,6 +257,7 @@ class ConversationTaskProposals:
     def typed_input_started(self, *, participant: str, generation: int) -> None:
         # The exact full-text card was published synchronously by offer(). A cancel question
         # has no card, so typed input never arms it; the task card's Cancel control remains.
+        self._input_serial += 1
         pending = self._pending
         self._capture_binding = (
             pending
@@ -499,6 +505,7 @@ class ConversationTaskProposals:
             if self._deadline is None or self._clock() >= self._deadline:
                 self.retire("expired")
                 return WorkCommandAdmission.REFUSED
+            deadline = self._deadline
             # The same one-use consume precedes all projections and admission awaits.
             self._pending = None
             self._pending_visible = False
@@ -509,10 +516,28 @@ class ConversationTaskProposals:
                 category = "cancel_consumed"
                 if decision != "confirm" or wait_for_ack:
                     raise ValueError("a cancel question is only ever confirmed by speech")
+                # The confirming input's authority, re-read under the work surface's
+                # admission lock: the same binding, no newer user input since this
+                # affirmative, and the question's own deadline.
+                binding = (proposal.participant, proposal.generation)
+                input_serial = self._input_serial
+                task_id = proposal.cancel_task_id
+                eligible = getattr(self._surface, "natural_cancel_eligible", None)
+
+                def still_current() -> bool:
+                    return (
+                        self._binding == binding
+                        and self._input_serial == input_serial
+                        and self._clock() < deadline
+                        and callable(eligible)
+                        and eligible(task_id) is True
+                    )
+
                 # The same exact-task command path as the task card; Hermes owns the ack.
                 return await self._surface.submit_cancel_command(
                     task_id=proposal.cancel_task_id,
                     invocation_id="confirmed_cancel_" + proposal.proposal_id,
+                    still_current=still_current,
                 )
             if decision is not None:
                 self._publish(proposal, "confirmed" if decision == "confirm" else "declined")
