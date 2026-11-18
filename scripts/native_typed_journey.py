@@ -25,6 +25,7 @@ from typing import Any
 
 from hermes_realtime.client.projection import _EVENT_KINDS, BrowserPublicEvent
 from hermes_realtime.conversation.commands import _CANCEL_PREFIX, _START_PREFIX
+from hermes_realtime.conversation.task_proposals import cancel_readback
 from hermes_realtime.integration.api import _WEB_REFUSAL_NOTICES, _WEB_UNVERIFIED_NOTICE
 from hermes_realtime.protocol.identifiers import TASK_ID as TASK
 from scripts.native_run_witness import RUN_ID, NativeRunWitness, require, validate_origin
@@ -101,6 +102,28 @@ _TASK_CANCEL_WORDS = ("actually", "stop", "that", "research", "i", "don", "t", "
 # Bounds for the spoken-delegation step: dispatch attribution, the quiet wait with the task
 # still active, and the observed cancellation of exactly TARGET.
 _TASK_DISPATCH_TIMEOUT, _TASK_QUIET_TIMEOUT, _TASK_CANCEL_TIMEOUT = 90.0, 90.0, 30.0
+# Confirmed natural spoken cancel with two tasks (`speak_confirm_cancel`, #581). Both tasks are
+# started by typed explicit command, so their stored objectives are exactly these; the host's
+# readback is computed from them by the package's own rule, never retyped here.
+_CONFIRM_OBJECTIVE_A = "Compare rail ticket prices for three European capitals in detail."
+_CONFIRM_OBJECTIVE_B = "Summarize recent ocean temperature research in detail."
+_CONFIRM_READBACKS = {
+    "a": cancel_readback(_CONFIRM_OBJECTIVE_A), "b": cancel_readback(_CONFIRM_OBJECTIVE_B),
+}
+_CONFIRM_FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures/audio"
+_CONFIRM_REQUEST_B_SHA256 = "1a62a02660dffe23d3d86986dafa4dcde14edee619a49d5d6f56192067867965"
+_CONFIRM_NO_SHA256 = "88adf9fdaf8aa9cff0cb792fc965cedfb576c29caa68580709b68dc48d2ee31a"
+_CONFIRM_REQUEST_A_SHA256 = "18ef57088232b525b75a22ecc8a792f195378e71db4404c17734791c61e693e8"
+_CONFIRM_YES_SHA256 = "0477f0f8418f933a01340b5156753b44d57583bd04a0d43ad5868a3129b85dae"
+_CONFIRM_REQUEST_B_WORDS = ("please", "stop", "the", "ocean", "temperature", "research", "task")
+_CONFIRM_REQUEST_A_WORDS = ("please", "stop", "the", "rail", "ticket", "prices", "task")
+# Receipt key prefixes, in injection order: request B, No, request A, Yes.
+_CONFIRM_CLIPS = ("requestB", "no", "requestA", "yes")
+# The bound on each request's reply (readback or not), and the window after No in which no
+# cancellation may appear. Declared up front; never tuned to pass.
+_CONFIRM_REPLY_TIMEOUT, _CONFIRM_NO_DRAIN_SECONDS = 60.0, 3.0
+_CONFIRM_CANCELS = {"cancelling", "interrupted"}
+_CONFIRM_LIVE_RUN = {"queued", "running", "waiting_for_approval"}
 _SPEAK_RATE, _SPEAK_FRAME_SAMPLES = 48_000, 480  # 10 ms mono frames
 _SPEAK_LEAD_FRAMES, _SPEAK_TRAIL_FRAMES = 30, 100  # bounded silence: 0.3 s and 1.0 s
 _SPEAK_FRAME_SECONDS = 0.01  # real-time pace
@@ -150,6 +173,23 @@ def load_task_fixtures() -> tuple[
     dispatch, _, _ = _load_clip(_TASK_DISPATCH_FIXTURE, _TASK_DISPATCH_SHA256)
     cancel, first, end = _load_clip(_TASK_CANCEL_FIXTURE, _TASK_CANCEL_SHA256)
     return dispatch, _TASK_DISPATCH_WORDS, cancel, (first, end), _TASK_CANCEL_WORDS
+
+
+def load_confirm_fixtures() -> tuple[tuple[tuple[bytes, ...], tuple[str, ...]], ...]:
+    """The four pinned clips in injection order (request B, No, request A, Yes), each as
+    (frames, words). Each clip's first speech frame is _SPEAK_LEAD_FRAMES."""
+    clips = (
+        ("sapi_confirm_request_b.wav", _CONFIRM_REQUEST_B_SHA256, _CONFIRM_REQUEST_B_WORDS),
+        ("sapi_confirm_no.wav", _CONFIRM_NO_SHA256, ("no",)),
+        ("sapi_confirm_request_a.wav", _CONFIRM_REQUEST_A_SHA256, _CONFIRM_REQUEST_A_WORDS),
+        ("sapi_confirm_yes.wav", _CONFIRM_YES_SHA256, ("yes",)),
+    )
+    loaded = []
+    for name, sha256, words in clips:
+        frames, first, _ = _load_clip(_CONFIRM_FIXTURES / name, sha256)
+        require(first == _SPEAK_LEAD_FRAMES, "journey_speak_fixture")
+        loaded.append((frames, words))
+    return tuple(loaded)
 
 
 def _load_clip(path: Path, sha256: str) -> tuple[tuple[bytes, ...], int, int]:
@@ -420,6 +460,143 @@ class TaskSpeakTrace(SpeakTrace):
             self.competing_active += 1
 
 
+class ConfirmCancelTrace(SpeakTrace):
+    """Evidence for two typed tasks and four spoken clips on one microphone track.
+
+    Facts are logged in event order with their clip phase: -1 before the first clip's first
+    speech frame, then the index of the latest injected clip. An assistant final is reduced in
+    memory to which pinned readback it equals exactly, if any; no text is kept. Identities stay
+    in memory; only booleans, counts and categories leave it.
+    """
+
+    def __init__(self, prior: frozenset[tuple[str, int]], incarnation: int,
+                 typed: frozenset[str]) -> None:
+        super().__init__(prior, (), incarnation)
+        self.typed = typed
+        self.marks: list[int] = []
+        self.words: list[tuple[str, ...]] = []
+        self.log: list[tuple[int, int, str, Any, Any]] = []  # (seq, phase, fact, key, value)
+        self.overflow = False
+        # The phase in which each pair was first seen; -2 for pairs seen before the step.
+        self.first_phase: dict[tuple[str, int], int] = dict.fromkeys(prior, -2)
+        # From the freeze to the first clip only the typed commands are expected: a voice
+        # start, any other user final, or an unbound or replayed foreground event is not.
+        self.frozen_seq: int | None = None
+        self.unexpected = 0
+
+    def mark(self, cursor: int, words: tuple[str, ...]) -> None:
+        self.marks.append(cursor)
+        self.words.append(words)
+
+    def _log(self, seq: int, fact: str, key: Any, value: Any) -> None:
+        if len(self.log) < 512:
+            self.log.append((seq, len(self.marks) - 1, fact, key, value))
+        else:
+            self.overflow = True
+
+    def observe(self, kind: str, data: dict[str, Any], seq: int,
+                pair: tuple[str, int] | None) -> None:
+        if kind == "voice_input_ready":
+            super().observe(kind, data, seq, pair)
+            return
+        phase = len(self.marks) - 1
+        if kind in {"task_state", "task_result"}:
+            task, status = data.get("taskId"), data.get("status")
+            if type(task) is str and type(status) is str:
+                self._log(seq, kind, task, status)
+            return
+        foreground = kind in _SPEAK_LIFECYCLE or kind == "transcript_final"
+        if foreground and pair is not None and pair not in self.first_phase:
+            if len(self.first_phase) >= 128:
+                self.overflow = True
+                return
+            self.first_phase[pair] = phase
+        role, text = data.get("role"), data.get("text")
+        if phase < 0:
+            if self.frozen_seq is None or seq <= self.frozen_seq:
+                return
+            if (kind == "voice_activity_started"
+                    or (kind == "transcript_final" and role == "user"
+                        and (type(text) is not str or text not in self.typed))
+                    or (kind in _SPEAK_LIFECYCLE
+                        and (pair is None or self.first_phase.get(pair) == -2))):
+                self.unexpected += 1
+            return
+        if kind == "voice_activity_started":
+            self._log(seq, "voice", None, None)
+        elif kind == "transcript_final" and role == "user":
+            self._log(seq, "user", None, _speak_words(text) == self.words[phase])
+        elif kind == "transcript_final" and role == "assistant":
+            match = next((key for key, value in _CONFIRM_READBACKS.items() if text == value), None)
+            self._log(seq, "assistant", pair, match)
+        elif kind in _SPEAK_LIFECYCLE:
+            self._log(seq, kind, pair, None)
+
+    def cancels(self, task: str) -> list[int]:
+        """Every cancelling or interrupted state or result of ``task`` (broad, for refusals)."""
+        return [seq for seq, _, fact, key, value in self.log
+                if fact in {"task_state", "task_result"} and key == task
+                and value in _CONFIRM_CANCELS]
+
+    def first_task_row(self, task: str) -> tuple[int, str, str] | None:
+        for seq, _, fact, key, value in self.log:
+            if fact in {"task_state", "task_result"} and key == task:
+                return seq, fact, value
+        return None
+
+    def replayed(self, tasks: set[str], after: int) -> bool:
+        return any(fact == "task_state" and value == "active" and key in tasks and seq > after
+                   for seq, _, fact, key, value in self.log)
+
+    def clip(self, phase: int) -> tuple[bool, int, bool, int | None]:
+        """(voice start before the first final, finals, first final matches, its sequence)."""
+        users = [row for row in self.log if row[1] == phase and row[2] == "user"]
+        final = users[0][0] if users else None
+        voice = any(row[1] == phase and row[2] == "voice" and (final is None or row[0] < final)
+                    for row in self.log)
+        return voice, len(users), bool(users) and users[0][4] is True, final
+
+    def arming(self, task: str, phase: int) -> int | None:
+        """The first cancelling or interrupted task_state of ``task`` after the phase's final."""
+        final = self.clip(phase)[3]
+        if final is None:
+            return None
+        return next((seq for seq, _, fact, key, value in self.log
+                     if fact == "task_state" and key == task and value in _CONFIRM_CANCELS
+                     and seq > final), None)
+
+    def settled(self, phase: int) -> bool:
+        return any(row[1] == phase and row[2] in {"assistant_turn_completed",
+                                                  "assistant_turn_interrupted"}
+                   for row in self.log)
+
+    def reply(self, phase: int, final: int, want: str, other: str) -> str:
+        """Classify the one reply turn to a request: target, other, clarified, interrupted,
+        incomplete, none or ambiguous. A reply must be one pair first seen in this phase,
+        wholly after the request's final."""
+        rows = [row for row in self.log
+                if row[1] == phase and (row[2] in _SPEAK_LIFECYCLE or row[2] == "assistant")]
+        pairs: list[tuple[str, int]] = []
+        for seq, _, _, pair, _ in rows:
+            if pair is None or self.first_phase.get(pair) != phase or seq < final:
+                return "ambiguous"
+            if pair not in pairs:
+                pairs.append(pair)
+        if len(pairs) > 1:
+            return "ambiguous"
+        if not pairs:
+            return "none"
+        facts = {row[2] for row in rows}
+        if "assistant_turn_interrupted" in facts:
+            return "interrupted"
+        if "assistant_turn_completed" not in facts:
+            return "incomplete"
+        matches = {row[4] for row in rows if row[2] == "assistant"}
+        if other in matches:
+            return "other"
+        return "target" if want in matches else "clarified"
+
+
 class WorkerAudioMeter:
     """Count non-silent PCM from exactly one remote identity. No audio is retained or written."""
 
@@ -659,13 +836,14 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
             and LABEL.fullmatch(label) is not None
             and label not in labels
             and kind in {"dispatch", "status", "recall", "cancel", "natural_cancel",
-                         "conversation", "speak", "speak_barge", "speak_task"},
+                         "conversation", "speak", "speak_barge", "speak_task",
+                         "speak_confirm_cancel"},
             "journey_step_identity",
         )
         labels.add(label)
         if kind == "cancel":
             require(set(step) == {"label", "kind", "task"}, "journey_cancel_shape")
-        elif kind in {"speak", "speak_barge", "speak_task"}:
+        elif kind in {"speak", "speak_barge", "speak_task", "speak_confirm_cancel"}:
             # One fixed pinned synthetic clip set, once: no text, task or repeat. A barge and a
             # plain speak share the one microphone track, so a scenario holds only one of them.
             require(set(step) == {"label", "kind"}, "journey_speak_shape")
@@ -675,6 +853,8 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
                 load_barge_fixtures()
             elif kind == "speak_task":
                 load_task_fixtures()
+            elif kind == "speak_confirm_cancel":
+                load_confirm_fixtures()
             else:
                 load_speak_fixture()
             continue
@@ -1118,7 +1298,7 @@ class Journey:
         if self.voice is not None:
             self.voice.sync(self.tracker.speak)
 
-    async def wait(self, predicate, seconds: int = 60) -> None:
+    async def wait(self, predicate, seconds: float = 60) -> None:
         async with asyncio.timeout(seconds):
             while not predicate():
                 await self.poll()
@@ -1670,13 +1850,274 @@ class Journey:
         require(set(tracker.tasks) == before_tasks | {target}
                 and self.admissions - before_runs == {run}, "journey_followup_dispatched")
 
+    async def _confirm_dispatch(
+        self, trace: ConfirmCancelTrace, label: str, text: str,
+        before_tasks: set[str], before_runs: set[str], receipt: dict[str, Any],
+    ) -> tuple[str, str]:
+        """Start one task by typed explicit command and bind exactly one new task and run to
+        it by event order: the task's first projected state is active, after the send."""
+        tracker = self.tracker
+        # Not a measured turn: a command starts none, and the microphone finals must never be
+        # checked as this typed text.
+        tracker.current, tracker.text = None, ""
+        sent = tracker.cursor
+        self.sequence += 1
+        try:
+            await self.request("input", {"sequence": self.sequence, "text": text})
+            with contextlib.suppress(TimeoutError):
+                await self.wait(lambda: bool(set(tracker.tasks) - before_tasks)
+                                and bool(self.admissions - before_runs), _TASK_DISPATCH_TIMEOUT)
+        finally:
+            # Owned as soon as unambiguous, whatever the verdict, so cleanup can cancel it.
+            self._own_single_dispatch(label, before_tasks, before_runs)
+        new_tasks, new_runs = set(tracker.tasks) - before_tasks, self.admissions - before_runs
+        receipt["dispatchTasks"] += len(new_tasks)
+        receipt["dispatchAdmissions"] += len(new_runs)
+        require(not trace.overflow, "journey_confirm_trace_bound")
+        require(not trace.replayed(before_tasks, sent), "journey_confirm_competing")
+        require(bool(new_tasks) and bool(new_runs), "journey_confirm_not_dispatched")
+        require(len(new_tasks) == 1 and len(new_runs) == 1, "journey_confirm_competing")
+        task, run = next(iter(new_tasks)), next(iter(new_runs))
+        first = trace.first_task_row(task)
+        require(first is not None and first[0] > sent and first[1:] == ("task_state", "active"),
+                "journey_confirm_dispatch_unbound")
+        return task, run
+
+    def _require_confirm_live(self, trace: ConfirmCancelTrace, tasks: tuple[str, ...],
+                              cancel_category: str) -> None:
+        """Each task still active: any cancel seen fails as ``cancel_category``; a natural end
+        is inconclusive (journey_confirm_target_terminal), never replaced. Failure precedes
+        inconclusive: every task's cancels are checked before any task's natural end."""
+        statuses = [self.tracker.tasks.get(task) for task in tasks]
+        for task, status in zip(tasks, statuses, strict=True):
+            require(status not in _CONFIRM_CANCELS and not trace.cancels(task), cancel_category)
+        for status in statuses:
+            require(status not in TERMINAL, "journey_confirm_target_terminal")
+            require(status == "active", "journey_confirm_not_active")
+
+    async def speak_confirm_cancel(self, step: dict[str, Any]) -> None:
+        try:
+            await self._speak_confirm_cancel(step)
+        finally:
+            self.tracker.speak = None
+
+    async def _speak_confirm_cancel(self, step: dict[str, Any]) -> None:
+        """Two typed tasks, then a confirmed natural spoken cancel of exactly one of them.
+
+        A and B are started by typed `task:` commands so their stored objectives, and so the
+        host's fixed readbacks, are exact. With both active and the session quiet: a request
+        naming B must get B's exact readback, and No must cancel nothing; a request naming A
+        must get A's exact readback, and only after Yes may A be observed cancelling, with B
+        never cancelled and still live at the native witness read, which precedes all cleanup.
+        A readback for the other task, a reply without a readback, or a task that ends on its
+        own is inconclusive; no answer is sent after it and no replacement is chosen.
+        """
+        voice, tracker = self.voice, self.tracker
+        require(voice is not None, "journey_speak_unavailable")
+        assert voice is not None
+        clips = load_confirm_fixtures()
+        label = step["label"]
+        labels = {"a": label + ".a", "b": label + ".b"}  # never a scenario label (no dot)
+        commands = {"a": _START_PREFIX + " " + _CONFIRM_OBJECTIVE_A,
+                    "b": _START_PREFIX + " " + _CONFIRM_OBJECTIVE_B}
+        receipt = self.speak_receipt = {
+            "label": label, "kind": "speak_confirm_cancel", "mediaRequests": 0,
+            "cueAudioObserved": False, "quietGateMs": 0, "dispatchTasks": 0,
+            "dispatchAdmissions": 0, "tasksBound": False, "bothActiveBeforeRequest": False,
+            "quietBeforeRequestBMs": 0, "quietBeforeRequestAMs": 0, "unexpectedInputCount": 0,
+            **{name + suffix: value for name in _CONFIRM_CLIPS
+               for suffix, value in (("Injected", False), ("VadObserved", False),
+                                     ("FinalsCount", 0), ("TranscriptMatches", False))},
+            "readbackBOutcome": None, "readbackAOutcome": None, "bothActiveAfterNo": False,
+            "targetCancelObserved": False, "bystanderCancelObserved": False,
+            "bystanderActiveAtWitness": False, "nativeCancelledBeforeCleanup": False,
+            "nativeBystanderLiveBeforeCleanup": False, "cleanupCancelCommands": 0,
+        }
+        trace, before_tasks, before_runs = await self._mic_quiet_start(
+            voice, lambda prior, incarnation: ConfirmCancelTrace(
+                prior, incarnation, frozenset(commands.values())
+            ),
+        )
+        meter = voice.meter
+        task_a = task_b = run_a = run_b = ""
+
+        def disturbed() -> bool:
+            return any(tracker.tasks.get(task) != "active" for task in (task_a, task_b))
+
+        def scope() -> None:
+            # Exactly A and B (and their runs) are new, nothing else is live, and nothing
+            # unexpected arrived before the first clip.
+            receipt["unexpectedInputCount"] = trace.unexpected
+            require(not trace.overflow, "journey_confirm_trace_bound")
+            require(trace.unexpected == 0, "journey_confirm_unexpected_input")
+            live = {task for task, state in tracker.tasks.items() if state not in TERMINAL}
+            require(live <= {task_a, task_b} and set(tracker.tasks) - before_tasks
+                    == {task_a, task_b} and self.admissions - before_runs == {run_a, run_b},
+                    "journey_confirm_competing")
+
+        def require_clip(index: int) -> None:
+            name = _CONFIRM_CLIPS[index]
+            vad, finals, matches, _ = trace.clip(index)
+            receipt.update({name + "VadObserved": vad, name + "FinalsCount": finals,
+                            name + "TranscriptMatches": matches})
+            require(vad, "journey_confirm_vad")
+            require(finals == 1, "journey_confirm_finals")
+            require(matches, "journey_confirm_transcript")
+
+        async def quiet(key: str, cancel_category: str) -> None:
+            # No open turn, no pending admission and one whole quiet interval, with both
+            # tasks still active. Client clock only.
+            entry = meter.now()
+            try:
+                await self.wait(lambda: disturbed() or (
+                    not tracker.open_turns and self.pending == 0
+                    and meter.quiet_since(entry, _SPEAK_SETTLE_SECONDS)), _TASK_QUIET_TIMEOUT)
+            except TimeoutError:
+                require(False, "journey_confirm_not_quiet")
+            receipt[key] = int((meter.now() - entry) * 1000)
+            self._require_confirm_live(trace, (task_a, task_b), cancel_category)
+            scope()
+
+        async def inject(index: int, cancel_category: str) -> None:
+            frames, words = clips[index]
+
+            def start() -> None:
+                # Re-checked at the first speech frame, after the clip's leading silence: both
+                # still active, nothing competing. Abort before any speech if not.
+                self._require_confirm_live(trace, (task_a, task_b), cancel_category)
+                scope()
+                require(self.pending == 0, "journey_confirm_competing")
+                trace.mark(tracker.cursor, words)
+                receipt[_CONFIRM_CLIPS[index] + "Injected"] = True
+
+            await self._stream_bounded(voice, frames, {_SPEAK_LEAD_FRAMES: start})
+
+        async def request(index: int, want: str, other: str) -> None:
+            cancel_category = ("journey_confirm_premature_cancel" if index == 0
+                               else "journey_confirm_no_cancelled")
+            await inject(index, cancel_category)
+            with contextlib.suppress(TimeoutError):
+                await self.wait(lambda: disturbed() or trace.settled(index),
+                                _CONFIRM_REPLY_TIMEOUT)
+            await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
+            await self.poll()
+            # A readback is only a question: nothing may be cancelling yet. Side effects are
+            # proven absent before any reply is classified, so a mismatch or a clarification
+            # can never mask one. From the No onward a cancel is a No side effect.
+            self._require_confirm_live(trace, (task_a, task_b), cancel_category)
+            scope()
+            require_clip(index)
+            final = trace.clip(index)[3]
+            assert final is not None
+            outcome = trace.reply(index, final, want, other)
+            receipt["readback" + want.upper() + "Outcome"] = outcome
+            require(outcome != "ambiguous", "journey_confirm_ambiguous")
+            require(outcome in {"target", "other", "clarified"},
+                    "journey_confirm_readback_incomplete")
+            require(outcome != "other", "journey_confirm_nomination_mismatch")
+            require(outcome == "target", "journey_confirm_clarified")
+
+        try:
+            await self._mic_ready(voice, trace, receipt)
+            trace.frozen_seq = tracker.cursor
+            task_a, run_a = await self._confirm_dispatch(
+                trace, labels["a"], commands["a"], before_tasks, before_runs, receipt)
+            self._require_confirm_live(trace, (task_a,), "journey_confirm_premature_cancel")
+            task_b, run_b = await self._confirm_dispatch(
+                trace, labels["b"], commands["b"], before_tasks | {task_a},
+                before_runs | {run_a}, receipt)
+            self._require_confirm_live(trace, (task_a, task_b), "journey_confirm_premature_cancel")
+            receipt["tasksBound"] = True
+            await quiet("quietBeforeRequestBMs", "journey_confirm_premature_cancel")
+            receipt["bothActiveBeforeRequest"] = True
+            await request(0, "b", "a")
+            # No: nothing may be cancelled through a whole drain window after its final.
+            await inject(1, "journey_confirm_premature_cancel")
+            with contextlib.suppress(TimeoutError):
+                await self.wait(lambda: disturbed() or (
+                    trace.clip(1)[3] is not None and not tracker.open_turns),
+                    _CONFIRM_REPLY_TIMEOUT)
+            with contextlib.suppress(TimeoutError):
+                await self.wait(disturbed, _CONFIRM_NO_DRAIN_SECONDS)
+            await self.poll()
+            self._require_confirm_live(trace, (task_a, task_b), "journey_confirm_no_cancelled")
+            scope()
+            require_clip(1)
+            receipt["bothActiveAfterNo"] = True
+            await quiet("quietBeforeRequestAMs", "journey_confirm_no_cancelled")
+            await request(2, "a", "b")
+            await inject(3, "journey_confirm_no_cancelled")
+            with contextlib.suppress(TimeoutError):
+                await self.wait(lambda: trace.arming(task_a, 3) is not None
+                                or tracker.tasks.get(task_b) != "active"
+                                or tracker.tasks.get(task_a) in {"completed", "failed"},
+                                _TASK_CANCEL_TIMEOUT)
+            await asyncio.sleep(_SPEAK_DRAIN_SECONDS)
+            await self.poll()
+        finally:
+            await voice.stop_idle()  # every exit path: cancel and settle the idle feeder
+            meter.advance("closed")
+
+        def validate() -> None:
+            # B never cancelled and not ended; nothing else new; Yes heard exactly once; and A
+            # cancelling or interrupted only after that final. Run before and after each
+            # native read, with the trace still live.
+            status_b = tracker.tasks.get(task_b)
+            receipt["bystanderCancelObserved"] = (bool(trace.cancels(task_b))
+                                                  or status_b in _CONFIRM_CANCELS)
+            require(not receipt["bystanderCancelObserved"], "journey_confirm_wrong_target")
+            require(status_b == "active", "journey_confirm_bystander_ended")
+            scope()
+            require_clip(3)
+            final = trace.clip(3)[3]
+            assert final is not None
+            require(all(seq > final for seq in trace.cancels(task_a)),
+                    "journey_confirm_premature_cancel")
+            armed = trace.arming(task_a, 3)
+            receipt["targetCancelObserved"] = armed is not None
+            if armed is None:
+                require(tracker.tasks.get(task_a) not in {"completed", "failed"},
+                        "journey_confirm_target_terminal")
+            require(armed is not None, "journey_confirm_not_cancelled")
+
+        validate()
+        # The native witness is read here, before any cleanup: cleanup never supplies evidence.
+        await self.collect(labels["a"])
+        require(self.results[labels["a"]]["terminal"] == "cancelled", "journey_cancel_unproven")
+        receipt["nativeCancelledBeforeCleanup"] = True
+        await self.poll()
+        validate()
+        receipt["bystanderActiveAtWitness"] = True
+        live = await asyncio.to_thread(NativeRunWitness(
+            self.bearer, run_b, profile=self.options.native_profile,
+            api_origin=self.options.api_origin,
+        ).live_status)
+        require(live not in {"stopping", "cancelled", "interrupted"},
+                "journey_confirm_wrong_target")
+        require(live in _CONFIRM_LIVE_RUN, "journey_confirm_bystander_ended")
+        receipt["nativeBystanderLiveBeforeCleanup"] = True
+        await self.poll()
+        validate()  # re-checked after the live read and the final poll
+        # Cleanup, after all acceptance evidence: B is cancelled by exact id and counted
+        # separately. Its events are not trace evidence.
+        tracker.speak = None
+        tracker.current, tracker.text = None, ""
+        self.sequence += 1
+        receipt["cleanupCancelCommands"] += 1
+        await self.request("input", {"sequence": self.sequence,
+                                     "text": _CANCEL_PREFIX + " " + task_b})
+        await self.wait(lambda: tracker.tasks.get(task_b) in TERMINAL, 45)
+        await self.collect(labels["b"])
+
     async def step(self, step: dict) -> None:
         kind, label = step["kind"], step["label"]
-        if kind in {"speak", "speak_barge", "speak_task"}:
+        if kind in {"speak", "speak_barge", "speak_task", "speak_confirm_cancel"}:
             if kind == "speak_barge":
                 await self.speak_barge(step)
             elif kind == "speak_task":
                 await self.speak_task(step)
+            elif kind == "speak_confirm_cancel":
+                await self.speak_confirm_cancel(step)
             else:
                 await self.speak(step)
             return
@@ -1841,7 +2282,8 @@ async def execute(options, steps, receipt) -> None:
             ),
             15,
         )
-        if any(step.get("kind") in {"speak", "speak_barge", "speak_task"}
+        if any(step.get("kind") in {"speak", "speak_barge", "speak_task",
+                                    "speak_confirm_cancel"}
                for step in steps):
             # Subscribe only to the worker's audio, by the identity validated above.
             journey.voice = SyntheticVoice(rtc, room, credential["workerIdentity"])

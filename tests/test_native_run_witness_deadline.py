@@ -204,3 +204,40 @@ def test_a_prompt_status_response_still_reads_within_the_deadline(
     # Cancelled before any session existed: a verified result with no tool-use claim.
     assert summary["terminal"] == "cancelled"
     assert summary["toolTraceAvailable"] is False
+
+
+@pytest.mark.parametrize(
+    "status", ["queued", "running", "waiting_for_approval", "stopping", "completed", "cancelled"]
+)
+def test_the_live_status_probe_returns_one_known_status_and_needs_no_terminal(
+    tmp_path: Path, status: str
+) -> None:
+    subject = NativeRunWitness("secret", RUN, profile=tmp_path, api_origin="http://127.0.0.1:1")
+    subject._status = lambda: {  # type: ignore[method-assign]
+        "object": "hermes.run", "run_id": RUN, "session_id": RUN, "status": status,
+    }
+    assert subject.live_status() == status
+
+
+@pytest.mark.parametrize(
+    "reply,category",
+    [
+        ({"object": "hermes.run", "run_id": "run_" + "b" * 32, "session_id": RUN,
+          "status": "running"}, "witness_run_binding"),
+        ({"object": "other", "run_id": RUN, "session_id": RUN, "status": "running"},
+         "witness_run_binding"),
+        ({"object": "hermes.run", "run_id": RUN, "session_id": "x", "status": "running"},
+         "witness_session_binding"),
+        ({"object": "hermes.run", "run_id": RUN, "session_id": RUN, "status": "paused"},
+         "witness_status_unknown"),
+        ({"object": "hermes.run", "run_id": RUN, "session_id": RUN, "status": None},
+         "witness_status_unknown"),
+    ],
+)
+def test_the_live_status_probe_fails_closed(
+    tmp_path: Path, reply: dict[str, object], category: str
+) -> None:
+    subject = NativeRunWitness("secret", RUN, profile=tmp_path, api_origin="http://127.0.0.1:1")
+    subject._status = lambda: reply  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match=category):
+        subject.live_status()
