@@ -4698,7 +4698,7 @@ def test_speak_confirm_cancel_cancels_exactly_the_confirmed_task(tmp_path, monke
     assert receipt["bystanderActiveAtWitness"] is True
     assert receipt["nativeCancelledBeforeCleanup"] is True
     assert receipt["nativeBystanderLiveBeforeCleanup"] is True
-    assert receipt["cleanupCancelCommands"] == 1  # B, after the witness: never acceptance
+    assert receipt["successPathCleanupCancels"] == 1  # B, after the witness: never acceptance
     # A's witness, then B's live status, both before any cleanup; B's read is cleanup's.
     assert journey.witness_reads == [("read", RUN_A), ("live", RUN_B), ("read", RUN_B)]
     assert journey.results["confirm.a"]["terminal"] == "cancelled"
@@ -4985,7 +4985,7 @@ def test_cleanup_cancellation_is_never_recorded_as_trace_evidence(tmp_path, monk
     monkeypatch.setattr(client, "ConfirmCancelTrace", Recording)
     journey = confirm_journey(tmp_path, monkeypatch)
     run_confirm(journey)
-    assert journey.speak_receipt["cleanupCancelCommands"] == 1
+    assert journey.speak_receipt["successPathCleanupCancels"] == 1
     assert journey.tracker.tasks[C_B] == "interrupted"  # cleanup did cancel B
     (trace,) = traces
     assert trace.cancels(C_B) == []  # but its events never reached the step's trace
@@ -5057,7 +5057,7 @@ def test_a_target_cancelled_only_by_cleanup_is_never_accepted(tmp_path, monkeypa
     assert journey.inputs[-2:] == ["cancel task: " + C_A, "cancel task: " + C_B]
     assert receipt["targetCancelObserved"] is False
     assert receipt["nativeCancelledBeforeCleanup"] is False
-    assert receipt["cleanupCancelCommands"] == 0
+    assert receipt["successPathCleanupCancels"] == 0
 
 
 def test_the_native_witness_must_say_the_target_was_cancelled(tmp_path, monkeypatch):
@@ -5081,7 +5081,7 @@ def test_the_native_witness_must_say_the_bystander_is_still_live(
     receipt = confirm_refused(journey, category)
     assert receipt["nativeCancelledBeforeCleanup"] is True
     assert receipt["nativeBystanderLiveBeforeCleanup"] is False
-    assert receipt["cleanupCancelCommands"] == 0
+    assert receipt["successPathCleanupCancels"] == 0
 
 
 def test_a_bystander_cancelled_after_its_live_witness_read_still_fails(tmp_path, monkeypatch):
@@ -5098,7 +5098,7 @@ def test_a_bystander_cancelled_after_its_live_witness_read_still_fails(tmp_path,
 
     journey.poll = poll
     receipt = confirm_refused(journey, "journey_confirm_wrong_target")
-    assert polls_after_live and receipt["cleanupCancelCommands"] == 0
+    assert polls_after_live and receipt["successPathCleanupCancels"] == 0
 
 
 # Input and attribution.

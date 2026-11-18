@@ -335,7 +335,7 @@ spoken delegation; `speak_task` covers that separately.
    `queued`, `running` or `waiting_for_approval` (`stopping`, `cancelled` or `interrupted` is
    the wrong target; `completed` or `failed` is an ended bystander). The validation runs
    before and after each native read with the trace live. It never waits for B to finish.
-7. **Cleanup** then cancels B by exact id, counted separately as `cleanupCancelCommands`.
+7. **Cleanup** then cancels B by exact id, counted separately as `successPathCleanupCancels`.
    Cleanup never creates acceptance: a target only cancelled by cleanup is refused.
 
 Classification precedence is failure before inconclusive. Every side effect is ruled out
@@ -352,6 +352,21 @@ its own (`journey_confirm_target_terminal`). An interrupted or unfinished reply 
 the request's final, is `journey_confirm_ambiguous`. Wrong words, a missing voice start or a
 second final for any clip fail (`journey_confirm_transcript`, `journey_confirm_vad`,
 `journey_confirm_finals`).
+
+**Outcome classes.**
+- **Inconclusive:** these mean a precondition of the scenario was lost. They are never a product
+  failure:
+  - `journey_confirm_nomination_mismatch`;
+  - `journey_confirm_clarified`;
+  - `journey_confirm_target_terminal`;
+  - `journey_confirm_bystander_ended`, meaning B ended on its own before the witness. If any
+    cancel evidence for B exists, the outcome is `journey_confirm_wrong_target` instead.
+- **Failures:** every other `journey_confirm_*` refusal, including
+  `journey_confirm_readback_incomplete`. Failure precedence always applies.
+
+`successPathCleanupCancels` counts only the cleanup cancel of B on the success path, after
+the native evidence. Cleanup after a refusal goes through the mandatory owned-task cleanup
+and its cleanup flags. That cleanup is authoritative and is not counted here.
 
 The receipt holds booleans, counts, client-local milliseconds and the fixed reply categories
 `readbackBOutcome` / `readbackAOutcome` (`target`, `other`, `clarified`, `interrupted`,

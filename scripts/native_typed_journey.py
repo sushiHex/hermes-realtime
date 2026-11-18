@@ -1931,7 +1931,7 @@ class Journey:
             "readbackBOutcome": None, "readbackAOutcome": None, "bothActiveAfterNo": False,
             "targetCancelObserved": False, "bystanderCancelObserved": False,
             "bystanderActiveAtWitness": False, "nativeCancelledBeforeCleanup": False,
-            "nativeBystanderLiveBeforeCleanup": False, "cleanupCancelCommands": 0,
+            "nativeBystanderLiveBeforeCleanup": False, "successPathCleanupCancels": 0,
         }
         trace, before_tasks, before_runs = await self._mic_quiet_start(
             voice, lambda prior, incarnation: ConfirmCancelTrace(
@@ -2103,7 +2103,7 @@ class Journey:
         tracker.speak = None
         tracker.current, tracker.text = None, ""
         self.sequence += 1
-        receipt["cleanupCancelCommands"] += 1
+        receipt["successPathCleanupCancels"] += 1
         await self.request("input", {"sequence": self.sequence,
                                      "text": _CANCEL_PREFIX + " " + task_b})
         await self.wait(lambda: tracker.tasks.get(task_b) in TERMINAL, 45)
