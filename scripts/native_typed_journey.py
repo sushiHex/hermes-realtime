@@ -2229,16 +2229,21 @@ class Journey:
 
         Nothing is awaited and no native witness is read: mandatory cleanup follows with
         no suspension point in between. The native category is the one collect() already
-        retained, or null when collect() did not run for that task.
+        retained, or null when collect() did not run for that task. ``hostRefusalObserved`` is
+        the fixed host refusal category the browser projected for that task, if any: an
+        observed notice only, never proof of the native outcome or its cause.
         """
+        known = frozenset(_HOST_REFUSALS.values())
         tasks: dict[str, dict[str, Any]] = {}
         for label, (task, _) in self.bindings.items():
             status = self.tracker.tasks.get(task)
             native = self.results[label]["terminal"] if label in self.results else None
+            refusal = self.tracker.host_refusals.get(task)
             tasks[label] = {
                 "trackerStatus": status if status in {"active", "cancelling", *TERMINAL}
                 else None,
                 "nativeTerminal": _native_category(native),
+                "hostRefusalObserved": refusal if refusal in known else None,
             }
         return tasks
 
