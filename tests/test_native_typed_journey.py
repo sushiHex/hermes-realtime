@@ -4924,8 +4924,14 @@ def _early_end_with_competing_work():
 
 
 def test_competing_work_first_seen_at_the_quiet_gate_fails(tmp_path, monkeypatch):
-    """Site-specific (Astra 9272): the quiet gate before request B sees the early end first."""
-    journey = confirm_journey(tmp_path, monkeypatch, pre=[_early_end_with_competing_work()])
+    """Site-specific (Astra 9272): the quiet gate before request B sees the early end first.
+    B's dispatch leaves an admission pending, so the gate polls; its next batch clears the
+    pending admission together with the early end and the competing work."""
+    journey = confirm_journey(
+        tmp_path, monkeypatch,
+        dispatches=confirm_dispatches(b=[("__pending__", {"count": 1})]),
+        pre=[[("__pending__", {"count": 0}), *_early_end_with_competing_work()]],
+    )
     receipt = confirm_refused(journey, "journey_confirm_competing")
     assert receipt["requestBInjected"] is False
 
