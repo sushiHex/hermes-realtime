@@ -356,6 +356,20 @@ the request's final, is `journey_confirm_ambiguous`. Wrong words, a missing voic
 second final for any clip fail (`journey_confirm_transcript`, `journey_confirm_vad`,
 `journey_confirm_finals`).
 
+#### Short finals near playback
+
+For a streaming recognizer, a two-character final near playback can retain authority
+when its whole alphanumeric text agrees with the latest partial from that same capture
+(ignoring case and terminal sentence punctuation). This path requires an explicit speech
+presence verifier; acoustic promotion and transcript echo filtering still apply. Agreement
+is consistency, not independent recognition: a recognizer wrapper may reuse its last partial
+at the endpoint. Missing, stale, mismatched or echo evidence refuses the final.
+
+This endpoint path does not authorize interruption from a short partial, make a capture
+clean, or grant positive cancellation confirmation. A final is checked again after the
+interruption await so a replaced foreground cannot inherit the old capture's authority.
+Refusal diagnostics contain bounded counts and categories only, never recognized text.
+
 #### Controlled background-model lifetimes
 
 Short research tasks can finish before this spoken sequence reaches confirmation.
