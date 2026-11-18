@@ -356,6 +356,36 @@ the request's final, is `journey_confirm_ambiguous`. Wrong words, a missing voic
 second final for any clip fail (`journey_confirm_transcript`, `journey_confirm_vad`,
 `journey_confirm_finals`).
 
+#### Controlled background-model lifetimes
+
+Short research tasks can finish before this spoken sequence reaches confirmation.
+For an explicitly scripted-model rehearsal, an externally owned qualification controller
+can use [`ControlledTaskModel`](../scripts/controlled_task_model.py). Pass a mapping from
+separate local labels to the two unchanged, exact objectives, await `start()`, and configure
+only the isolated Hermes profile's custom model URL/default to the returned URL and
+`controlled`. The endpoint binds loopback on an ephemeral port and admits each objective
+once. Unknown, stale, duplicate and nonstreaming requests refuse; no fuzzy matching occurs.
+
+Each held response yields unfinished model chunks until its client disconnects or its
+own local gate is released. These chunks let the native stream consumer observe cancellation;
+SSE comments alone may be swallowed by the SDK. They do not impose a minimum duration or
+complete work on a timer. The endpoint never starts a task, grants cancellation, emits task
+events, or edits native run state. There is no HTTP release control.
+
+Keep both gates unreleased throughout the successful journey. Use the existing task/run
+bindings and native witnesses, unchanged: A must be natively cancelled and B natively live
+before cleanup. `snapshot()` exposes admission/open/closed/refusal counts only; a closed
+model stream is not a native cancellation witness. Afterwards the controller must settle
+the owned tasks and call `close()` in its cleanup path, including on failure. Use the
+[existing process owner](contained-validation.md) for the controller and native descendants;
+this library neither owns native processes nor replaces their settlement checks.
+
+Retain a separate receipt explicitly labelled **native runtime with scripted background-model
+lifetimes and synthetic audio**. It may prove the confirmation/cancellation mechanism under
+controlled task longevity. It cannot qualify the configured background provider, research
+results, natural task duration, physical microphone, AEC, or perceived speech quality. A
+controlled success does not close those separate acceptance gates.
+
 **Outcome classes.**
 - **Inconclusive:** these mean a precondition of the scenario was lost. They are never a product
   failure:
