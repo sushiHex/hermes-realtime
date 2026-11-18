@@ -343,9 +343,10 @@ class ConversationTaskProposals:
         if proposal.cancel_task_id is not None:
             # The clean capture latched this exact question for the current binding, and
             # confirmation_target froze this affirmative's input epoch before recording.
+            # That frozen epoch, not the current one, is checked at the locked commit.
             frozen, self._cancel_confirmation = self._cancel_confirmation, None
-            if frozen is None or frozen[0] is not proposal or frozen[1] != self._input_serial:
-                self.retire("cancel_newer_input")
+            if frozen is None or frozen[0] is not proposal:
+                self.retire("cancel_unfrozen_confirmation")
                 return WorkCommandAdmission.REFUSED
             result = await self._consume(
                 proposal, decision="confirm", confirming_input=frozen[1],

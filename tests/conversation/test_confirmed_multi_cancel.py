@@ -625,6 +625,25 @@ async def test_route_spoken_freezes_the_confirming_input_before_recording_it(cha
 
 
 @pytest.mark.asyncio
+async def test_a_consume_without_its_own_confirmation_is_refused():
+    """A cancel is consumed only for the affirmative confirmation_target froze for it."""
+    inference = Nominations(HostCancelRequest(target="choice_1"))
+    loop, _context, controller, proposals, _synth, _events = _owner(
+        "alpha", "beta", inference=inference,
+    )
+    await _say(loop, proposals, "Stop alpha.", "turn_1")
+    proposals.capture_started(participant="participant", generation=1, clean=True)
+    pending = proposals._pending
+    assert pending is not None
+    assert await proposals.consume_input("yes", expected_proposal=pending) is (
+        WorkCommandAdmission.REFUSED
+    )
+    await _settle()
+    assert controller.cancellations == []
+    assert not proposals.has_pending
+
+
+@pytest.mark.asyncio
 async def test_an_uninterrupted_confirmation_still_commits_after_waiting_for_the_lock():
     inference = Nominations(HostCancelRequest(target="choice_1"))
     loop, _context, controller, proposals, _synth, _events = _owner(
