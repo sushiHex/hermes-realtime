@@ -360,8 +360,8 @@ second final for any clip fail (`journey_confirm_transcript`, `journey_confirm_v
 
 Short research tasks can finish before this spoken sequence reaches confirmation.
 For an explicitly scripted-model rehearsal, an externally owned qualification controller
-can use [`ControlledTaskModel`](../scripts/controlled_task_model.py). Pass a mapping of
-the two unchanged, exact objectives to separate local labels, await `start()`, and configure
+can use [`ControlledTaskModel`](../scripts/controlled_task_model.py). Pass a mapping from
+separate local labels to the two unchanged, exact objectives, await `start()`, and configure
 only the isolated Hermes profile's custom model URL/default to the returned URL and
 `controlled`. The endpoint binds loopback on an ephemeral port and admits each objective
 once. Unknown, stale, duplicate and nonstreaming requests refuse; no fuzzy matching occurs.
