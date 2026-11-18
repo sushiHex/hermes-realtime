@@ -1859,7 +1859,8 @@ def test_mandatory_cleanup_follows_the_failure_with_no_diagnostic_suspension(
     }
     assert receipt["outcome"] == "refused" and inputs == [] and constructed == []
     assert receipt["diagnostics"]["preCleanupTasks"] == {
-        "work": {"trackerStatus": "interrupted", "nativeTerminal": None},
+        "work": {"trackerStatus": "interrupted", "nativeTerminal": None,
+                 "hostRefusalObserved": None},
     }
 
 
@@ -1904,7 +1905,8 @@ def test_diagnostics_explain_an_uncorrelated_cancel_turn_without_changing_the_ve
             "targetCancelAfterAdmission": True,
             "nativeTerminal": None,  # Not read: collect() did not run for this task.
         }],
-        "preCleanupTasks": {"work": {"trackerStatus": "interrupted", "nativeTerminal": None}},
+        "preCleanupTasks": {"work": {"trackerStatus": "interrupted", "nativeTerminal": None,
+                                     "hostRefusalObserved": None}},
     }
     assert not any(marker in json.dumps(receipt) for marker in PRIVATE_MARKERS)
 
@@ -1969,7 +1971,8 @@ def test_pre_cleanup_snapshot_survives_cleanup(tmp_path, monkeypatch):
     # The snapshot taken before cleanup is unchanged by what cleanup then did.
     diagnostics = receipt["diagnostics"]
     assert diagnostics["preCleanupTasks"] == {
-        "work": {"trackerStatus": "active", "nativeTerminal": None},
+        "work": {"trackerStatus": "active", "nativeTerminal": None,
+                 "hostRefusalObserved": None},
     }
     assert diagnostics["steps"][0]["targetCancelObserved"] is False
     assert diagnostics["steps"][0]["nativeTerminal"] is None
@@ -4776,6 +4779,40 @@ def test_a_task_that_ends_during_the_request_lead_in_is_inconclusive_and_nothing
     receipt = confirm_refused(journey, "journey_confirm_target_terminal")
     assert receipt["bothActiveBeforeRequest"] is True and receipt["requestBInjected"] is False
     assert sent_speech_frames(journey) == 0
+
+
+def _failed_with_notice(task, text):
+    return ("task_result", {"taskId": task, "status": "failed", "text": text})
+
+
+@pytest.mark.parametrize("reason", ["insufficient", "deadline", "unverified"])
+def test_an_early_host_refusal_is_retained_as_an_observed_notice(tmp_path, monkeypatch, reason):
+    """Diagnosis only: A's fixed host refusal category survives into the pre-cleanup
+    snapshot even though its native terminal is never read. The verdict is unchanged."""
+    import scripts.native_typed_journey as client
+
+    notice = {value: key for key, value in client._HOST_REFUSALS.items()}[reason]
+    journey = confirm_journey(tmp_path, monkeypatch, pre=[[_failed_with_notice(C_A, notice)]])
+    receipt = confirm_refused(journey, "journey_confirm_target_terminal")
+    assert receipt["requestBInjected"] is False
+    snapshot = journey.pre_cleanup_tasks()
+    assert snapshot["confirm.a"] == {"trackerStatus": "failed", "nativeTerminal": None,
+                                     "hostRefusalObserved": reason}
+    assert snapshot["confirm.b"]["hostRefusalObserved"] is None
+    assert notice not in json.dumps(snapshot)
+
+
+@pytest.mark.parametrize("text", ["Some raw model or Hermes error text.", None])
+def test_an_unknown_failure_text_is_never_copied_as_a_notice(tmp_path, monkeypatch, text):
+    row = (("task_result", {"taskId": C_A, "status": "failed", "text": text})
+           if text is not None else ("task_state", {"taskId": C_A, "status": "failed"}))
+    journey = confirm_journey(tmp_path, monkeypatch, pre=[[row]])
+    confirm_refused(journey, "journey_confirm_target_terminal")
+    snapshot = journey.pre_cleanup_tasks()
+    assert snapshot["confirm.a"] == {"trackerStatus": "failed", "nativeTerminal": None,
+                                     "hostRefusalObserved": None}
+    if text is not None:
+        assert text not in json.dumps(snapshot)
 
 
 def test_a_task_that_ends_before_the_yes_is_inconclusive_and_no_yes_is_sent(
