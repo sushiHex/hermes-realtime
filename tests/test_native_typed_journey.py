@@ -4919,6 +4919,42 @@ def test_competing_work_beside_an_early_end_fails_and_is_not_inconclusive(
                     "journey_confirm_competing")
 
 
+def _reply_with_finals(spoken, pair, finals):
+    """A request phase whose reply turn publishes these assistant finals, in order."""
+    phase = confirm_reply(spoken, pair)
+    phase[2] = [("first_foreground_token", pair), *(assistant_final(t, pair) for t in finals)]
+    return phase
+
+
+@pytest.mark.parametrize("phase", ["b", "a"])
+@pytest.mark.parametrize("shape", ["readback_then_text", "readback_twice", "both_readbacks"])
+def test_a_reply_that_is_not_exactly_one_final_readback_is_ambiguous(
+    tmp_path, monkeypatch, phase, shape,
+):
+    """PR #583 review 4609479174: the readback must be the reply's last assistant final and
+    appear exactly once; extra or duplicate publications around it are refused."""
+    obj_a, obj_b = confirm_objectives()
+    want, other = ((readback_of(obj_b), readback_of(obj_a)) if phase == "b"
+                   else (readback_of(obj_a), readback_of(obj_b)))
+    finals = {"readback_then_text": [want, "Which one did you mean?"],
+              "readback_twice": [want, want],
+              "both_readbacks": [other, want]}[shape]
+    spoken, pair = (REQ_B_SPOKEN, P_B) if phase == "b" else (REQ_A_SPOKEN, P_A)
+    phases = confirm_phases(**{phase: _reply_with_finals(spoken, pair, finals)})
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                              "journey_confirm_ambiguous")
+    assert receipt["readback" + phase.upper() + "Outcome"] == "ambiguous"
+
+
+def test_prose_before_the_readback_still_reaches_the_target(tmp_path, monkeypatch):
+    """Model prose spoken before the nomination is allowed: the host's readback is last."""
+    obj_b = confirm_objectives()[1]
+    b = _reply_with_finals(REQ_B_SPOKEN, P_B, ["Sure.", readback_of(obj_b)])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(b=b))
+    run_confirm(journey)
+    assert journey.speak_receipt["readbackBOutcome"] == "target"
+
+
 def _early_end_with_competing_work():
     return [task_result_row(C_A, "completed"), task_state_row(C_OTHER, "active"), admit(RUN_X)]
 

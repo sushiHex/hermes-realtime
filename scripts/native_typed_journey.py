@@ -592,10 +592,17 @@ class ConfirmCancelTrace(SpeakTrace):
             return "interrupted"
         if "assistant_turn_completed" not in facts:
             return "incomplete"
-        matches = {row[4] for row in rows if row[2] == "assistant"}
-        if other in matches:
-            return "other"
-        return "target" if want in matches else "clarified"
+        # The host speaks its readback after the provider stream closes and refuses model text
+        # after it, so a readback is the turn's last assistant final and appears once; model
+        # prose may precede it. Any other shape around a readback is refused, never accepted
+        # by membership.
+        finals = [row[4] for row in rows if row[2] == "assistant"]
+        readbacks = [match for match in finals if match is not None]
+        if not readbacks:
+            return "clarified"
+        if len(readbacks) != 1 or finals[-1] is None:
+            return "ambiguous"
+        return "target" if readbacks[0] == want else "other"
 
 
 class WorkerAudioMeter:

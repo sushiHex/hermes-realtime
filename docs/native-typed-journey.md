@@ -322,7 +322,10 @@ spoken delegation; `speak_task` covers that separately.
 2. **Quiet with both active**, then `sapi_confirm_request_b.wav` (names B). At its first
    speech frame both tasks must still be active with nothing competing, otherwise it aborts
    before any speech. The one reply turn (a pair first seen after the request's final) must
-   contain an assistant final exactly equal to B's readback and complete.
+   complete. Its last assistant final must be exactly B's readback, and that readback must
+   appear only once. Model prose may precede it: the host speaks the readback after the
+   provider stream closes and refuses model text after it. Any other shape around a readback
+   is `journey_confirm_ambiguous`: text after it, a duplicate, or both readbacks.
 3. `sapi_confirm_no.wav`: through a bounded drain window after its final nothing may be
    cancelling or interrupted and both tasks stay active (`journey_confirm_no_cancelled`).
 4. **Quiet again**, then `sapi_confirm_request_a.wav` (names A): A's exact readback, completed.
