@@ -457,12 +457,23 @@ that is not a clean capture of its completed readback retires it, and the input
 continues as an ordinary turn, which may at most ask again. Such an affirmative is a
 typed, echoed, interrupted or late one. A readback that was not delivered exactly also
 retires the question. No question is held when the turn has no speech segment left to
-ask it. The question is retired before confirmation, and checked again at
-consumption, if its task is no longer running with nothing starting or stopping. A later
-"yes" is therefore an ordinary turn and never moves to another task, including a
-successor with the same objective. A consumed question calls the same exact-task command
-path as the card's **Cancel**, `cancel task: <id>` intake for the frozen task. The work
-surface's lock and stale-target refusal are the commit point. The generation-bound task
+ask it. The question is retired before confirmation if its task is no longer running
+with nothing starting or stopping. A later "yes" is therefore an ordinary turn and never
+moves to another task, including a successor with the same objective.
+
+A consumed question calls the same exact-task command path as the card's **Cancel**,
+`cancel task: <id>` intake for the frozen task. It carries the confirming input's own
+authority, not the nomination turn's. A synchronous predicate is re-read under the work
+surface's admission lock, which is the commit point, with no suspension before the cancel
+binds. The commit is refused, and nothing is cancelled, if any of these has changed while
+the cancel waits for that lock:
+- the session binding;
+- no newer user input has begun, spoken or typed;
+- the question's deadline has not passed;
+- the task is still running with nothing starting or stopping.
+
+A superseded commit is a refusal of that command, not lost task control. The stale-target
+refusal still applies at the commit. The generation-bound task
 identity selects that task's own run through the existing context, API and controller
 checks; no separate run authority is added.
 
