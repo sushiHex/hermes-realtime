@@ -5049,7 +5049,7 @@ def test_a_cancel_of_the_other_task_during_witness_collection_is_the_wrong_targe
     assert ("live", RUN_B) not in journey.witness_reads
 
 
-def test_a_bystander_that_ends_before_the_witness_fails(tmp_path, monkeypatch):
+def test_a_bystander_that_ends_before_the_witness_is_inconclusive(tmp_path, monkeypatch):
     phases = confirm_phases(yes=confirm_yes(extra=[task_result_row(C_B, "completed")]))
     journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
     receipt = confirm_refused(journey, "journey_confirm_bystander_ended")
