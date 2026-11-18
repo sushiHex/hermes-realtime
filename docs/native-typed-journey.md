@@ -302,6 +302,80 @@ grammar or the ambiguous-cancel category.
 The receipt holds booleans and counts only (no ids or text). It is controlled synthetic
 evidence.
 
+### `speak_confirm_cancel`
+
+A `speak_confirm_cancel` step (exactly `label` and `kind`; it is the scenario's one microphone
+step) tests the confirmed natural spoken cancel with several running tasks (#581, ADR 0004
+"Confirmed natural cancel with several tasks"). It starts both tasks by **typed explicit
+`task:` commands** so their stored objectives, and therefore the host's fixed readbacks
+(`cancel_readback`, imported from the package, never retyped), are exact. It does not cover
+spoken delegation; `speak_task` covers that separately.
+
+1. **Two typed starts.** After the speak flow's quiet start, warm-up and quiet gate, it sends
+   `task: <A>` then `task: <B>` (two fixed harmless objectives) through the typed input route.
+   Each must yield exactly one new task and one new run whose first projected state is
+   `active` after that send (`journey_confirm_not_dispatched`, `journey_confirm_competing`,
+   `journey_confirm_dispatch_unbound`). Each is owned for cleanup as soon as it is unambiguous
+   (bindings `<label>.a` / `<label>.b`). From then until the first clip only those typed finals
+   may arrive: a voice start, another user final, or an unbound or replayed foreground event
+   fails (`journey_confirm_unexpected_input`).
+2. **Quiet with both active**, then `sapi_confirm_request_b.wav` (names B). At its first
+   speech frame both tasks must still be active with nothing competing, otherwise it aborts
+   before any speech. The one reply turn (a pair first seen after the request's final) must
+   complete. Its last assistant final must be exactly B's readback, and that readback must
+   appear only once. Model prose may precede it: the host speaks the readback after the
+   provider stream closes and refuses model text after it. Any other shape around a readback
+   is `journey_confirm_ambiguous`: text after it, a duplicate, or both readbacks.
+3. `sapi_confirm_no.wav`: through a bounded drain window after its final nothing may be
+   cancelling or interrupted and both tasks stay active (`journey_confirm_no_cancelled`).
+4. **Quiet again**, then `sapi_confirm_request_a.wav` (names A): A's exact readback, completed.
+5. `sapi_confirm_yes.wav`. The only proof is the outcome: A observed `cancelling` or
+   `interrupted` by `task_state` after the Yes final (`journey_confirm_not_cancelled`
+   otherwise; a terminal result alone is not arming). B must never be cancelled
+   (`journey_confirm_wrong_target`) and stay active (`journey_confirm_bystander_ended`).
+6. **Native evidence before cleanup.** A's witness is read (through `collect`) and must say
+   `cancelled`; then B's run status is read with `NativeRunWitness.live_status` and must be
+   `queued`, `running` or `waiting_for_approval` (`stopping`, `cancelled` or `interrupted` is
+   the wrong target; `completed` or `failed` is an ended bystander). The validation runs
+   before and after each native read with the trace live. It never waits for B to finish.
+7. **Cleanup** then cancels B by exact id, counted separately as `successPathCleanupCancels`.
+   Cleanup never creates acceptance: a target only cancelled by cleanup is refused.
+
+Classification precedence is failure before inconclusive. Every side effect is ruled out
+before any reply is classified or any natural end is named, so a mismatch, a clarification or
+an early end can never mask one. A cancel of either task during request B is
+`journey_confirm_premature_cancel`; any cancel from the No through the Yes injection is
+`journey_confirm_no_cancelled`; a cancel of A in the Yes clip before its final is premature;
+any cancel of B after Yes is the wrong target. Only then are these inconclusive (no further
+answer is sent and no replacement is chosen): a readback naming the other task
+(`journey_confirm_nomination_mismatch`), a completed reply without a readback
+(`journey_confirm_clarified`, including a readback with extra words), or a task that ends on
+its own (`journey_confirm_target_terminal`). An interrupted or unfinished reply is
+`journey_confirm_readback_incomplete`; more than one reply turn, or a reply that starts before
+the request's final, is `journey_confirm_ambiguous`. Wrong words, a missing voice start or a
+second final for any clip fail (`journey_confirm_transcript`, `journey_confirm_vad`,
+`journey_confirm_finals`).
+
+**Outcome classes.**
+- **Inconclusive:** these mean a precondition of the scenario was lost. They are never a product
+  failure:
+  - `journey_confirm_nomination_mismatch`;
+  - `journey_confirm_clarified`;
+  - `journey_confirm_target_terminal`;
+  - `journey_confirm_bystander_ended`, meaning B ended on its own before the witness. If any
+    cancel evidence for B exists, the outcome is `journey_confirm_wrong_target` instead.
+- **Failures:** every other `journey_confirm_*` refusal, including
+  `journey_confirm_readback_incomplete`. Failure precedence always applies.
+
+`successPathCleanupCancels` counts only the cleanup cancel of B on the success path, after
+the native evidence. Cleanup after a refusal goes through the mandatory owned-task cleanup
+and its cleanup flags. That cleanup is authoritative and is not counted here.
+
+The receipt holds booleans, counts, client-local milliseconds and the fixed reply categories
+`readbackBOutcome` / `readbackAOutcome` (`target`, `other`, `clarified`, `interrupted`,
+`incomplete`, `none`, `ambiguous`, or null if not reached). Assistant text is only compared in
+memory with the two pinned readbacks; no text or identity is stored.
+
 This is a controlled synthetic path. It bypasses the physical microphone and acoustic
 echo cancellation. It does not prove source-attributed microphone qualification or the
 naturalness of the conversation.

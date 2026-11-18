@@ -23,6 +23,11 @@ TOTAL_CAP = 2 * 1024 * 1024
 # extends it, and at expiry the status socket is shut down so a blocked read returns.
 READ_DEADLINE_SECONDS = 15.0
 STATUS_IDLE_SECONDS = 5.0
+# Pinned Runs statuses: live (integration/api.py _LIVE_RUN_STATUSES) and terminal.
+KNOWN_RUN_STATUSES = frozenset({
+    "queued", "running", "waiting_for_approval", "stopping",
+    "completed", "failed", "cancelled", "interrupted",
+})
 
 
 def require(ok: bool, category: str) -> None:
@@ -201,6 +206,23 @@ class NativeRunWitness:
         require(status == 200 and content_type == "application/json", "witness_run_response")
         require(len(raw) <= TEXT_CAP, "witness_run_bound")
         return object_json(raw.decode("utf-8"))
+
+    def live_status(self) -> str:
+        """The bound run's current status, which need not be terminal yet.
+
+        Only one known status category leaves: no session, tool or message evidence is read.
+        The same one deadline, run binding and session binding as ``read`` apply.
+        """
+        self._deadline = time.monotonic() + READ_DEADLINE_SECONDS
+        status = self._status()
+        require(
+            status.get("object") == "hermes.run" and status.get("run_id") == self.run_id,
+            "witness_run_binding",
+        )
+        require(status.get("session_id") == self.run_id, "witness_session_binding")
+        value = status.get("status")
+        require(type(value) is str and value in KNOWN_RUN_STATUSES, "witness_status_unknown")
+        return str(value)
 
     def read(self) -> dict:
         self._deadline = time.monotonic() + READ_DEADLINE_SECONDS

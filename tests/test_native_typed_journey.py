@@ -4492,3 +4492,849 @@ def test_a_second_cancel_final_during_witness_collection_fails_the_step(tmp_path
     journey = task_journey(tmp_path, monkeypatch, post=post)
     receipt = task_refused(journey, "journey_task_cancel_finals")
     assert receipt["cancelFinalsCount"] == 2 and receipt["cancelTranscriptMatches"] is True
+
+
+# Confirmed natural spoken cancel with two tasks `speak_confirm_cancel` step (#237, #581):
+# controlled synthetic path only; it bypasses the physical microphone and AEC.
+
+CONFIRM_STEP = {"label": "confirm", "kind": "speak_confirm_cancel"}
+C_A, C_B, C_OTHER = "task_alpha", "task_bravo", "task_other"
+RUN_A, RUN_B, RUN_X = "run_" + "a" * 32, "run_" + "b" * 32, "run_" + "c" * 32
+REQ_B_SPOKEN = "Please stop the ocean temperature research task."
+REQ_A_SPOKEN = "Please stop the rail ticket prices task."
+P_B, P_NO, P_A, P_YES = ({"turnId": "confirm_" + name, "turnGeneration": 1}
+                         for name in ("b", "no", "a", "yes"))
+
+
+def confirm_objectives():
+    import scripts.native_typed_journey as client
+
+    return client._CONFIRM_OBJECTIVE_A, client._CONFIRM_OBJECTIVE_B
+
+
+def readback_of(objective):
+    from hermes_realtime.conversation.task_proposals import cancel_readback
+
+    return cancel_readback(objective)
+
+
+def assistant_final(text, pair):
+    return ("transcript_final", {"role": "assistant", "text": text, **pair})
+
+
+def confirm_reply(spoken, pair, *, said=None, complete=True, interrupted=False, extra=()):
+    """One spoken clip's phase: voice start, its final, a reply turn, and that turn's end."""
+    reply = [("first_foreground_token", pair)]
+    if said is not None:
+        reply.append(assistant_final(said, pair))
+    end = []
+    if interrupted:
+        end = [("assistant_turn_interrupted", pair)]
+    elif complete:
+        end = [("assistant_turn_completed", pair)]
+    return [[("voice_activity_started", {})],
+            [("voice_activity_ended", {}), user_final(spoken)],
+            [*reply, *extra], end]
+
+
+def confirm_yes(*, cancel=None, before_final=(), extra=()):
+    if cancel is None:
+        cancel = (task_state_row(C_A, "cancelling"),)
+    return [[("voice_activity_started", {})],
+            [*before_final, ("voice_activity_ended", {}), user_final("Yes.")],
+            [*cancel, *extra],
+            [task_state_row(C_A, "interrupted"), task_result_row(C_A, "interrupted")]]
+
+
+def confirm_phases(**overrides):
+    obj_a, obj_b = confirm_objectives()
+    phases = {
+        "b": confirm_reply(REQ_B_SPOKEN, P_B, said=readback_of(obj_b)),
+        "no": confirm_reply("No.", P_NO, said="Okay."),
+        "a": confirm_reply(REQ_A_SPOKEN, P_A, said=readback_of(obj_a)),
+        "yes": confirm_yes(),
+    }
+    phases.update(overrides)
+    return [phases["b"], phases["no"], phases["a"], phases["yes"]]
+
+
+def confirm_dispatches(a=(), b=()):
+    obj_a, obj_b = confirm_objectives()
+    return {
+        "task: " + obj_a: [task_state_row(C_A, "active"), admit(RUN_A), *a],
+        "task: " + obj_b: [task_state_row(C_B, "active"), admit(RUN_B), *b],
+    }
+
+
+def confirm_journey(tmp_path, monkeypatch, *, phases=None, pre=(), dispatches=None,
+                    witness=None, live=None, before=(), journal=()):
+    """A Journey with a fake mic transport and a state-driven fake host.
+
+    Typed inputs answer with their dispatch (or a cleanup cancellation) at the next poll.
+    Otherwise each poll returns one batch of the current clip phase (the number of clips
+    whose first speech frame has been sent), or of ``pre`` before any clip.
+    """
+    import scripts.native_typed_journey as client
+
+    for name, value in {
+        "_SPEAK_FRAME_SECONDS": 0.0, "_SPEAK_DRAIN_SECONDS": 0.0, "_SPEAK_TURN_TIMEOUT": 1.0,
+        "_SPEAK_SETTLE_TIMEOUT": 0.5, "_SPEAK_READY_TIMEOUT": 1.0,
+        "_SPEAK_SETTLE_SECONDS": 0.0, "_TASK_DISPATCH_TIMEOUT": 0.6,
+        "_TASK_QUIET_TIMEOUT": 0.6, "_TASK_CANCEL_TIMEOUT": 0.6,
+        "_CONFIRM_REPLY_TIMEOUT": 0.6, "_CONFIRM_NO_DRAIN_SECONDS": 0.3,
+    }.items():
+        monkeypatch.setattr(client, name, value)
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              api_origin="http://127.0.0.1:1")
+    journey = Journey(options, {"expiresInSeconds": 3600}, "secret")
+    run_journal = {"ids": set(journal), "pending": 0}
+    monkeypatch.setattr(client, "read_journal",
+                        lambda _: (set(run_journal["ids"]), run_journal["pending"]))
+    journey.witness_reads = []
+
+    def witness_factory(bearer, run, **kwargs):
+        def read():
+            journey.witness_reads.append(("read", run))
+            return {"terminal": (witness or {}).get(run, "cancelled"), "toolCalls": []}
+
+        def live_status():
+            journey.witness_reads.append(("live", run))
+            return (live or {}).get(run, "running")
+
+        return SimpleNamespace(read=read, live_status=live_status)
+
+    monkeypatch.setattr(client, "NativeRunWitness", witness_factory)
+    rtc, room = fake_rtc(), FakeRoom()
+    journey.voice = client.SyntheticVoice(rtc, room, SPEAK_WORKER)
+    meter = journey.voice.meter
+    now, cursor = [1000.0], [len(before) + 1]
+    if before:
+        journey.tracker.consume(numbered(list(before), 1))
+    meter._clock = lambda: now[0]
+    queues = {"pre": [[], [("voice_input_ready", READY)], *pre]}
+    for index, batches in enumerate(confirm_phases() if phases is None else phases):
+        queues[index] = list(batches)
+    answers = confirm_dispatches() if dispatches is None else dispatches
+    immediate, phase = [], ["pre"]
+    journey.inputs, journey.media, journey.rtc, journey.room = [], [], rtc, room
+    journey.journal, journey.queues = run_journal, queues
+
+    async def request(route, payload=None):
+        if route == "media":
+            journey.media.append(payload)
+            return {"mediaIncarnation": payload["mediaIncarnation"], "version": 1}
+        if route == "input":
+            text = payload["text"]
+            journey.inputs.append(text)
+            if text.startswith("cancel task: "):
+                task = text.removeprefix("cancel task: ")
+                immediate.append([task_state_row(task, "interrupted"),
+                                  task_result_row(task, "interrupted")])
+            elif text in answers:
+                immediate.append(list(answers[text]))
+            return {}
+        assert route == "events"
+        now[0] += TASK_CLOCK_STEP
+        trace = journey.tracker.speak
+        marks = getattr(trace, "marks", None)
+        if marks:
+            phase[0] = len(marks) - 1
+        if immediate:
+            batch = immediate.pop(0)
+        else:
+            batch = queues[phase[0]].pop(0) if queues.get(phase[0]) else []
+        rows = []
+        for kind, data in batch:
+            if kind == "__admit__":
+                run_journal["ids"].add(data["run"])
+            elif kind == "__pending__":
+                run_journal["pending"] = data["count"]
+            else:
+                rows.append((kind, data))
+        events = numbered(rows, cursor[0])
+        cursor[0] += len(events)
+        return {"version": 2, "events": events}
+
+    journey.request = request
+    return journey
+
+
+def run_confirm(journey, seconds=15):
+    asyncio.run(asyncio.wait_for(journey.step(CONFIRM_STEP), seconds))
+
+
+def confirm_refused(journey, category):
+    with pytest.raises(ValueError, match=category):
+        run_confirm(journey)
+    return journey.speak_receipt
+
+
+def sent_speech_frames(journey):
+    return sum(any(frame.data) for frame in journey.room.published[0][0].source.frames)
+
+
+def clip_speech_frames(*indexes):
+    import scripts.native_typed_journey as client
+
+    clips = client.load_confirm_fixtures()
+    return sum(sum(any(pcm) for pcm in clips[index][0]) for index in indexes)
+
+
+def test_speak_confirm_cancel_cancels_exactly_the_confirmed_task(tmp_path, monkeypatch):
+    journey = confirm_journey(tmp_path, monkeypatch)
+    run_confirm(journey)
+    receipt = journey.speak_receipt
+    obj_a, obj_b = confirm_objectives()
+    assert journey.inputs == ["task: " + obj_a, "task: " + obj_b, "cancel task: " + C_B]
+    assert journey.bindings == {"confirm.a": (C_A, RUN_A), "confirm.b": (C_B, RUN_B)}
+    assert receipt["dispatchTasks"] == 2 and receipt["dispatchAdmissions"] == 2
+    assert receipt["tasksBound"] and receipt["bothActiveBeforeRequest"]
+    for clip in ("requestB", "no", "requestA", "yes"):
+        assert receipt[clip + "Injected"] and receipt[clip + "VadObserved"]
+        assert receipt[clip + "FinalsCount"] == 1 and receipt[clip + "TranscriptMatches"]
+    assert receipt["readbackBOutcome"] == "target" and receipt["readbackAOutcome"] == "target"
+    assert receipt["bothActiveAfterNo"] is True
+    assert receipt["targetCancelObserved"] is True and receipt["bystanderCancelObserved"] is False
+    assert receipt["bystanderActiveAtWitness"] is True
+    assert receipt["nativeCancelledBeforeCleanup"] is True
+    assert receipt["nativeBystanderLiveBeforeCleanup"] is True
+    assert receipt["successPathCleanupCancels"] == 1  # B, after the witness: never acceptance
+    # A's witness, then B's live status, both before any cleanup; B's read is cleanup's.
+    assert journey.witness_reads == [("read", RUN_A), ("live", RUN_B), ("read", RUN_B)]
+    assert journey.results["confirm.a"]["terminal"] == "cancelled"
+    assert journey.tracker.speak is None and journey.tracker.turns == []
+    assert journey.media == [{"mediaIncarnation": 1}] and len(journey.room.published) == 1
+    assert sent_speech_frames(journey) == clip_speech_frames(0, 1, 2, 3)
+
+
+def test_speak_confirm_cancel_receipt_is_metadata_only(tmp_path, monkeypatch):
+    journey = confirm_journey(tmp_path, monkeypatch)
+    run_confirm(journey)
+    raw = json.dumps(journey.speak_receipt).lower()
+    for private in (C_A, C_B, RUN_A, RUN_B, "ocean", "rail", "ticket", "temperature",
+                    "background task", "okay"):
+        assert private not in raw
+    assert all(value is None or type(value) in {bool, int, str}
+               for value in journey.speak_receipt.values())
+
+
+def test_the_confirm_readbacks_are_the_hosts_exact_readbacks():
+    import scripts.native_typed_journey as client
+
+    obj_a, obj_b = confirm_objectives()
+    assert {"a": readback_of(obj_a), "b": readback_of(obj_b)} == client._CONFIRM_READBACKS
+    assert readback_of(obj_a) != readback_of(obj_b)
+
+
+def test_scenario_accepts_one_speak_confirm_cancel_step_and_no_second_microphone_step(tmp_path):
+    def scenario(*steps):
+        path = tmp_path / "confirm.json"
+        path.write_text(json.dumps({"version": 1, "steps": list(steps)}), encoding="utf-8")
+        return load_scenario(path)
+
+    assert scenario(CONFIRM_STEP)[0]["kind"] == "speak_confirm_cancel"
+    for bad in (
+        [{"label": "a", "kind": "speak_task"}, {"label": "b", "kind": "speak_confirm_cancel"}],
+        [{"label": "a", "kind": "speak_confirm_cancel"}, {"label": "b", "kind": "speak"}],
+        [{"label": "a", "kind": "speak_confirm_cancel", "text": "Stop"}],
+        [{"label": "a", "kind": "speak_confirm_cancel", "task": "x"}],
+    ):
+        with pytest.raises(ValueError, match="journey_(speak|step)"):
+            scenario(*bad)
+
+
+@pytest.mark.parametrize("name", ["_CONFIRM_REQUEST_B_SHA256", "_CONFIRM_NO_SHA256",
+                                  "_CONFIRM_REQUEST_A_SHA256", "_CONFIRM_YES_SHA256"])
+def test_the_confirm_fixtures_are_pinned_by_sha256(monkeypatch, name):
+    import scripts.native_typed_journey as client
+
+    clips = client.load_confirm_fixtures()
+    assert [words for _, words in clips] == [
+        ("please", "stop", "the", "ocean", "temperature", "research", "task"),
+        ("no",), ("please", "stop", "the", "rail", "ticket", "prices", "task"), ("yes",),
+    ]
+    monkeypatch.setattr(client, name, "0" * 64)
+    with pytest.raises(ValueError, match="journey_speak_fixture"):
+        client.load_confirm_fixtures()
+
+
+# Inconclusive: the precondition did not hold, so nothing is claimed either way.
+
+def test_a_task_that_ends_with_its_dispatch_is_inconclusive(tmp_path, monkeypatch):
+    dispatches = confirm_dispatches(b=[task_result_row(C_B, "completed")])
+    journey = confirm_journey(tmp_path, monkeypatch, dispatches=dispatches)
+    receipt = confirm_refused(journey, "journey_confirm_target_terminal")
+    assert receipt["requestBInjected"] is False and receipt["bothActiveBeforeRequest"] is False
+    assert journey.bindings == {"confirm.a": (C_A, RUN_A), "confirm.b": (C_B, RUN_B)}
+
+
+@pytest.mark.parametrize("task", [C_A, C_B])
+def test_a_task_that_ends_during_the_request_lead_in_is_inconclusive_and_nothing_is_sent(
+    tmp_path, monkeypatch, task
+):
+    journey = confirm_journey(tmp_path, monkeypatch, pre=[[task_result_row(task, "failed")]])
+    receipt = confirm_refused(journey, "journey_confirm_target_terminal")
+    assert receipt["bothActiveBeforeRequest"] is True and receipt["requestBInjected"] is False
+    assert sent_speech_frames(journey) == 0
+
+
+def test_a_task_that_ends_before_the_yes_is_inconclusive_and_no_yes_is_sent(
+    tmp_path, monkeypatch
+):
+    phases = confirm_phases(a=[*confirm_reply(REQ_A_SPOKEN, P_A,
+                                              said=readback_of(confirm_objectives()[0])),
+                               [task_result_row(C_A, "completed")]])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_target_terminal")
+    assert receipt["requestAInjected"] is True and receipt["yesInjected"] is False
+    assert sent_speech_frames(journey) == clip_speech_frames(0, 1, 2)
+
+
+def test_a_task_that_ends_during_the_no_drain_is_inconclusive(tmp_path, monkeypatch):
+    phases = confirm_phases(no=[*confirm_reply("No.", P_NO, said="Okay."),
+                                [task_result_row(C_B, "completed")]])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_target_terminal")
+    assert receipt["noInjected"] is True and receipt["requestAInjected"] is False
+
+
+@pytest.mark.parametrize("phase", ["b", "a"])
+def test_a_readback_naming_the_other_task_is_inconclusive_and_no_answer_is_sent(
+    tmp_path, monkeypatch, phase
+):
+    obj_a, obj_b = confirm_objectives()
+    spoken, pair, other = ((REQ_B_SPOKEN, P_B, obj_a) if phase == "b"
+                           else (REQ_A_SPOKEN, P_A, obj_b))
+    phases = confirm_phases(**{phase: confirm_reply(spoken, pair, said=readback_of(other))})
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_nomination_mismatch")
+    key = "readbackBOutcome" if phase == "b" else "readbackAOutcome"
+    assert receipt[key] == "other"
+    assert receipt["yesInjected"] is False
+    sent = clip_speech_frames(0) if phase == "b" else clip_speech_frames(0, 1, 2)
+    assert sent_speech_frames(journey) == sent
+
+
+@pytest.mark.parametrize("phase", ["b", "a"])
+def test_a_reply_without_a_readback_is_clarified_and_inconclusive(tmp_path, monkeypatch, phase):
+    spoken, pair = (REQ_B_SPOKEN, P_B) if phase == "b" else (REQ_A_SPOKEN, P_A)
+    phases = confirm_phases(**{phase: confirm_reply(spoken, pair, said="Which task?")})
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_clarified")
+    assert receipt["readbackBOutcome" if phase == "b" else "readbackAOutcome"] == "clarified"
+    assert receipt["yesInjected"] is False
+
+
+def test_a_readback_with_extra_words_is_not_the_readback(tmp_path, monkeypatch):
+    said = readback_of(confirm_objectives()[1]) + " Really?"
+    phases = confirm_phases(b=confirm_reply(REQ_B_SPOKEN, P_B, said=said))
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                    "journey_confirm_clarified")
+
+
+# Failures.
+
+def test_an_interrupted_readback_turn_fails(tmp_path, monkeypatch):
+    phases = confirm_phases(b=confirm_reply(REQ_B_SPOKEN, P_B, interrupted=True,
+                                            said=readback_of(confirm_objectives()[1])))
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                              "journey_confirm_readback_incomplete")
+    assert receipt["readbackBOutcome"] == "interrupted"
+
+
+def test_a_readback_turn_that_never_ends_fails(tmp_path, monkeypatch):
+    phases = confirm_phases(b=confirm_reply(REQ_B_SPOKEN, P_B, complete=False,
+                                            said=readback_of(confirm_objectives()[1])))
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                    "journey_confirm_readback_incomplete")
+
+
+@pytest.mark.parametrize("task", [C_A, C_B])
+@pytest.mark.parametrize("status", ["cancelling", "interrupted"])
+def test_a_cancel_after_the_request_and_before_any_answer_is_premature(
+    tmp_path, monkeypatch, task, status
+):
+    phases = confirm_phases(b=confirm_reply(REQ_B_SPOKEN, P_B, extra=[task_state_row(task, status)],
+                                            said=readback_of(confirm_objectives()[1])))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_premature_cancel")
+    assert receipt["noInjected"] is False and journey.witness_reads == []
+
+
+def test_a_cancel_of_a_after_its_readback_and_before_the_yes_is_a_no_side_effect(
+    tmp_path, monkeypatch
+):
+    phases = confirm_phases(a=confirm_reply(REQ_A_SPOKEN, P_A,
+                                            extra=[task_state_row(C_A, "cancelling")],
+                                            said=readback_of(confirm_objectives()[0])))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_no_cancelled")
+    assert receipt["yesInjected"] is False
+
+
+# Precedence: a failure is never masked by a later or simultaneous inconclusive outcome.
+
+def test_a_mismatched_readback_with_a_premature_cancel_fails_premature(tmp_path, monkeypatch):
+    obj_a, _ = confirm_objectives()
+    phases = confirm_phases(b=confirm_reply(REQ_B_SPOKEN, P_B, said=readback_of(obj_a),
+                                            extra=[task_state_row(C_A, "cancelling")]))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_premature_cancel")
+    assert receipt["readbackBOutcome"] is None  # never classified past the side effect
+
+
+def test_a_clarification_with_a_cancel_after_no_fails_no_cancelled(tmp_path, monkeypatch):
+    phases = confirm_phases(a=confirm_reply(REQ_A_SPOKEN, P_A, said="Which task?",
+                                            extra=[task_state_row(C_B, "cancelling")]))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_no_cancelled")
+    assert receipt["readbackAOutcome"] is None
+
+
+@pytest.mark.parametrize("phase", ["b", "a"])
+def test_an_early_end_beside_a_cancel_fails_and_is_not_inconclusive(tmp_path, monkeypatch, phase):
+    obj_a, obj_b = confirm_objectives()
+    spoken, pair, said = ((REQ_B_SPOKEN, P_B, readback_of(obj_b)) if phase == "b"
+                          else (REQ_A_SPOKEN, P_A, readback_of(obj_a)))
+    extra = [task_result_row(C_A, "completed"), task_state_row(C_B, "cancelling")]
+    phases = confirm_phases(**{phase: confirm_reply(spoken, pair, said=said, extra=extra)})
+    category = ("journey_confirm_premature_cancel" if phase == "b"
+                else "journey_confirm_no_cancelled")
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases), category)
+
+
+@pytest.mark.parametrize("phase", ["b", "a"])
+@pytest.mark.parametrize("other", ["active", "cancelling"])
+def test_competing_work_beside_an_early_end_fails_and_is_not_inconclusive(
+    tmp_path, monkeypatch, phase, other,
+):
+    """Astra 9263: a third task or admission next to an early end is competing work, a failure;
+    the early end must never be what is reported."""
+    obj_a, obj_b = confirm_objectives()
+    spoken, pair, said = ((REQ_B_SPOKEN, P_B, readback_of(obj_b)) if phase == "b"
+                          else (REQ_A_SPOKEN, P_A, readback_of(obj_a)))
+    extra = [task_result_row(C_A, "completed"), task_state_row(C_OTHER, other), admit(RUN_X)]
+    phases = confirm_phases(**{phase: confirm_reply(spoken, pair, said=said, extra=extra)})
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                    "journey_confirm_competing")
+
+
+def _reply_with_finals(spoken, pair, finals):
+    """A request phase whose reply turn publishes these assistant finals, in order."""
+    phase = confirm_reply(spoken, pair)
+    phase[2] = [("first_foreground_token", pair), *(assistant_final(t, pair) for t in finals)]
+    return phase
+
+
+@pytest.mark.parametrize("phase", ["b", "a"])
+@pytest.mark.parametrize("shape", ["readback_then_text", "readback_twice", "both_readbacks"])
+def test_a_reply_that_is_not_exactly_one_final_readback_is_ambiguous(
+    tmp_path, monkeypatch, phase, shape,
+):
+    """PR #583 review 4609479174: the readback must be the reply's last assistant final and
+    appear exactly once; extra or duplicate publications around it are refused."""
+    obj_a, obj_b = confirm_objectives()
+    want, other = ((readback_of(obj_b), readback_of(obj_a)) if phase == "b"
+                   else (readback_of(obj_a), readback_of(obj_b)))
+    finals = {"readback_then_text": [want, "Which one did you mean?"],
+              "readback_twice": [want, want],
+              "both_readbacks": [other, want]}[shape]
+    spoken, pair = (REQ_B_SPOKEN, P_B) if phase == "b" else (REQ_A_SPOKEN, P_A)
+    phases = confirm_phases(**{phase: _reply_with_finals(spoken, pair, finals)})
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                              "journey_confirm_ambiguous")
+    assert receipt["readback" + phase.upper() + "Outcome"] == "ambiguous"
+
+
+def test_prose_before_the_readback_still_reaches_the_target(tmp_path, monkeypatch):
+    """Model prose spoken before the nomination is allowed: the host's readback is last."""
+    obj_b = confirm_objectives()[1]
+    b = _reply_with_finals(REQ_B_SPOKEN, P_B, ["Sure.", readback_of(obj_b)])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(b=b))
+    run_confirm(journey)
+    assert journey.speak_receipt["readbackBOutcome"] == "target"
+
+
+def _early_end_with_competing_work():
+    return [task_result_row(C_A, "completed"), task_state_row(C_OTHER, "active"), admit(RUN_X)]
+
+
+def test_competing_work_first_seen_at_the_quiet_gate_fails(tmp_path, monkeypatch):
+    """Site-specific (Astra 9272): the quiet gate before request B sees the early end first.
+    B's dispatch leaves an admission pending, so the gate polls; its next batch clears the
+    pending admission together with the early end and the competing work."""
+    journey = confirm_journey(
+        tmp_path, monkeypatch,
+        dispatches=confirm_dispatches(b=[("__pending__", {"count": 1})]),
+        pre=[[("__pending__", {"count": 0}), *_early_end_with_competing_work()]],
+    )
+    receipt = confirm_refused(journey, "journey_confirm_competing")
+    assert receipt["requestBInjected"] is False
+
+
+def test_competing_work_first_seen_at_a_clip_lead_in_fails(tmp_path, monkeypatch):
+    """Site-specific: request B's reply settles cleanly; the No clip's first-frame check is the
+    first to see the early end and the competing work."""
+    obj_b = confirm_objectives()[1]
+    b = [*confirm_reply(REQ_B_SPOKEN, P_B, said=readback_of(obj_b)), [],
+         _early_end_with_competing_work()]
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(b=b))
+    receipt = confirm_refused(journey, "journey_confirm_competing")
+    assert receipt["readbackBOutcome"] == "target" and receipt["noInjected"] is False
+
+
+def test_competing_work_first_seen_after_no_fails(tmp_path, monkeypatch):
+    """Site-specific: the post-No check is the first to see the early end."""
+    no = confirm_reply("No.", P_NO, said="Okay.", extra=_early_end_with_competing_work())
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(no=no))
+    receipt = confirm_refused(journey, "journey_confirm_competing")
+    assert receipt["noInjected"] is True and receipt["requestAInjected"] is False
+
+
+@pytest.mark.parametrize("other", ["active", "cancelling"])
+def test_competing_work_beside_an_ended_bystander_after_yes_fails(tmp_path, monkeypatch, other):
+    yes = confirm_yes(extra=[task_result_row(C_B, "completed"), task_state_row(C_OTHER, other),
+                             admit(RUN_X)])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(yes=yes))
+    confirm_refused(journey, "journey_confirm_competing")
+
+
+def test_a_premature_a_cancel_beside_an_ended_bystander_fails_premature(tmp_path, monkeypatch):
+    yes = confirm_yes(before_final=[task_state_row(C_A, "cancelling")],
+                      cancel=[task_result_row(C_B, "completed")])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(yes=yes))
+    confirm_refused(journey, "journey_confirm_premature_cancel")
+
+
+def test_a_ends_early_and_b_cancelled_after_yes_is_the_wrong_target(tmp_path, monkeypatch):
+    yes = confirm_yes(cancel=[task_result_row(C_A, "completed"),
+                              task_state_row(C_B, "cancelling")])
+    yes[3] = []
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(yes=yes))
+    receipt = confirm_refused(journey, "journey_confirm_wrong_target")
+    assert receipt["bystanderCancelObserved"] is True and journey.witness_reads == []
+
+
+def test_a_b_cancel_during_the_yes_lead_in_is_a_no_side_effect(tmp_path, monkeypatch):
+    obj_a, _ = confirm_objectives()
+    phases = confirm_phases(a=[*confirm_reply(REQ_A_SPOKEN, P_A, said=readback_of(obj_a)),
+                               [], [task_state_row(C_B, "cancelling")]])
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                              "journey_confirm_no_cancelled")
+    assert receipt["yesInjected"] is False
+
+
+def test_a_cancel_of_a_before_the_yes_final_is_premature(tmp_path, monkeypatch):
+    phases = confirm_phases(yes=confirm_yes(cancel=(),
+                                            before_final=[task_state_row(C_A, "cancelling")]))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_premature_cancel")
+    assert receipt["targetCancelObserved"] is False and journey.witness_reads == []
+
+
+@pytest.mark.parametrize("task", [C_A, C_B])
+def test_a_cancel_after_no_fails(tmp_path, monkeypatch, task):
+    phases = confirm_phases(no=confirm_reply("No.", P_NO, said="Okay.",
+                                             extra=[task_state_row(task, "cancelling")]))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_no_cancelled")
+    assert receipt["bothActiveAfterNo"] is False and receipt["requestAInjected"] is False
+
+
+def test_a_cancel_late_in_the_no_drain_still_fails(tmp_path, monkeypatch):
+    phases = confirm_phases(no=[*confirm_reply("No.", P_NO, said="Okay."),
+                                [task_state_row(C_B, "cancelling")]])  # after its reply ended
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                              "journey_confirm_no_cancelled")
+    assert receipt["bothActiveAfterNo"] is False  # caught inside the drain window itself
+
+
+def test_a_dispatch_whose_active_state_precedes_its_send_is_unbound(tmp_path, monkeypatch):
+    obj_a, _ = confirm_objectives()
+    dispatches = confirm_dispatches()
+    dispatches["task: " + obj_a] = [admit(RUN_A)]
+    journey = confirm_journey(tmp_path, monkeypatch, dispatches=dispatches)
+    journey.queues["pre"][1].append(task_state_row(C_A, "active"))  # before the typed send
+    receipt = confirm_refused(journey, "journey_confirm_dispatch_unbound")
+    assert receipt["tasksBound"] is False
+
+
+def test_a_pending_admission_at_the_first_request_frame_aborts(tmp_path, monkeypatch):
+    journey = confirm_journey(tmp_path, monkeypatch, pre=[[("__pending__", {"count": 1})]])
+    receipt = confirm_refused(journey, "journey_confirm_competing")
+    assert receipt["requestBInjected"] is False and sent_speech_frames(journey) == 0
+
+
+def test_a_target_that_completes_after_cancelling_is_not_a_proven_cancel(tmp_path, monkeypatch):
+    yes = confirm_yes()
+    yes[3] = [task_result_row(C_A, "completed")]  # cancelling, then a natural completion
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(yes=yes),
+                              witness={RUN_A: "completed"})
+    receipt = confirm_refused(journey, "journey_cancel_unproven")
+    assert receipt["nativeCancelledBeforeCleanup"] is False
+    assert ("live", RUN_B) not in journey.witness_reads
+
+
+def test_cleanup_cancellation_is_never_recorded_as_trace_evidence(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    traces = []
+
+    class Recording(client.ConfirmCancelTrace):
+        def __init__(self, *args):
+            super().__init__(*args)
+            traces.append(self)
+
+    monkeypatch.setattr(client, "ConfirmCancelTrace", Recording)
+    journey = confirm_journey(tmp_path, monkeypatch)
+    run_confirm(journey)
+    assert journey.speak_receipt["successPathCleanupCancels"] == 1
+    assert journey.tracker.tasks[C_B] == "interrupted"  # cleanup did cancel B
+    (trace,) = traces
+    assert trace.cancels(C_B) == []  # but its events never reached the step's trace
+
+
+def test_cancelling_the_other_task_after_yes_is_the_wrong_target(tmp_path, monkeypatch):
+    phases = confirm_phases(yes=confirm_yes(extra=[task_state_row(C_B, "cancelling")]))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_wrong_target")
+    assert receipt["bystanderCancelObserved"] is True
+    assert receipt["nativeCancelledBeforeCleanup"] is False and journey.witness_reads == []
+
+
+def test_cancelling_only_the_other_task_after_yes_is_the_wrong_target(tmp_path, monkeypatch):
+    phases = confirm_phases(yes=confirm_yes(cancel=[task_state_row(C_B, "cancelling")]))
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                    "journey_confirm_wrong_target")
+
+
+def test_a_cancel_of_the_other_task_during_witness_collection_is_the_wrong_target(
+    tmp_path, monkeypatch
+):
+    yes = confirm_yes()
+    yes[3] = []  # A settles only after B is cancelled, while collect() polls
+    yes += [[task_state_row(C_B, "cancelling")],
+            [task_state_row(C_A, "interrupted"), task_result_row(C_A, "interrupted")]]
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(yes=yes))
+    receipt = confirm_refused(journey, "journey_confirm_wrong_target")
+    assert receipt["bystanderActiveAtWitness"] is False
+    assert ("live", RUN_B) not in journey.witness_reads
+
+
+def test_a_bystander_that_ends_before_the_witness_is_inconclusive(tmp_path, monkeypatch):
+    phases = confirm_phases(yes=confirm_yes(extra=[task_result_row(C_B, "completed")]))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_bystander_ended")
+    assert receipt["bystanderActiveAtWitness"] is False
+    assert ("live", RUN_B) not in journey.witness_reads
+
+
+def test_a_yes_that_cancels_nothing_is_not_accepted(tmp_path, monkeypatch):
+    phases = confirm_phases(yes=confirm_yes(cancel=())[:2])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    receipt = confirm_refused(journey, "journey_confirm_not_cancelled")
+    assert receipt["targetCancelObserved"] is False
+    assert journey.witness_reads == [] and journey.results == {}
+
+
+def test_a_cancel_visible_only_as_a_terminal_result_is_not_arming(tmp_path, monkeypatch):
+    yes = confirm_yes(cancel=())
+    yes[3] = [task_result_row(C_A, "interrupted")]
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(yes=yes))
+    confirm_refused(journey, "journey_confirm_not_cancelled")
+    assert journey.witness_reads == []
+
+
+def test_a_target_cancelled_only_by_cleanup_is_never_accepted(tmp_path, monkeypatch):
+    phases = confirm_phases(yes=confirm_yes(cancel=())[:2])
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+
+    async def run():
+        with pytest.raises(ValueError, match="journey_confirm_not_cancelled"):
+            await asyncio.wait_for(journey.step(CONFIRM_STEP), 15)
+        return await journey.settle_owned()
+
+    asyncio.run(run())
+    receipt = journey.speak_receipt
+    # Cleanup cancelled both tasks by exact id; the refused verdict and its evidence stand.
+    assert journey.inputs[-2:] == ["cancel task: " + C_A, "cancel task: " + C_B]
+    assert receipt["targetCancelObserved"] is False
+    assert receipt["nativeCancelledBeforeCleanup"] is False
+    assert receipt["successPathCleanupCancels"] == 0
+
+
+def test_the_native_witness_must_say_the_target_was_cancelled(tmp_path, monkeypatch):
+    journey = confirm_journey(tmp_path, monkeypatch, witness={RUN_A: "completed"})
+    receipt = confirm_refused(journey, "journey_terminal_binding")
+    assert receipt["nativeCancelledBeforeCleanup"] is False
+    assert journey.witness_reads == [("read", RUN_A)]
+
+
+@pytest.mark.parametrize("status,category", [
+    ("cancelled", "journey_confirm_wrong_target"),
+    ("interrupted", "journey_confirm_wrong_target"),
+    ("stopping", "journey_confirm_wrong_target"),
+    ("completed", "journey_confirm_bystander_ended"),
+    ("failed", "journey_confirm_bystander_ended"),
+])
+def test_the_native_witness_must_say_the_bystander_is_still_live(
+    tmp_path, monkeypatch, status, category
+):
+    journey = confirm_journey(tmp_path, monkeypatch, live={RUN_B: status})
+    receipt = confirm_refused(journey, category)
+    assert receipt["nativeCancelledBeforeCleanup"] is True
+    assert receipt["nativeBystanderLiveBeforeCleanup"] is False
+    assert receipt["successPathCleanupCancels"] == 0
+
+
+def test_a_bystander_cancelled_after_its_live_witness_read_still_fails(tmp_path, monkeypatch):
+    journey = confirm_journey(tmp_path, monkeypatch)
+    real = journey.poll
+    polls_after_live = []
+
+    async def poll():
+        if ("live", RUN_B) in journey.witness_reads and not polls_after_live:
+            polls_after_live.append(1)
+            # Delivered at the first poll after the live read, before any cleanup.
+            journey.queues[3].insert(0, [task_state_row(C_B, "cancelling")])
+        await real()
+
+    journey.poll = poll
+    receipt = confirm_refused(journey, "journey_confirm_wrong_target")
+    assert polls_after_live and receipt["successPathCleanupCancels"] == 0
+
+
+# Input and attribution.
+
+def test_a_typed_dispatch_that_starts_nothing_fails(tmp_path, monkeypatch):
+    obj_a, _ = confirm_objectives()
+    dispatches = confirm_dispatches()
+    dispatches["task: " + obj_a] = []
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, dispatches=dispatches),
+                              "journey_confirm_not_dispatched")
+    assert receipt["tasksBound"] is False
+
+
+def test_a_competing_task_during_a_typed_dispatch_fails(tmp_path, monkeypatch):
+    dispatches = confirm_dispatches(a=[task_state_row(C_OTHER, "active"), admit(RUN_X)])
+    journey = confirm_journey(tmp_path, monkeypatch, dispatches=dispatches)
+    confirm_refused(journey, "journey_confirm_competing")
+    assert journey.bindings == {}  # never guessed into ownership
+
+
+def test_a_dispatch_whose_first_state_is_not_active_is_unbound(tmp_path, monkeypatch):
+    obj_a, _ = confirm_objectives()
+    dispatches = confirm_dispatches()
+    dispatches["task: " + obj_a] = [task_result_row(C_A, "completed"),
+                                    task_state_row(C_A, "active"), admit(RUN_A)]
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, dispatches=dispatches),
+                    "journey_confirm_dispatch_unbound")
+
+
+def test_a_replayed_prior_task_during_dispatch_fails(tmp_path, monkeypatch):
+    dispatches = confirm_dispatches(a=[task_state_row(T_OLD, "active")])
+    journey = confirm_journey(tmp_path, monkeypatch, dispatches=dispatches,
+                              before=[task_state_row(T_OLD, "completed")], journal=[RUN_OLD])
+    confirm_refused(journey, "journey_confirm_competing")
+
+
+@pytest.mark.parametrize("rows", [
+    [("voice_activity_started", {})],
+    [user_final("unexpected extra input")],
+    [("assistant_turn_completed", {})],
+], ids=["voice-start", "user-final", "unbound-foreground"])
+def test_unexpected_input_before_the_first_request_fails(tmp_path, monkeypatch, rows):
+    journey = confirm_journey(tmp_path, monkeypatch, pre=[rows])
+    receipt = confirm_refused(journey, "journey_confirm_unexpected_input")
+    assert receipt["unexpectedInputCount"] == 1 and receipt["requestBInjected"] is False
+
+
+def test_a_competing_task_at_the_first_request_frame_aborts(tmp_path, monkeypatch):
+    journey = confirm_journey(tmp_path, monkeypatch,
+                              pre=[[task_state_row(C_OTHER, "active"), admit(RUN_X)]])
+    receipt = confirm_refused(journey, "journey_confirm_competing")
+    assert receipt["requestBInjected"] is False and sent_speech_frames(journey) == 0
+
+
+def test_a_competing_task_at_the_yes_frame_aborts_before_the_yes(tmp_path, monkeypatch):
+    phases = confirm_phases(a=[*confirm_reply(REQ_A_SPOKEN, P_A,
+                                              said=readback_of(confirm_objectives()[0])),
+                               [admit(RUN_X)]])
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                              "journey_confirm_competing")
+    assert receipt["yesInjected"] is False
+
+
+@pytest.mark.parametrize("phase,spoken,key", [
+    ("b", "Please stop the task.", "requestB"),
+    ("no", "Know.", "no"),
+    ("a", "Please stop the rail task.", "requestA"),
+])
+def test_wrong_words_for_a_clip_fail(tmp_path, monkeypatch, phase, spoken, key):
+    obj_a, obj_b = confirm_objectives()
+    pair = {"b": P_B, "no": P_NO, "a": P_A}[phase]
+    said = {"b": readback_of(obj_b), "no": "Okay.", "a": readback_of(obj_a)}[phase]
+    phases = confirm_phases(**{phase: confirm_reply(spoken, pair, said=said)})
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                              "journey_confirm_transcript")
+    assert receipt[key + "TranscriptMatches"] is False and receipt["yesInjected"] is False
+
+
+def test_a_yes_with_wrong_words_cancels_nothing_it_can_claim(tmp_path, monkeypatch):
+    yes = confirm_yes()
+    yes[1] = [("voice_activity_ended", {}), user_final("Yes, please.")]
+    receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch,
+                                              phases=confirm_phases(yes=yes)),
+                              "journey_confirm_transcript")
+    assert receipt["yesTranscriptMatches"] is False
+    assert receipt["nativeCancelledBeforeCleanup"] is False
+
+
+@pytest.mark.parametrize("phase", ["b", "no", "a"])
+def test_two_finals_for_a_clip_fail(tmp_path, monkeypatch, phase):
+    obj_a, obj_b = confirm_objectives()
+    spoken = {"b": REQ_B_SPOKEN, "no": "No.", "a": REQ_A_SPOKEN}[phase]
+    pair = {"b": P_B, "no": P_NO, "a": P_A}[phase]
+    said = {"b": readback_of(obj_b), "no": "Okay.", "a": readback_of(obj_a)}[phase]
+    batches = confirm_reply(spoken, pair, said=said)
+    batches[1].append(user_final(spoken))
+    confirm_refused(confirm_journey(tmp_path, monkeypatch,
+                                    phases=confirm_phases(**{phase: batches})),
+                    "journey_confirm_finals")
+
+
+def test_a_clip_with_no_voice_start_fails(tmp_path, monkeypatch):
+    batches = confirm_reply(REQ_B_SPOKEN, P_B, said=readback_of(confirm_objectives()[1]))
+    batches[0] = []
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(b=batches)),
+                    "journey_confirm_vad")
+
+
+def test_a_second_reply_turn_for_a_request_is_ambiguous(tmp_path, monkeypatch):
+    other = {"turnId": "confirm_other", "turnGeneration": 1}
+    batches = confirm_reply(REQ_B_SPOKEN, P_B, said=readback_of(confirm_objectives()[1]))
+    batches[3] += [("first_foreground_token", other), ("assistant_turn_completed", other)]
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(b=batches)),
+                    "journey_confirm_ambiguous")
+
+
+def test_a_readback_from_a_reply_that_starts_before_the_final_is_not_bound(tmp_path, monkeypatch):
+    batches = confirm_reply(REQ_B_SPOKEN, P_B, said=readback_of(confirm_objectives()[1]))
+    batches[0] = [("voice_activity_started", {}), ("first_foreground_token", P_B)]
+    batches[2] = batches[2][1:]
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(b=batches)),
+                    "journey_confirm_ambiguous")
+
+
+def test_a_task_dispatched_after_the_yes_fails(tmp_path, monkeypatch):
+    phases = confirm_phases(yes=confirm_yes(extra=[task_state_row(C_OTHER, "active")]))
+    confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
+                    "journey_confirm_competing")
+
+
+def test_both_tasks_are_owned_for_cleanup_even_when_the_step_fails(tmp_path, monkeypatch):
+    phases = confirm_phases(b=confirm_reply(REQ_B_SPOKEN, P_B, said="Which task?"))
+    journey = confirm_journey(tmp_path, monkeypatch, phases=phases)
+    confirm_refused(journey, "journey_confirm_clarified")
+    assert journey.bindings == {"confirm.a": (C_A, RUN_A), "confirm.b": (C_B, RUN_B)}
+    assert journey.tracker.speak is None and journey.voice.meter.window == "closed"

@@ -84,3 +84,18 @@ Synthetic phrases for the native journey `speak_task` step (spoken delegation, t
 Expected words after lowercasing and replacing punctuation with spaces: `research european public transit funding and compare the major cities` and `actually stop that research i don t need it anymore`.
 
 Generation command: the same PowerShell recipe as `sapi_hello_can_you_hear_me.wav` (set `[Environment]::CurrentDirectory` first), once per file, with output file names `sapi_task_dispatch.wav` / `sapi_task_cancel.wav` and `$synth.Speak(...)` given the phrase from the table.
+
+## `sapi_confirm_*.wav`
+
+Synthetic phrases for the native journey `speak_confirm_cancel` step (a confirmed natural spoken cancel with two running tasks), injected in this order. None contains a human recording or user speech. All use the `Microsoft David Desktop` SAPI voice (CPU, selected explicitly with `$synth.SelectVoice('Microsoft David Desktop')`), mono signed 16-bit little-endian PCM at 22,050 Hz, and are at most 5 seconds.
+
+| File | Phrase | SHA-256 | Frames |
+| --- | --- | --- | --- |
+| `sapi_confirm_request_b.wav` | `Please stop the ocean temperature research task.` | `1a62a02660dffe23d3d86986dafa4dcde14edee619a49d5d6f56192067867965` | `78,143` (about `3.544` s) |
+| `sapi_confirm_no.wav` | `No.` | `88adf9fdaf8aa9cff0cb792fc965cedfb576c29caa68580709b68dc48d2ee31a` | `24,904` (about `1.129` s) |
+| `sapi_confirm_request_a.wav` | `Please stop the rail ticket prices task.` | `18ef57088232b525b75a22ecc8a792f195378e71db4404c17734791c61e693e8` | `72,965` (about `3.309` s) |
+| `sapi_confirm_yes.wav` | `Yes.` | `0477f0f8418f933a01340b5156753b44d57583bd04a0d43ad5868a3129b85dae` | `28,100` (about `1.274` s) |
+
+Expected words after lowercasing and replacing punctuation with spaces: `please stop the ocean temperature research task`, `no`, `please stop the rail ticket prices task` and `yes`.
+
+Generation command: the same PowerShell recipe as `sapi_hello_can_you_hear_me.wav` (set `[Environment]::CurrentDirectory` first), once per file, adding `$synth.SelectVoice('Microsoft David Desktop')` before `SetOutputToWaveFile`, with the output file name and `$synth.Speak(...)` phrase from the table.
