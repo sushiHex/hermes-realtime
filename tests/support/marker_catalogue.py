@@ -10,6 +10,9 @@ measured. The last four tables record debts and are meant to shrink (ADR 0007).
 # of the prefix as text to write: a helper called from ten places counts once, where it prints.
 # Line numbers are deliberately absent, so moving code does not change the table.
 EMIT_SITES: dict[str, dict[str, int]] = {
+    "controlled-task-refusal": {
+        "scripts/controlled_task_model.py": 1,
+    },
     "approval-decision-refused": {
         "web/src/controller.ts": 1,
         "web/src/main.ts": 2,
