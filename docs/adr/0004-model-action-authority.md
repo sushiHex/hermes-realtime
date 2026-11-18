@@ -468,7 +468,9 @@ surface's admission lock, which is the commit point, with no suspension before t
 binds. The commit is refused, and nothing is cancelled, unless all of these still hold
 when the cancel gets that lock:
 - the session binding is unchanged;
-- no newer user input has begun, spoken or typed;
+- no newer user input, spoken or typed, has begun since the affirmative was accepted as
+  this question's answer. That input epoch is frozen before the router suspends to
+  record the affirmative, so input that begins while it is recorded is newer;
 - the question's deadline has not passed;
 - the task is still running with nothing starting or stopping.
 
