@@ -4919,6 +4919,36 @@ def test_competing_work_beside_an_early_end_fails_and_is_not_inconclusive(
                     "journey_confirm_competing")
 
 
+def _early_end_with_competing_work():
+    return [task_result_row(C_A, "completed"), task_state_row(C_OTHER, "active"), admit(RUN_X)]
+
+
+def test_competing_work_first_seen_at_the_quiet_gate_fails(tmp_path, monkeypatch):
+    """Site-specific (Astra 9272): the quiet gate before request B sees the early end first."""
+    journey = confirm_journey(tmp_path, monkeypatch, pre=[_early_end_with_competing_work()])
+    receipt = confirm_refused(journey, "journey_confirm_competing")
+    assert receipt["requestBInjected"] is False
+
+
+def test_competing_work_first_seen_at_a_clip_lead_in_fails(tmp_path, monkeypatch):
+    """Site-specific: request B's reply settles cleanly; the No clip's first-frame check is the
+    first to see the early end and the competing work."""
+    obj_b = confirm_objectives()[1]
+    b = [*confirm_reply(REQ_B_SPOKEN, P_B, said=readback_of(obj_b)), [],
+         _early_end_with_competing_work()]
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(b=b))
+    receipt = confirm_refused(journey, "journey_confirm_competing")
+    assert receipt["readbackBOutcome"] == "target" and receipt["noInjected"] is False
+
+
+def test_competing_work_first_seen_after_no_fails(tmp_path, monkeypatch):
+    """Site-specific: the post-No check is the first to see the early end."""
+    no = confirm_reply("No.", P_NO, said="Okay.", extra=_early_end_with_competing_work())
+    journey = confirm_journey(tmp_path, monkeypatch, phases=confirm_phases(no=no))
+    receipt = confirm_refused(journey, "journey_confirm_competing")
+    assert receipt["noInjected"] is True and receipt["requestAInjected"] is False
+
+
 @pytest.mark.parametrize("other", ["active", "cancelling"])
 def test_competing_work_beside_an_ended_bystander_after_yes_fails(tmp_path, monkeypatch, other):
     yes = confirm_yes(extra=[task_result_row(C_B, "completed"), task_state_row(C_OTHER, other),
