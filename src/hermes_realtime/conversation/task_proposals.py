@@ -158,6 +158,9 @@ class ConversationTaskProposals:
         # Advanced at every user input onset, spoken or typed: a confirmed cancel commits
         # only if no newer input began before its admission.
         self._input_serial = 0
+        # The cancel question an affirmative answered and that affirmative's input epoch,
+        # frozen by confirmation_target before the router records the input.
+        self._cancel_confirmation: tuple[TaskProposal, int] | None = None
 
     @property
     def max_objective_chars(self) -> int:
@@ -291,6 +294,10 @@ class ConversationTaskProposals:
             # retires it, and the input continues as an ordinary turn the host can answer.
             self.retire("cancel_confirmation_not_clean")
             return None
+        if pending is not None and pending.cancel_task_id is not None:
+            # Freeze this affirmative's own input epoch now, before the router can suspend
+            # to record it: any input that begins after this point is newer than the "yes".
+            self._cancel_confirmation = (pending, self._input_serial)
         return pending
 
     def _cancel_still_eligible(self) -> bool:
@@ -334,8 +341,15 @@ class ConversationTaskProposals:
                 self._evidence(reason)
             return WorkCommandAdmission.REFUSED
         if proposal.cancel_task_id is not None:
-            # The clean capture latched this exact question for the current binding.
-            result = await self._consume(proposal, decision="confirm")
+            # The clean capture latched this exact question for the current binding, and
+            # confirmation_target froze this affirmative's input epoch before recording.
+            frozen, self._cancel_confirmation = self._cancel_confirmation, None
+            if frozen is None or frozen[0] is not proposal or frozen[1] != self._input_serial:
+                self.retire("cancel_newer_input")
+                return WorkCommandAdmission.REFUSED
+            result = await self._consume(
+                proposal, decision="confirm", confirming_input=frozen[1],
+            )
             assert isinstance(result, WorkCommandAdmission)
             return result
         return await self.decide(
@@ -496,7 +510,7 @@ class ConversationTaskProposals:
 
     async def _consume(
         self, proposal: TaskProposal, *, decision: str | None, wait_for_ack: bool = False,
-        anchor_turn_id: str | None = None,
+        anchor_turn_id: str | None = None, confirming_input: int | None = None,
     ) -> WorkCommandAdmission | WorkStartResult:
         category = "expired"
         try:
@@ -519,7 +533,9 @@ class ConversationTaskProposals:
                 # admission lock: the same binding, no newer user input since this
                 # affirmative, and the question's own deadline.
                 binding = (proposal.participant, proposal.generation)
-                input_serial = self._input_serial
+                if confirming_input is None:
+                    raise ValueError("a cancel question needs its confirming input epoch")
+                input_serial = confirming_input
                 task_id = proposal.cancel_task_id
                 eligible = getattr(self._surface, "natural_cancel_eligible", None)
 
@@ -568,6 +584,7 @@ class ConversationTaskProposals:
         visible, self._pending_visible = self._pending_visible, False
         self._readback_complete = None
         self._capture_binding = None
+        self._cancel_confirmation = None
         self._deadline = None
         if proposal is not None and visible:
             try:

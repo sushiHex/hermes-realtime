@@ -582,6 +582,49 @@ async def test_route_spoken_carries_the_confirming_authority_to_the_locked_commi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "newer_speech", "newer_typed", "rebind"])
+async def test_route_spoken_freezes_the_confirming_input_before_recording_it(change):
+    """Astra 9191: the router suspends to record the "yes" before consuming it. Input that
+    begins during that suspension is newer than the "yes" and must cancel nothing."""
+    from hermes_realtime.evidence import CommandRoutingOutcome
+
+    inference = Nominations(HostCancelRequest(target="choice_1"))
+    loop, _context, controller, proposals, _synth, _events = _owner(
+        "alpha", "beta", inference=inference,
+    )
+    router, mint, accepted = _router(loop, proposals)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def record(_text):
+        started.set()
+        await release.wait()
+
+    router._validate_user_input = lambda _text: None
+    router._record_user_input = record
+    await _say(loop, proposals, "Stop alpha.", "turn_1")
+    proposals.capture_started(participant="participant", generation=1, clean=True)
+    routed = asyncio.create_task(router.route_spoken("yes", mint()))
+    await started.wait()
+    if change == "newer_speech":
+        proposals.capture_started(participant="participant", generation=1, clean=True)
+    elif change == "newer_typed":
+        proposals.typed_input_started(participant="participant", generation=1)
+    elif change == "rebind":
+        proposals.bind("participant", 2)
+    release.set()
+    result = await routed
+    await _settle()
+    if change is None:
+        assert result.outcome is CommandRoutingOutcome.ACCEPTED
+        assert controller.cancellations == [("task_alpha", "user requested task cancellation")]
+    else:
+        assert result.outcome is CommandRoutingOutcome.REJECTED
+        assert accepted == []
+        assert controller.cancellations == []
+        assert not proposals.has_pending
+
+
+@pytest.mark.asyncio
 async def test_an_uninterrupted_confirmation_still_commits_after_waiting_for_the_lock():
     inference = Nominations(HostCancelRequest(target="choice_1"))
     loop, _context, controller, proposals, _synth, _events = _owner(
