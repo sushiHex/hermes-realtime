@@ -318,8 +318,7 @@ class ConversationTaskProposals:
         if self._deadline is None or self._clock() >= self._deadline:
             self.retire("expired")
             return WorkCommandAdmission.REFUSED
-        if not self._cancel_still_eligible():
-            return WorkCommandAdmission.REFUSED
+        # A cancel's eligibility is rechecked at its locked commit point (see _consume).
         if capture is not proposal:
             reason = (
                 "use_confirmation_card"
