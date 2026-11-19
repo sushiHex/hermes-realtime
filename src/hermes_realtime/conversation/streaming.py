@@ -1559,6 +1559,7 @@ class StreamingSpeechLoop:
                             proposal_readback=proposal_readback,
                             proposal_confirmed_text=proposal_confirmed_text,
                             typed_input=typed_input,
+                            generated_segments=generated_segments,
                         ),
                         name=f"foreground-speech:{turn_id}:{lease.generation}",
                     )
@@ -1864,6 +1865,7 @@ class StreamingSpeechLoop:
         proposal_readback: list[TaskProposal],
         proposal_confirmed_text: list[str],
         typed_input: tuple[int, int] | None = None,
+        generated_segments: list[ForegroundPublication],
     ) -> None:
         first_playable_observed = False
         replay_lifecycle = replay_presentations.get(1)
@@ -2096,81 +2098,85 @@ class StreamingSpeechLoop:
                 typed_input=typed_input,
             )
         except BaseException as error:
-            if proposal_readback and self._task_proposals is not None:
-                self._task_proposals.speech_started()
-                self._task_proposals.complete_readback(
-                    proposal_readback[0], "", queued_chunks=0, confirmed_chunks=0,
-                )
-            interruption_marker_error: BaseException | None = None
-            if last_heard_segment is not None:
-                # The turn did not complete normally after some speech was heard:
-                # mark this turn's last heard row once.
-                try:
-                    self._context.mark_assistant_segment_interrupted(last_heard_segment)
-                except BaseException as candidate:
-                    interruption_marker_error = candidate
-            interruption_projection_error: BaseException | None = None
-            observer = self._observer
-            if observer is not None:
-                try:
-                    observer(
-                        "assistant_turn_interrupted",
-                        {
-                            "turnId": lifecycle_turn_id,
-                            "turnGeneration": lifecycle_generation,
-                            **self._typed_input_metadata(typed_input),
-                        },
+            after_publication = bool(generated_segments)
+            try:
+                if proposal_readback and self._task_proposals is not None:
+                    self._task_proposals.speech_started()
+                    self._task_proposals.complete_readback(
+                        proposal_readback[0], "", queued_chunks=0, confirmed_chunks=0,
                     )
-                except BaseException as candidate:
-                    interruption_projection_error = candidate
-            if not prefetch_task.done():
-                prefetch_task.cancel()
-            cleanup_errors = await self._cleanup_failed_turn(
-                turn_id,
-                pending_admissions=pending_admissions,
-                cancel_inference=cancel_inference,
-                evidence_lease=evidence_lease,
-                terminal_evidence=terminal_evidence,
-            )
-            cleanup_errors.extend(
-                await self._settle_prefetch_task(
-                    prefetch_task,
-                    primary_error=error,
-                )
-            )
-            if interruption_marker_error is not None:
-                cleanup_errors.append(interruption_marker_error)
-            if interruption_projection_error is not None:
-                cleanup_errors.append(interruption_projection_error)
-            evidence = self._resolve_evidence_admission()
-            counts = terminal_evidence.counts
-            if evidence is not None and evidence_lease is not None and counts is not None:
-                with suppress(Exception):
-                    settlement_disposition = evidence.settle_terminal(
-                        evidence_lease,
-                        queued_chunk_count=counts.queued_chunk_count,
-                        started_chunk_count=counts.started_chunk_count,
-                        assistant_delivery_context_recorded=(
-                            counts.assistant_delivery_context_recorded
-                        ),
-                    )
-                    if self._observe_terminal_settlement(
-                        evidence,
-                        evidence_lease,
-                        settlement_disposition,
-                    ):
-                        self._observe_committed_conversation_context_snapshot(
-                            terminal_evidence.committed_conversation_context_snapshot
+                interruption_marker_error: BaseException | None = None
+                if last_heard_segment is not None:
+                    # The turn did not complete normally after some speech was heard:
+                    # mark this turn's last heard row once.
+                    try:
+                        self._context.mark_assistant_segment_interrupted(last_heard_segment)
+                    except BaseException as candidate:
+                        interruption_marker_error = candidate
+                interruption_projection_error: BaseException | None = None
+                observer = self._observer
+                if observer is not None:
+                    try:
+                        observer(
+                            "assistant_turn_interrupted",
+                            {
+                                "turnId": lifecycle_turn_id,
+                                "turnGeneration": lifecycle_generation,
+                                **self._typed_input_metadata(typed_input),
+                            },
                         )
-            failures = [error, *cleanup_errors]
-            if all(_is_cancellation_only(failure) for failure in failures):
-                raise asyncio.CancelledError from None
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "streaming response and cleanup failed",
-                    failures,
-                ) from None
-            raise
+                    except BaseException as candidate:
+                        interruption_projection_error = candidate
+                if not prefetch_task.done():
+                    prefetch_task.cancel()
+                cleanup_errors = await self._cleanup_failed_turn(
+                    turn_id,
+                    pending_admissions=pending_admissions,
+                    cancel_inference=cancel_inference,
+                    evidence_lease=evidence_lease,
+                    terminal_evidence=terminal_evidence,
+                )
+                cleanup_errors.extend(
+                    await self._settle_prefetch_task(
+                        prefetch_task,
+                        primary_error=error,
+                    )
+                )
+                if interruption_marker_error is not None:
+                    cleanup_errors.append(interruption_marker_error)
+                if interruption_projection_error is not None:
+                    cleanup_errors.append(interruption_projection_error)
+                evidence = self._resolve_evidence_admission()
+                counts = terminal_evidence.counts
+                if evidence is not None and evidence_lease is not None and counts is not None:
+                    with suppress(Exception):
+                        settlement_disposition = evidence.settle_terminal(
+                            evidence_lease,
+                            queued_chunk_count=counts.queued_chunk_count,
+                            started_chunk_count=counts.started_chunk_count,
+                            assistant_delivery_context_recorded=(
+                                counts.assistant_delivery_context_recorded
+                            ),
+                        )
+                        if self._observe_terminal_settlement(
+                            evidence,
+                            evidence_lease,
+                            settlement_disposition,
+                        ):
+                            self._observe_committed_conversation_context_snapshot(
+                                terminal_evidence.committed_conversation_context_snapshot
+                            )
+                failures = [error, *cleanup_errors]
+                if all(_is_cancellation_only(failure) for failure in failures):
+                    raise asyncio.CancelledError from None
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "streaming response and cleanup failed",
+                        failures,
+                    ) from None
+                raise
+            finally:
+                self._report_consumer_failure(error, after_publication=after_publication)
 
     async def _prefetch_speech(
         self,
@@ -2915,21 +2921,36 @@ class StreamingSpeechLoop:
         errors = [error for error in (iteration, close) if error is not None]
         if not errors or all(_is_cancellation_only(error) for error in errors):
             return
-        error = errors[0]
-        if len(errors) > 1 or isinstance(error, BaseExceptionGroup):
-            kind = "group"
-        elif type(error) is ModelOutputRefused:
-            kind = "refused"
-        else:
-            kind = next((label for cls, label in (
-                (ValueError, "value"), (TypeError, "type"), (RuntimeError, "runtime"),
-                (TimeoutError, "timeout"),
-            ) if isinstance(error, cls)), "other")
+        kind = "group" if len(errors) > 1 else StreamingSpeechLoop._failure_kind(errors[0])
         with suppress(Exception):
             print("[foreground-failure] " + json.dumps({
                 "version": 1, "stage": "producer", "failure_kind": kind,
                 "text_phase": "after_text" if after_text else "before_text",
             }, separators=(",", ":")), flush=True)
+
+    @staticmethod
+    def _report_consumer_failure(error: BaseException, *, after_publication: bool) -> None:
+        # This is the consumer's original exception, before cleanup can replace or group it.
+        # Publication evidence is local to this turn; it does not establish model token arrival.
+        with suppress(BaseException):
+            print("[foreground-failure] " + json.dumps({
+                "version": 1, "stage": "consumer",
+                "failure_kind": StreamingSpeechLoop._failure_kind(error),
+                "text_phase": "after_publication" if after_publication else "before_publication",
+            }, separators=(",", ":")), flush=True)
+
+    @staticmethod
+    def _failure_kind(error: BaseException) -> str:
+        if _is_cancellation_only(error):
+            return "cancelled"
+        if isinstance(error, BaseExceptionGroup):
+            return "group"
+        if type(error) is ModelOutputRefused:
+            return "refused"
+        return next((label for cls, label in (
+            (ValueError, "value"), (TypeError, "type"), (RuntimeError, "runtime"),
+            (TimeoutError, "timeout"),
+        ) if isinstance(error, cls)), "other")
 
     @staticmethod
     def _snapshot_speech_chunk(chunk: SpeechChunk) -> SpeechChunk:
