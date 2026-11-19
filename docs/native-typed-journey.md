@@ -423,6 +423,12 @@ The receipt holds booleans, counts, client-local milliseconds and the fixed repl
 `incomplete`, `none`, `ambiguous`, or null if not reached). Assistant text is only compared in
 memory with the two pinned readbacks; no text or identity is stored.
 
+Flat `readbackA` / `readbackB` fields retain event, distinct-pair, assistant-final and
+readback-final counts. Their `Reason` is null or a fixed ambiguity category: `unbound_reply`,
+`foreign_phase`, `reply_before_final`, `multiple_turns`, `multiple_readbacks`, or
+`text_after_readback`. These explain an existing refusal without changing its classification
+or failure precedence. Counts remain bounded by the trace capacity.
+
 This is a controlled synthetic path. It bypasses the physical microphone and acoustic
 echo cancellation. It does not prove source-attributed microphone qualification or the
 naturalness of the conversation.

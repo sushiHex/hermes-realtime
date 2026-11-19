@@ -4981,6 +4981,13 @@ def test_a_reply_that_is_not_exactly_one_final_readback_is_ambiguous(
     receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
                               "journey_confirm_ambiguous")
     assert receipt["readback" + phase.upper() + "Outcome"] == "ambiguous"
+    detail = {key: receipt["readback" + phase.upper() + key[0].upper() + key[1:]]
+              for key in ("reason", "events", "pairs", "assistantFinals", "readbackFinals")}
+    assert detail == {"reason": ("text_after_readback" if shape == "readback_then_text"
+                                 else "multiple_readbacks"),
+                      "events": 4, "pairs": 1, "assistantFinals": 2,
+                      "readbackFinals": 1 if shape == "readback_then_text" else 2}
+    assert "Which" not in json.dumps(detail)
 
 
 def test_prose_before_the_readback_still_reaches_the_target(tmp_path, monkeypatch):
@@ -5413,3 +5420,30 @@ def test_yes_waits_for_quiet_after_its_completed_readback(tmp_path, monkeypatch,
         run_confirm(journey)
         assert journey.speak_receipt["yesInjected"]
         assert journey.speak_receipt["quietBeforeYesMs"] > 0
+
+
+@pytest.mark.parametrize(("shape", "reason"), [
+    ("unbound", "unbound_reply"), ("foreign", "foreign_phase"),
+    ("early", "reply_before_final"), ("two_turns", "multiple_turns"),
+])
+def test_reply_diagnostics_distinguish_binding_ambiguity_without_identifiers(shape, reason):
+    from scripts.native_typed_journey import ConfirmCancelTrace
+
+    pair = ("PRIVATE-PAIR", 1)
+    trace = ConfirmCancelTrace(frozenset(), 1, frozenset())
+    trace.mark(0, ("request",))
+    trace.first_phase[pair] = -1 if shape == "foreign" else 0
+    trace._log(0 if shape == "early" else 2, "first_foreground_token",
+               None if shape == "unbound" else pair, None)
+    trace._log(3, "assistant", pair, "b")
+    trace._log(4, "assistant_turn_completed", pair, None)
+    if shape == "two_turns":
+        other = ("PRIVATE-OTHER", 1)
+        trace.first_phase[other] = 0
+        trace._log(5, "first_foreground_token", other, None)
+    assert trace.reply(0, 1, "b", "a") == "ambiguous"
+    detail = trace.reply_diagnostics
+    assert detail["reason"] == reason
+    assert set(detail) == {"reason", "events", "pairs", "assistantFinals", "readbackFinals"}
+    assert all(type(detail[k]) is int and 0 <= detail[k] <= 512 for k in detail if k != "reason")
+    assert "PRIVATE" not in json.dumps(detail)
