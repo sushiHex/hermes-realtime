@@ -1114,6 +1114,9 @@ READERS: dict[str, dict[str, int]] = {
         "scripts/real_hermes_api_gate.py": 1,
         "scripts/rehearse_desktop_mvp.py": 1,
     },
+    "codex-output-refusal": {
+        "scripts/lookup_backend_logs.py": 2,
+    },
     "foreground-failure": {
         "scripts/lookup_backend_logs.py": 2,
     },
