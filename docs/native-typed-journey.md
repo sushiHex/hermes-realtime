@@ -329,7 +329,10 @@ spoken delegation; `speak_task` covers that separately.
 3. `sapi_confirm_no.wav`: through a bounded drain window after its final nothing may be
    cancelling or interrupted and both tasks stay active (`journey_confirm_no_cancelled`).
 4. **Quiet again**, then `sapi_confirm_request_a.wav` (names A): A's exact readback, completed.
-5. `sapi_confirm_yes.wav`. The only proof is the outcome: A observed `cancelling` or
+5. **Quiet after A's completed readback**, then `sapi_confirm_yes.wav`. The existing
+   drain, quiet interval and clip lead let the default playback tail and capture pre-roll
+   expire; the gate resets on worker audio and refuses on its existing deadline. The only
+   proof is the outcome: A observed `cancelling` or
    `interrupted` by `task_state` after the Yes final (`journey_confirm_not_cancelled`
    otherwise; a terminal result alone is not arming). B must never be cancelled
    (`journey_confirm_wrong_target`) and stay active (`journey_confirm_bystander_ended`).

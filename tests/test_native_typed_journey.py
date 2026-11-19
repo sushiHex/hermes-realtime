@@ -5375,3 +5375,41 @@ def test_both_tasks_are_owned_for_cleanup_even_when_the_step_fails(tmp_path, mon
     confirm_refused(journey, "journey_confirm_clarified")
     assert journey.bindings == {"confirm.a": (C_A, RUN_A), "confirm.b": (C_B, RUN_B)}
     assert journey.tracker.speak is None and journey.voice.meter.window == "closed"
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_yes_waits_for_quiet_after_its_completed_readback(tmp_path, monkeypatch, continuous):
+    journey = confirm_journey(tmp_path, monkeypatch)
+    import scripts.native_typed_journey as client
+
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 0.5)
+    original_stream = journey._stream_bounded
+    original_quiet = journey.voice.meter.quiet_since
+    calls, after_a, quiet_checks = [0], [False], [0]
+
+    async def stream(*args, **kwargs):
+        calls[0] += 1
+        if calls[0] == 4:
+            assert quiet_checks[0] >= 3  # late audio must restart the gate before Yes
+        result = await original_stream(*args, **kwargs)
+        if calls[0] == 3:
+            after_a[0] = True
+        return result
+
+    def quiet(entry, seconds):
+        if after_a[0]:
+            quiet_checks[0] += 1
+            if continuous or quiet_checks[0] <= 2:
+                journey.voice.meter.observe(fake_frame(8000))
+        return original_quiet(entry, seconds)
+
+    journey._stream_bounded = stream
+    monkeypatch.setattr(journey.voice.meter, "quiet_since", quiet)
+    if continuous:
+        receipt = confirm_refused(journey, "journey_confirm_not_quiet")
+        assert not receipt["yesInjected"]
+        assert sent_speech_frames(journey) == clip_speech_frames(0, 1, 2)
+    else:
+        run_confirm(journey)
+        assert journey.speak_receipt["yesInjected"]
+        assert journey.speak_receipt["quietBeforeYesMs"] > 0

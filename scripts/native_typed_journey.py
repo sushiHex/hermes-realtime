@@ -1937,7 +1937,8 @@ class Journey:
             "label": label, "kind": "speak_confirm_cancel", "mediaRequests": 0,
             "cueAudioObserved": False, "quietGateMs": 0, "dispatchTasks": 0,
             "dispatchAdmissions": 0, "tasksBound": False, "bothActiveBeforeRequest": False,
-            "quietBeforeRequestBMs": 0, "quietBeforeRequestAMs": 0, "unexpectedInputCount": 0,
+            "quietBeforeRequestBMs": 0, "quietBeforeRequestAMs": 0, "quietBeforeYesMs": 0,
+            "unexpectedInputCount": 0,
             **{name + suffix: value for name in _CONFIRM_CLIPS
                for suffix, value in (("Injected", False), ("VadObserved", False),
                                      ("FinalsCount", 0), ("TranscriptMatches", False))},
@@ -2059,6 +2060,7 @@ class Journey:
             receipt["bothActiveAfterNo"] = True
             await quiet("quietBeforeRequestAMs", "journey_confirm_no_cancelled")
             await request(2, "a", "b")
+            await quiet("quietBeforeYesMs", "journey_confirm_no_cancelled")
             await inject(3, "journey_confirm_no_cancelled")
             with contextlib.suppress(TimeoutError):
                 await self.wait(lambda: trace.arming(task_a, 3) is not None
