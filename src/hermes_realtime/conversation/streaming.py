@@ -1341,9 +1341,10 @@ class StreamingSpeechLoop:
                     else:
                         try:
                             for text, source in quarantined:
-                                if not await lease.publish(
+                                if not await lease.publish_when_ready(
                                     text, on_admit=admit_generated, source=source,
                                 ):
+                                    stale_quarantine = True
                                     break
                         except BaseException as error:
                             if not isinstance(error, asyncio.CancelledError):
