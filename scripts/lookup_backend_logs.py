@@ -23,15 +23,22 @@ def _foreground_failure_category(raw: bytes) -> str:
         or set(value) != {"version", "stage", "failure_kind", "text_phase"}
         or type(value["version"]) is not int
         or value["version"] != 1
-        or value["stage"] != "producer"
+        or type(value["stage"]) is not str
+        or value["stage"] not in {"producer", "consumer"}
         or type(value["failure_kind"]) is not str
         or value["failure_kind"]
-        not in {"value", "type", "runtime", "timeout", "group", "refused", "other"}
+        not in {"value", "type", "runtime", "timeout", "group", "refused", "other", "cancelled"}
         or type(value["text_phase"]) is not str
-        or value["text_phase"] not in {"before_text", "after_text"}
     ):
         raise ValueError("invalid foreground diagnostic")
-    return f"foreground_producer_{value['failure_kind']}_{value['text_phase']}"
+    if value["stage"] == "producer":
+        valid = (value["text_phase"] in {"before_text", "after_text"}
+                 and value["failure_kind"] != "cancelled")
+    else:
+        valid = value["text_phase"] in {"before_publication", "after_publication"}
+    if not valid:
+        raise ValueError("invalid foreground diagnostic")
+    return f"foreground_{value['stage']}_{value['failure_kind']}_{value['text_phase']}"
 
 
 _HOST_STAGES = {"configuration", "host_construction", "host_start", "serving", "host_close"}
