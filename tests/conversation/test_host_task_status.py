@@ -196,6 +196,8 @@ async def test_loop_refuses_text_after_status_with_bounded_evidence(capsys):
         '[host-speech] {"category":"after_terminal","kind":"task_status"}\n'
         '[foreground-failure] {"version":1,"stage":"producer",'
         '"failure_kind":"value","text_phase":"after_text"}\n'
+        '[foreground-failure] {"version":1,"stage":"consumer",'
+        '"failure_kind":"cancelled","text_phase":"after_publication"}\n'
     )
     await loop.close()
 
