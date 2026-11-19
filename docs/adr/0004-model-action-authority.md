@@ -380,9 +380,14 @@ stopped. An accepted cancel, whose task is still running, gets the accepted-star
 continuation pattern: one tool-free model request whose new fact is the accepted
 cancellation, instructed to say the task is being stopped and not that it stopped. A
 cancellation acknowledgment means stopping was requested; only the terminal state
-shows the task ended. Speech the model emits before it selects cannot be undone, and
-no phrase guard checks either it or the acknowledgment for a stopped claim; that
-wording remains a manual truthfulness check. A turn answering a heard proposal
+shows the task ended. On turns offering either cancel route, initial publications stay
+within the existing segment count and character bounds until the provider stream closes
+successfully. A cancel selection or nomination discards preceding model prose; a
+non-cancel reply publishes its held text in order only while the lease remains current.
+Failure or interruption before clean stream closure releases none of that held text.
+No phrase guard checks an
+ordinary non-cancel reply or the accepted-cancel acknowledgment for a stopped claim;
+their wording remains a manual truthfulness check. A turn answering a heard proposal
 readback offers no cancel, so "no, cancel that" cannot reach the running task.
 
 Invariant: the model never names a task, so a wrong-task cancel is impossible. The

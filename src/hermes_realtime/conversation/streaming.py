@@ -1071,6 +1071,8 @@ class StreamingSpeechLoop:
 
         async def producer(lease: ForegroundTurnLease) -> None:
             text_seen = False
+            quarantined: list[tuple[str, str]] | None = None
+            stale_quarantine = False
             def admit_generated(publication: ForegroundPublication) -> None:
                 if record_generation:
                     self._context.validate_assistant_generation(publication.text)
@@ -1179,6 +1181,23 @@ class StreamingSpeechLoop:
                 automatic_proposal: HostTaskProposalRequest | None = None
                 cancel_selected = False
                 cancel_nominated: tuple[str, str] | None = None
+                # A terminal cancel selection can follow arbitrary model prose. Hold
+                # this turn's validated publications within the existing segment
+                # count/character bounds until iteration and close both succeed.
+                quarantined = (
+                    [] if cancel_target is not None or cancel_choices else None
+                )
+
+                async def publish_initial(text: str, *, source: str) -> bool:
+                    nonlocal stale_quarantine
+                    if quarantined is not None:
+                        if not lease.is_current:
+                            stale_quarantine = True
+                            return False
+                        quarantined.append((text, source))
+                        return True
+                    return await lease.publish(text, on_admit=admit_generated, source=source)
+
                 iteration_error: BaseException | None = None
                 pending_initial_segment: str | None = None
                 coalesce_initial_segment = transcript is not None and segments is None
@@ -1279,22 +1298,20 @@ class StreamingSpeechLoop:
                                 segment = combined
                                 pending_initial_segment = None
                             else:
-                                if not await lease.publish(
+                                if not await publish_initial(
                                     pending_initial_segment,
-                                    on_admit=admit_generated,
                                     source="conversation",
                                 ):
                                     break
                                 pending_initial_segment = None
-                        if not await lease.publish(
-                            segment, on_admit=admit_generated, source=source,
+                        if not await publish_initial(
+                            segment, source=source,
                         ):
                             break
                     else:
                         if pending_initial_segment is not None:
-                            await lease.publish(
+                            await publish_initial(
                                 pending_initial_segment,
-                                on_admit=admit_generated,
                                 source="conversation",
                             )
                 except asyncio.CancelledError:
@@ -1318,6 +1335,22 @@ class StreamingSpeechLoop:
                     close_error,
                     producer_after_text=text_seen,
                 )
+                if quarantined is not None and not cancel_selected and cancel_nominated is None:
+                    if not lease.is_current:
+                        stale_quarantine = True
+                    else:
+                        try:
+                            for text, source in quarantined:
+                                if not await lease.publish(
+                                    text, on_admit=admit_generated, source=source,
+                                ):
+                                    break
+                        except BaseException as error:
+                            if not isinstance(error, asyncio.CancelledError):
+                                producer_failed.set()
+                                lease.invalidate_publications()
+                            raise
+
                 async def speak_host_refusal(
                     refusal: str, *, source: str = "host_task_status",
                 ) -> None:
@@ -1475,7 +1508,17 @@ class StreamingSpeechLoop:
                 if not producer_result.done():
                     producer_result.set_result(None)
             finally:
-                producer_done.set()
+                try:
+                    if stale_quarantine:
+                        with suppress(Exception):
+                            print("[cancel-prose-refused] " + json.dumps({
+                                "version": 1, "category": "stale_turn",
+                                "buffered_segments": min(
+                                    _MAX_SEGMENTS_LIMIT, len(quarantined or ()),
+                                ),
+                            }, separators=(",", ":")), flush=True)
+                finally:
+                    producer_done.set()
 
         async with self._lifecycle_lock:
             if self._closed:
