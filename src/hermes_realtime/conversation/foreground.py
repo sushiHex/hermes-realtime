@@ -115,6 +115,23 @@ class ForegroundTurnLease:
 
         return await self._coordinator._publish(self, text, on_admit=on_admit, source=source)
 
+    async def publish_when_ready(
+        self,
+        text: str,
+        *,
+        on_admit: Callable[[ForegroundPublication], None] | None = None,
+        source: str = "conversation",
+    ) -> bool:
+        """Wait for bounded queue space; recheck owner authority before admission.
+
+        The current foreground task owns this wait, so revocation and close cancel
+        it through the coordinator's existing bounded settlement path.
+        """
+
+        return await self._coordinator._publish(
+            self, text, on_admit=on_admit, source=source, wait_for_capacity=True,
+        )
+
     def invalidate_publications(self) -> None:
         """Fail closed before an owning producer begins asynchronous cleanup."""
 
@@ -175,7 +192,9 @@ class ForegroundTurnCoordinator:
         async with self._publication_available:
             while True:
                 if self._publications:
-                    return self._publications.popleft()
+                    publication = self._publications.popleft()
+                    self._publication_available.notify_all()
+                    return publication
                 if self._closed:
                     raise ForegroundTurnClosed(
                         "foreground turn coordinator is closed"
@@ -299,6 +318,7 @@ class ForegroundTurnCoordinator:
         *,
         on_admit: Callable[[ForegroundPublication], None] | None = None,
         source: str = "conversation",
+        wait_for_capacity: bool = False,
     ) -> bool:
         validate_speech_source(source)
         if type(text) is not str:
@@ -308,13 +328,17 @@ class ForegroundTurnCoordinator:
         if on_admit is not None and not callable(on_admit):
             raise TypeError("foreground publication observer must be callable")
         current_task = asyncio.current_task()
-        async with self._state_lock:
-            if self._active_lease is not lease or self._active_task is not current_task:
-                return False
-            if len(self._publications) >= self._output_capacity:
-                raise ForegroundOutputBackpressure(
-                    "foreground publication queue is full"
-                )
+        async with self._publication_available:
+            while True:
+                if self._active_lease is not lease or self._active_task is not current_task:
+                    return False
+                if len(self._publications) < self._output_capacity:
+                    break
+                if not wait_for_capacity:
+                    raise ForegroundOutputBackpressure(
+                        "foreground publication queue is full"
+                    )
+                await self._publication_available.wait()
             sequence = lease._publication_sequence + 1
             publication = ForegroundPublication(
                 turn_id=lease.turn_id,

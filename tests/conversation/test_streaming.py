@@ -65,7 +65,9 @@ async def test_producer_failure_retains_typed_terminal_and_safe_marker(capsys, a
         assert terminals[0]["inputSequence"] == 3 and terminals[0]["bindingGeneration"] == 7
         markers = [line.removeprefix("[foreground-failure] ")
                    for line in capsys.readouterr().out.splitlines()
-                   if line.startswith("[foreground-failure] ")]
+                   if line.startswith("[foreground-failure] ")
+                   and json.loads(line.removeprefix("[foreground-failure] "))["stage"]
+                   == "producer"]
         assert len(markers) == 1
         assert json.loads(markers[0]) == {
             "version": 1, "stage": "producer", "failure_kind": "value",
@@ -1464,7 +1466,13 @@ async def test_cancelled_assistant_turn_projects_exact_terminal_identity(capsys)
         "assistant_turn_interrupted",
         {"turnId": "turn_001", "turnGeneration": 1},
     )
-    assert "[foreground-failure]" not in capsys.readouterr().out
+    markers = [json.loads(line.removeprefix("[foreground-failure] "))
+               for line in capsys.readouterr().out.splitlines()
+               if line.startswith("[foreground-failure] ")]
+    assert markers == [{
+        "version": 1, "stage": "consumer", "failure_kind": "cancelled",
+        "text_phase": "after_publication",
+    }]
 
 
 @pytest.mark.asyncio
