@@ -329,7 +329,10 @@ spoken delegation; `speak_task` covers that separately.
 3. `sapi_confirm_no.wav`: through a bounded drain window after its final nothing may be
    cancelling or interrupted and both tasks stay active (`journey_confirm_no_cancelled`).
 4. **Quiet again**, then `sapi_confirm_request_a.wav` (names A): A's exact readback, completed.
-5. `sapi_confirm_yes.wav`. The only proof is the outcome: A observed `cancelling` or
+5. **Quiet after A's completed readback**, then `sapi_confirm_yes.wav`. The existing
+   drain, quiet interval and clip lead let the default playback tail and capture pre-roll
+   expire; the gate resets on worker audio and refuses on its existing deadline. The only
+   proof is the outcome: A observed `cancelling` or
    `interrupted` by `task_state` after the Yes final (`journey_confirm_not_cancelled`
    otherwise; a terminal result alone is not arming). B must never be cancelled
    (`journey_confirm_wrong_target`) and stay active (`journey_confirm_bystander_ended`).
@@ -355,6 +358,20 @@ its own (`journey_confirm_target_terminal`). An interrupted or unfinished reply 
 the request's final, is `journey_confirm_ambiguous`. Wrong words, a missing voice start or a
 second final for any clip fail (`journey_confirm_transcript`, `journey_confirm_vad`,
 `journey_confirm_finals`).
+
+#### Short finals near playback
+
+For a streaming recognizer, a two-character final near playback can retain authority
+when its whole alphanumeric text agrees with the latest partial from that same capture
+(ignoring case and terminal sentence punctuation). This path requires an explicit speech
+presence verifier; acoustic promotion and transcript echo filtering still apply. Agreement
+is consistency, not independent recognition: a recognizer wrapper may reuse its last partial
+at the endpoint. Missing, stale, mismatched or echo evidence refuses the final.
+
+This endpoint path does not authorize interruption from a short partial, make a capture
+clean, or grant positive cancellation confirmation. A final is checked again after the
+interruption await so a replaced foreground cannot inherit the old capture's authority.
+Refusal diagnostics contain bounded counts and categories only, never recognized text.
 
 #### Controlled background-model lifetimes
 
@@ -405,6 +422,12 @@ The receipt holds booleans, counts, client-local milliseconds and the fixed repl
 `readbackBOutcome` / `readbackAOutcome` (`target`, `other`, `clarified`, `interrupted`,
 `incomplete`, `none`, `ambiguous`, or null if not reached). Assistant text is only compared in
 memory with the two pinned readbacks; no text or identity is stored.
+
+Flat `readbackA` / `readbackB` fields retain event, distinct-pair, assistant-final and
+readback-final counts. Their `Reason` is null or a fixed ambiguity category: `unbound_reply`,
+`foreign_phase`, `reply_before_final`, `multiple_turns`, `multiple_readbacks`, or
+`text_after_readback`. These explain an existing refusal without changing its classification
+or failure precedence. Counts remain bounded by the trace capacity.
 
 This is a controlled synthetic path. It bypasses the physical microphone and acoustic
 echo cancellation. It does not prove source-attributed microphone qualification or the

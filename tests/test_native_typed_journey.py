@@ -4981,6 +4981,13 @@ def test_a_reply_that_is_not_exactly_one_final_readback_is_ambiguous(
     receipt = confirm_refused(confirm_journey(tmp_path, monkeypatch, phases=phases),
                               "journey_confirm_ambiguous")
     assert receipt["readback" + phase.upper() + "Outcome"] == "ambiguous"
+    detail = {key: receipt["readback" + phase.upper() + key[0].upper() + key[1:]]
+              for key in ("reason", "events", "pairs", "assistantFinals", "readbackFinals")}
+    assert detail == {"reason": ("text_after_readback" if shape == "readback_then_text"
+                                 else "multiple_readbacks"),
+                      "events": 4, "pairs": 1, "assistantFinals": 2,
+                      "readbackFinals": 1 if shape == "readback_then_text" else 2}
+    assert "Which" not in json.dumps(detail)
 
 
 def test_prose_before_the_readback_still_reaches_the_target(tmp_path, monkeypatch):
@@ -5375,3 +5382,68 @@ def test_both_tasks_are_owned_for_cleanup_even_when_the_step_fails(tmp_path, mon
     confirm_refused(journey, "journey_confirm_clarified")
     assert journey.bindings == {"confirm.a": (C_A, RUN_A), "confirm.b": (C_B, RUN_B)}
     assert journey.tracker.speak is None and journey.voice.meter.window == "closed"
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_yes_waits_for_quiet_after_its_completed_readback(tmp_path, monkeypatch, continuous):
+    journey = confirm_journey(tmp_path, monkeypatch)
+    import scripts.native_typed_journey as client
+
+    monkeypatch.setattr(client, "_SPEAK_SETTLE_SECONDS", 0.5)
+    original_stream = journey._stream_bounded
+    original_quiet = journey.voice.meter.quiet_since
+    calls, after_a, quiet_checks = [0], [False], [0]
+
+    async def stream(*args, **kwargs):
+        calls[0] += 1
+        if calls[0] == 4:
+            assert quiet_checks[0] >= 3  # late audio must restart the gate before Yes
+        result = await original_stream(*args, **kwargs)
+        if calls[0] == 3:
+            after_a[0] = True
+        return result
+
+    def quiet(entry, seconds):
+        if after_a[0]:
+            quiet_checks[0] += 1
+            if continuous or quiet_checks[0] <= 2:
+                journey.voice.meter.observe(fake_frame(8000))
+        return original_quiet(entry, seconds)
+
+    journey._stream_bounded = stream
+    monkeypatch.setattr(journey.voice.meter, "quiet_since", quiet)
+    if continuous:
+        receipt = confirm_refused(journey, "journey_confirm_not_quiet")
+        assert not receipt["yesInjected"]
+        assert sent_speech_frames(journey) == clip_speech_frames(0, 1, 2)
+    else:
+        run_confirm(journey)
+        assert journey.speak_receipt["yesInjected"]
+        assert journey.speak_receipt["quietBeforeYesMs"] > 0
+
+
+@pytest.mark.parametrize(("shape", "reason"), [
+    ("unbound", "unbound_reply"), ("foreign", "foreign_phase"),
+    ("early", "reply_before_final"), ("two_turns", "multiple_turns"),
+])
+def test_reply_diagnostics_distinguish_binding_ambiguity_without_identifiers(shape, reason):
+    from scripts.native_typed_journey import ConfirmCancelTrace
+
+    pair = ("PRIVATE-PAIR", 1)
+    trace = ConfirmCancelTrace(frozenset(), 1, frozenset())
+    trace.mark(0, ("request",))
+    trace.first_phase[pair] = -1 if shape == "foreign" else 0
+    trace._log(0 if shape == "early" else 2, "first_foreground_token",
+               None if shape == "unbound" else pair, None)
+    trace._log(3, "assistant", pair, "b")
+    trace._log(4, "assistant_turn_completed", pair, None)
+    if shape == "two_turns":
+        other = ("PRIVATE-OTHER", 1)
+        trace.first_phase[other] = 0
+        trace._log(5, "first_foreground_token", other, None)
+    assert trace.reply(0, 1, "b", "a") == "ambiguous"
+    detail = trace.reply_diagnostics
+    assert detail["reason"] == reason
+    assert set(detail) == {"reason", "events", "pairs", "assistantFinals", "readbackFinals"}
+    assert all(type(detail[k]) is int and 0 <= detail[k] <= 512 for k in detail if k != "reason")
+    assert "PRIVATE" not in json.dumps(detail)

@@ -484,6 +484,7 @@ class ConfirmCancelTrace(SpeakTrace):
         # start, any other user final, or an unbound or replayed foreground event is not.
         self.frozen_seq: int | None = None
         self.unexpected = 0
+        self.reply_diagnostics: dict[str, Any] = {}
 
     def mark(self, cursor: int, words: tuple[str, ...]) -> None:
         self.marks.append(cursor)
@@ -577,14 +578,29 @@ class ConfirmCancelTrace(SpeakTrace):
         wholly after the request's final."""
         rows = [row for row in self.log
                 if row[1] == phase and (row[2] in _SPEAK_LIFECYCLE or row[2] == "assistant")]
+        self.reply_diagnostics = {
+            "reason": None, "events": len(rows),
+            "pairs": len({row[3] for row in rows if row[3] is not None}),
+            "assistantFinals": sum(row[2] == "assistant" for row in rows),
+            "readbackFinals": sum(row[2] == "assistant" and row[4] is not None for row in rows),
+        }
+
+        def ambiguous(reason: str) -> str:
+            self.reply_diagnostics["reason"] = reason
+            return "ambiguous"
+
         pairs: list[tuple[str, int]] = []
         for seq, _, _, pair, _ in rows:
-            if pair is None or self.first_phase.get(pair) != phase or seq < final:
-                return "ambiguous"
+            if pair is None:
+                return ambiguous("unbound_reply")
+            if self.first_phase.get(pair) != phase:
+                return ambiguous("foreign_phase")
+            if seq < final:
+                return ambiguous("reply_before_final")
             if pair not in pairs:
                 pairs.append(pair)
         if len(pairs) > 1:
-            return "ambiguous"
+            return ambiguous("multiple_turns")
         if not pairs:
             return "none"
         facts = {row[2] for row in rows}
@@ -600,8 +616,10 @@ class ConfirmCancelTrace(SpeakTrace):
         readbacks = [match for match in finals if match is not None]
         if not readbacks:
             return "clarified"
-        if len(readbacks) != 1 or finals[-1] is None:
-            return "ambiguous"
+        if len(readbacks) != 1:
+            return ambiguous("multiple_readbacks")
+        if finals[-1] is None:
+            return ambiguous("text_after_readback")
         return "target" if readbacks[0] == want else "other"
 
 
@@ -1937,11 +1955,15 @@ class Journey:
             "label": label, "kind": "speak_confirm_cancel", "mediaRequests": 0,
             "cueAudioObserved": False, "quietGateMs": 0, "dispatchTasks": 0,
             "dispatchAdmissions": 0, "tasksBound": False, "bothActiveBeforeRequest": False,
-            "quietBeforeRequestBMs": 0, "quietBeforeRequestAMs": 0, "unexpectedInputCount": 0,
+            "quietBeforeRequestBMs": 0, "quietBeforeRequestAMs": 0, "quietBeforeYesMs": 0,
+            "unexpectedInputCount": 0,
             **{name + suffix: value for name in _CONFIRM_CLIPS
                for suffix, value in (("Injected", False), ("VadObserved", False),
                                      ("FinalsCount", 0), ("TranscriptMatches", False))},
             "readbackBOutcome": None, "readbackAOutcome": None, "bothActiveAfterNo": False,
+            **{"readback" + phase + suffix: value for phase in ("A", "B")
+               for suffix, value in (("Reason", None), ("Events", 0), ("Pairs", 0),
+                                     ("AssistantFinals", 0), ("ReadbackFinals", 0))},
             "targetCancelObserved": False, "bystanderCancelObserved": False,
             "bystanderActiveAtWitness": False, "nativeCancelledBeforeCleanup": False,
             "nativeBystanderLiveBeforeCleanup": False, "successPathCleanupCancels": 0,
@@ -2023,6 +2045,8 @@ class Journey:
             final = trace.clip(index)[3]
             assert final is not None
             outcome = trace.reply(index, final, want, other)
+            for key, value in trace.reply_diagnostics.items():
+                receipt["readback" + want.upper() + key[0].upper() + key[1:]] = value
             receipt["readback" + want.upper() + "Outcome"] = outcome
             require(outcome != "ambiguous", "journey_confirm_ambiguous")
             require(outcome in {"target", "other", "clarified"},
@@ -2059,6 +2083,7 @@ class Journey:
             receipt["bothActiveAfterNo"] = True
             await quiet("quietBeforeRequestAMs", "journey_confirm_no_cancelled")
             await request(2, "a", "b")
+            await quiet("quietBeforeYesMs", "journey_confirm_no_cancelled")
             await inject(3, "journey_confirm_no_cancelled")
             with contextlib.suppress(TimeoutError):
                 await self.wait(lambda: trace.arming(task_a, 3) is not None

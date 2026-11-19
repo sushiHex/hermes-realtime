@@ -56,11 +56,17 @@ _MAX_BUFFERED_AUDIO_BYTES = 2 * 1024 * 1024
 _BINDING_SPEECH_SETTLE_SECONDS = 10.0
 _BINDING_SPEECH_MARKER = "[binding-speech] "
 _DRAINED_PARTIALS_MARKER = "[drained-partials] "
+_PLAYBACK_FINAL_REFUSAL_MARKER = "[playback-final-refused] "
 _DRAINED_PARTIALS_REFUSALS = frozenset({"not_a_tuple", "not_a_transcript", "final"})
 _LOGGER = logging.getLogger(__name__)
 
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
+
+
+def _short_transcript_key(text: str) -> str | None:
+    key = text.strip().rstrip(".!?").casefold()
+    return key if len(key) == 2 and key.isalnum() else None
 
 
 class _VoiceActivityDetector(Protocol):
@@ -304,6 +310,7 @@ class ConversationSessionWorker:
         self._interruption_committed = False
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
+        self._playback_candidate_short_partial: str | None = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id: str | None = None
         self._interruption_authority: _ForegroundInterruptionAuthority | None = None
@@ -430,6 +437,7 @@ class ConversationSessionWorker:
                         confirmation_required and self._stt_streams_partials
                     )
                     self._playback_candidate_streaming_evidence = False
+                    self._playback_candidate_short_partial = None
                     if echo_dominated or confirmation_required:
                         self._echo_suppressed = True
                         self._echo_recheck_countdown = self._echo_recheck_frames
@@ -571,17 +579,20 @@ class ConversationSessionWorker:
                         trusted_final_transcript = (
                             admitted_final[0] if admitted_final else None
                         )
-                    if trusted_final_transcript is not None:
-                        transcripts = (
-                            *transcripts,
-                            trusted_final_transcript,
-                        )
                     self._raise_if_closed()
                     if trusted_final_transcript is not None:
                         await self._confirm_interruption_from_transcript(
                             trusted_final_transcript
                         )
-                        self._utterance_has_final_transcript = True
+                        # A target can be replaced while finalization awaits. The
+                        # interruption check may revoke this capture; do not publish
+                        # or route its final against the replacement.
+                        admitted_final = self._with_playback_authority(
+                            (trusted_final_transcript,)
+                        )
+                        if admitted_final:
+                            transcripts = (*transcripts, *admitted_final)
+                            self._utterance_has_final_transcript = True
                     if (
                         self._interruption_committed
                         and not self._utterance_has_final_transcript
@@ -681,22 +692,58 @@ class ConversationSessionWorker:
         transcripts: tuple[Transcript, ...],
     ) -> tuple[Transcript, ...]:
         if self._playback_candidate_authority_revoked:
-            return ()
+            try:
+                return ()
+            finally:
+                for transcript in transcripts:
+                    if transcript.final:
+                        self._record_playback_final_refusal(transcript, revoked=True)
         if not self._playback_candidate_requires_streaming_evidence:
             return transcripts
         admitted: list[Transcript] = []
         for transcript in transcripts:
             if not transcript.final:
+                self._playback_candidate_short_partial = _short_transcript_key(transcript.text)
                 if sum(character.isalnum() for character in transcript.text) >= 3:
                     self._playback_candidate_streaming_evidence = True
                 admitted.append(transcript)
             elif self._playback_candidate_streaming_evidence:
                 admitted.append(transcript)
+            else:
+                accepted = False
+                try:
+                    key = _short_transcript_key(transcript.text)
+                    # These frames reach STT only after echo promotion. An explicit
+                    # verifier must have confirmed speech; None historically bypasses
+                    # that check and cannot authorize this additional short-final path.
+                    # Agreement is consistency, not independent recognition (the STT
+                    # wrapper can fall back to its last partial at the endpoint).
+                    accepted = (self._speech_presence_verifier is not None
+                                and key is not None
+                                and key == self._playback_candidate_short_partial)
+                    if accepted:
+                        admitted.append(transcript)
+                finally:
+                    if not accepted:
+                        self._record_playback_final_refusal(transcript)
         return tuple(admitted)
+
+    def _record_playback_final_refusal(
+        self, transcript: Transcript, *, revoked: bool = False,
+    ) -> None:
+        with contextlib.suppress(Exception):
+            print(_PLAYBACK_FINAL_REFUSAL_MARKER + json.dumps({
+                "version": 1,
+                "category": "authority_revoked" if revoked else "streaming_evidence_missing",
+                "short_partial_chars": len(self._playback_candidate_short_partial or ""),
+                "final_chars": min(4096, len(transcript.text)),
+                "speech_verifier": bool(self._speech_presence_verifier is not None),
+            }, separators=(",", ":")), flush=True)
 
     def _clear_playback_candidate_authority(self) -> None:
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
+        self._playback_candidate_short_partial = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id = None
         self._interruption_authority = None
