@@ -20,11 +20,13 @@ _VERSION = 1
 _KEY = re.compile(r"[0-9a-f]{32}\Z")
 _REQUEST_FIELDS = frozenset({"input", "instructions", "provider", "model", "model_options"})
 _LOGGER = logging.getLogger(__name__)
-# On Windows a transient open handle from any other process (a reader, an indexer, a scanner)
-# denies os.replace; the old record stays intact while the replace is retried. Callers reach
-# write_run_record through asyncio.to_thread (api.py), so the sleep never blocks the loop.
+# On Windows, os.replace was observed to be denied while another handle is open on the
+# record (a concurrent reader; an indexer or scanner would hold one the same way). The old
+# record stays intact while the replace is retried. Callers reach write_run_record through
+# asyncio.to_thread (api.py), so the sleep never blocks the loop.
 _REPLACE_ATTEMPTS = 20
 _REPLACE_RETRY_SECONDS = 0.01
+_REPLACE_DENIED_PREFIX = "[hermes-run-record-replace] "
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -61,7 +63,13 @@ def write_run_record(path: Path, data: bytes) -> None:
                 break
             except PermissionError:
                 if attempt == _REPLACE_ATTEMPTS - 1:
-                    raise
+                    try:
+                        raise
+                    finally:
+                        # Bounded evidence only: a category and a count, no path or text.
+                        print(_REPLACE_DENIED_PREFIX + json.dumps(
+                            {"category": "replace_denied", "attempts": _REPLACE_ATTEMPTS},
+                            separators=(",", ":")), flush=True)
                 time.sleep(_REPLACE_RETRY_SECONDS)
     except BaseException:
         with contextlib.suppress(OSError):

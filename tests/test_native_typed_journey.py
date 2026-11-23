@@ -1015,7 +1015,7 @@ def test_main_os_error_receipt_identifies_trusted_read_context_without_private_d
         monkeypatch.setattr(client, "execute", execute)
         argv.append("--execute")
     assert client.main(argv) == 1
-    assert attempts == [True] * client._OPEN_ATTEMPTS  # the reader retries, then fails closed
+    assert attempts == [True]
     output = capsys.readouterr()
     saved = json.loads(receipt.read_text()) if receipt.exists() else json.loads(
         output.out.removeprefix("[native-typed-journey] "))
@@ -1027,7 +1027,7 @@ def test_main_os_error_receipt_identifies_trusted_read_context_without_private_d
     }
     lines, first = inspect.getsourcelines(client.read_json)
     assert metadata["sourceLine"] == first + next(
-        i for i, line in enumerate(lines) if 'with _open_for_read(path)' in line)
+        i for i, line in enumerate(lines) if 'with path.open("rb")' in line)
     serialized = json.dumps(saved) + output.out + output.err
     assert "SYNTHETIC_PRIVATE_MESSAGE" not in serialized
     assert "SYNTHETIC_PRIVATE_PATH" not in serialized
