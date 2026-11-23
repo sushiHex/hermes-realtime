@@ -827,8 +827,28 @@ class SyntheticVoice:
         await self.meter.aclose()
 
 
+_OPEN_ATTEMPTS = 5
+_OPEN_RETRY_SECONDS = 0.01
+
+
+def _open_journal(path: Path) -> io.BufferedReader:
+    return path.open("rb")
+
+
+def _open_for_read(path: Path) -> io.BufferedReader:
+    """Retry only the PermissionError a host replace briefly causes; then fail closed."""
+    for attempt in range(_OPEN_ATTEMPTS):
+        try:
+            return _open_journal(path)
+        except PermissionError:
+            if attempt == _OPEN_ATTEMPTS - 1:
+                raise
+            time.sleep(_OPEN_RETRY_SECONDS)
+    raise AssertionError("unreachable")
+
+
 def read_json(path: Path, cap: int = 65_536) -> Any:
-    with path.open("rb") as stream:
+    with _open_for_read(path) as stream:
         raw = stream.read(cap + 1)
     require(len(raw) <= cap, "journey_file_bound")
     try:

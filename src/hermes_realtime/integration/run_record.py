@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,11 @@ _VERSION = 1
 _KEY = re.compile(r"[0-9a-f]{32}\Z")
 _REQUEST_FIELDS = frozenset({"input", "instructions", "provider", "model", "model_options"})
 _LOGGER = logging.getLogger(__name__)
+# On Windows a transient open handle from any other process (a reader, an indexer, a scanner)
+# denies os.replace; the old record stays intact while the replace is retried. Callers reach
+# write_run_record through asyncio.to_thread (api.py), so the sleep never blocks the loop.
+_REPLACE_ATTEMPTS = 20
+_REPLACE_RETRY_SECONDS = 0.01
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -49,7 +55,14 @@ def write_run_record(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == _REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(_REPLACE_RETRY_SECONDS)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(temporary)
