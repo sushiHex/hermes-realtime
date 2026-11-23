@@ -67,9 +67,11 @@ def write_run_record(path: Path, data: bytes) -> None:
                         raise
                     finally:
                         # Bounded evidence only: a category and a count, no path or text.
-                        print(_REPLACE_DENIED_PREFIX + json.dumps(
-                            {"category": "replace_denied", "attempts": _REPLACE_ATTEMPTS},
-                            separators=(",", ":")), flush=True)
+                        # Best effort: a failed write must never replace the original error.
+                        with contextlib.suppress(Exception):
+                            print(_REPLACE_DENIED_PREFIX + json.dumps(
+                                {"category": "replace_denied", "attempts": _REPLACE_ATTEMPTS},
+                                separators=(",", ":")), flush=True)
                 time.sleep(_REPLACE_RETRY_SECONDS)
     except BaseException:
         with contextlib.suppress(OSError):

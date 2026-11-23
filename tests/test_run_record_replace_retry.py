@@ -128,6 +128,27 @@ def test_writer_raises_original_error_after_bound_and_removes_temporary(
     assert "denied\"" not in out.replace('"replace_denied"', "") and str(tmp_path) not in out
 
 
+@pytest.mark.parametrize("failure", [BrokenPipeError(32, "pipe"), OSError(9, "bad"), ValueError()])
+def test_a_failed_evidence_write_never_replaces_the_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    path = tmp_path / "journal.json"
+    path.write_bytes(b"old")
+    error = PermissionError(13, "denied")
+    calls, _ = _replace_failing(monkeypatch, 10**6, error)
+
+    def broken_print(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(run_record, "print", broken_print, raising=False)
+    with pytest.raises(PermissionError) as raised:
+        write_run_record(path, b"new")
+    assert raised.value is error
+    assert len(calls) == run_record._REPLACE_ATTEMPTS
+    assert path.read_bytes() == b"old"
+    assert _temporaries(tmp_path) == []
+
+
 def test_writer_does_not_retry_other_oserror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
