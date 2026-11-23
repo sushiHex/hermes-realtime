@@ -174,6 +174,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "hermes-run-record-lock": {
         "src/hermes_realtime/integration/api.py": 1,
     },
+    "hermes-run-record-replace": {
+        "src/hermes_realtime/integration/run_record.py": 1,
+    },
     "hermes-tool-catalog": {
         "src/hermes_realtime/integration/api.py": 1,
         "src/hermes_realtime/integration/tool_catalog.py": 1,
