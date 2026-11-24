@@ -2176,7 +2176,9 @@ class StreamingSpeechLoop:
                     ) from None
                 raise
             finally:
-                self._report_consumer_failure(error, after_publication=after_publication)
+                self._report_consumer_failure(
+                    error, after_publication=after_publication, producer_result=producer_result,
+                )
 
     async def _prefetch_speech(
         self,
@@ -2929,14 +2931,24 @@ class StreamingSpeechLoop:
             }, separators=(",", ":")), flush=True)
 
     @staticmethod
-    def _report_consumer_failure(error: BaseException, *, after_publication: bool) -> None:
+    def _report_consumer_failure(
+        error: BaseException,
+        *,
+        after_publication: bool,
+        producer_result: asyncio.Future[None],
+    ) -> None:
         # This is the consumer's original exception, before cleanup can replace or group it.
         # Publication evidence is local to this turn; it does not establish model token arrival.
-        # Cancellation-only paths (interruption, or a producer failure already reported by the
-        # producer) are not failures and emit no marker.
-        if _is_cancellation_only(error):
-            return
-        with suppress(BaseException):
+        # Called from a finally, so nothing here may replace the original exception.
+        with suppress(Exception):
+            # Cancellation-only paths are not failures. The producer's own exception, which
+            # the consumer re-raises by awaiting producer_result, was reported by the producer.
+            if _is_cancellation_only(error) or (
+                producer_result.done()
+                and not producer_result.cancelled()
+                and producer_result.exception() is error
+            ):
+                return
             print("[foreground-failure] " + json.dumps({
                 "version": 1, "stage": "consumer",
                 "failure_kind": StreamingSpeechLoop._failure_kind(error),

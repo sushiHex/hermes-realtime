@@ -136,6 +136,93 @@ async def test_consumer_cancellation_emits_no_failure_marker(
         await loop.close()
 
 
+def all_markers(output):
+    prefix = "[foreground-failure] "
+    return [json.loads(line[len(prefix):]) for line in output.splitlines()
+            if line.startswith(prefix)]
+
+
+@pytest.mark.asyncio
+async def test_consumer_that_awaits_the_failed_producer_does_not_report_it_again(
+    monkeypatch, capsys,
+):
+    error = ValueError("PRIVATE producer failure")
+
+    class FailingInference:
+        async def stream(self, snapshot, *, turn_id):
+            raise error
+            yield "unreachable"
+
+        async def cancel(self, turn_id):
+            pass
+
+    foreground = ForegroundTurnCoordinator()
+
+    async def stalled_cancel_if_current(lease):
+        # Hold the failure monitor so the consumer reaches the producer result first and
+        # raises the producer's own exception instead of being cancelled.
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(foreground, "cancel_if_current", stalled_cancel_if_current)
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(), foreground=foreground,
+        inference=FailingInference(), synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(), ledger=DeliveredSpeechLedger(),
+    )
+    try:
+        with pytest.raises(ValueError) as caught:
+            await loop._run_turn(
+                "synthetic_producer_race", transcript=Transcript("Synthetic", final=True),
+                announcement=None, updates=(), update_operation=None,
+            )
+        assert caught.value is error
+        assert all_markers(capsys.readouterr().out) == [{
+            "version": 1, "stage": "producer", "failure_kind": "value",
+            "text_phase": "before_text",
+        }]
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_consumer_failure_after_an_admitted_publication_is_after_publication(
+    monkeypatch, capsys,
+):
+    published = asyncio.Event()
+    error = ValueError("PRIVATE consumer failure")
+
+    class PublishingInference:
+        async def stream(self, snapshot, *, turn_id):
+            yield "Synthetic publication with enough words to pass the initial speech buffer."
+            await asyncio.Future()
+            yield "unreachable"
+
+        async def cancel(self, turn_id):
+            pass
+
+    async def failed_next_after_publication(*args):
+        await asyncio.wait_for(published.wait(), 1)
+        raise error
+
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(), foreground=ForegroundTurnCoordinator(),
+        inference=PublishingInference(), synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(), ledger=DeliveredSpeechLedger(),
+        observer=lambda kind, data: published.set() if kind == "assistant_text_generated" else None,
+    )
+    monkeypatch.setattr(loop, "_next_prefetched_speech", failed_next_after_publication)
+    try:
+        with pytest.raises(ValueError) as caught:
+            await loop.respond("synthetic_after_publication", Transcript("Synthetic", final=True))
+        assert caught.value is error
+        assert all_markers(capsys.readouterr().out) == [{
+            "version": 1, "stage": "consumer", "failure_kind": "value",
+            "text_phase": "after_publication",
+        }]
+    finally:
+        await loop.close()
+
+
 @pytest.mark.asyncio
 async def test_consumer_phase_is_frozen_before_cleanup_allows_a_late_publication(
     monkeypatch, capsys,
