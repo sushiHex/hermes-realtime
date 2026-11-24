@@ -525,8 +525,10 @@ call occurred or identify the refusal's cause. A gateway configured with stdout
 discarded cannot recover markers from an earlier run.
 
 Foreground inference iteration/closure failures emit `[foreground-failure]` with a fixed version,
-component, exception-kind label and before/after-speech-text phase. Cancellation-only
-paths do not emit this failure marker. The existing child-output collector retains
+component, exception-kind label and before/after-speech-text phase. Speech-consumer failures
+emit the same marker with stage `consumer` and a before/after-publication phase taken from
+the consumer's original exception. Cancellation-only paths, including an ordinary
+interruption, do not emit this failure marker. The existing child-output collector retains
 only fixed category counts and drain-observation times in
 `child_output_metadata.host.categories`; arbitrary exception text and extra marker
 fields are excluded. Scalar observations continue after the raw-storage cap, with
