@@ -66,6 +66,7 @@ async def test_producer_failure_retains_typed_terminal_and_safe_marker(capsys, a
         markers = [line.removeprefix("[foreground-failure] ")
                    for line in capsys.readouterr().out.splitlines()
                    if line.startswith("[foreground-failure] ")]
+        # One root failure, one marker: the consumer must not re-report the producer's error.
         assert len(markers) == 1
         assert json.loads(markers[0]) == {
             "version": 1, "stage": "producer", "failure_kind": "value",

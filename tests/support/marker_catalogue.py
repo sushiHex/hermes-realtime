@@ -124,7 +124,7 @@ EMIT_SITES: dict[str, dict[str, int]] = {
         "src/hermes_realtime/conversation/worker.py": 1,
     },
     "foreground-failure": {
-        "src/hermes_realtime/conversation/streaming.py": 1,
+        "src/hermes_realtime/conversation/streaming.py": 2,
     },
     "hermes-bridge-dispatch": {
         "src/hermes_realtime/integration/bridge.py": 1,
@@ -942,7 +942,8 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "src/hermes_realtime/conversation/streaming.py": {
         "foreground-failure": (
-            "failure_kind: call: next((label for cls, label in ((ValueError, 'value'), (TypeErro~",
+            "failure_kind: call: StreamingSpeechLoop._failure_kind(error)",
+            "failure_kind: call: StreamingSpeechLoop._failure_kind(errors[0])",
         ),
     },
     "src/hermes_realtime/conversation/tasks.py": {
@@ -1112,6 +1113,9 @@ READERS: dict[str, dict[str, int]] = {
     "<any>": {
         "scripts/real_hermes_api_gate.py": 1,
         "scripts/rehearse_desktop_mvp.py": 1,
+    },
+    "codex-output-refusal": {
+        "scripts/lookup_backend_logs.py": 2,
     },
     "foreground-failure": {
         "scripts/lookup_backend_logs.py": 2,

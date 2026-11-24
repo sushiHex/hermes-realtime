@@ -23,15 +23,21 @@ def _foreground_failure_category(raw: bytes) -> str:
         or set(value) != {"version", "stage", "failure_kind", "text_phase"}
         or type(value["version"]) is not int
         or value["version"] != 1
-        or value["stage"] != "producer"
+        or type(value["stage"]) is not str
+        or value["stage"] not in {"producer", "consumer"}
         or type(value["failure_kind"]) is not str
         or value["failure_kind"]
         not in {"value", "type", "runtime", "timeout", "group", "refused", "other"}
         or type(value["text_phase"]) is not str
-        or value["text_phase"] not in {"before_text", "after_text"}
     ):
         raise ValueError("invalid foreground diagnostic")
-    return f"foreground_producer_{value['failure_kind']}_{value['text_phase']}"
+    phases = (
+        {"before_text", "after_text"} if value["stage"] == "producer"
+        else {"before_publication", "after_publication"}
+    )
+    if value["text_phase"] not in phases:
+        raise ValueError("invalid foreground diagnostic")
+    return f"foreground_{value['stage']}_{value['failure_kind']}_{value['text_phase']}"
 
 
 _HOST_STAGES = {"configuration", "host_construction", "host_start", "serving", "host_close"}
@@ -49,6 +55,24 @@ _CREDENTIAL_MARKERS = {
     b"[presentation-credential-refused] ":
         ("presentation_credential_", {"credential", "cleanup_unknown"}),
 }
+# Wire contract mirrored without importing the application during launcher startup.
+# A parity test binds this exactly to MODEL_OUTPUT_REFUSAL_CATEGORIES.
+_CODEX_OUTPUT_REFUSALS = frozenset({
+    "call_imitation", "unverified_claim", "unverified_lookup_claim", "unexpected_native_calls",
+    "unadvertised", "duplicate_keys", "decision_json", "decision_schema",
+    "reply_type", "reply_blank", "reply_length", "reply_unicode",
+    "objective_type", "objective_blank", "objective_length", "objective_unicode",
+})
+
+
+def _codex_output_refusal_category(raw: bytes) -> str:
+    value = json.loads(raw, object_pairs_hook=_unique_fields)
+    if (type(value) is not dict or set(value) != {"version", "refusal"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or type(value["refusal"]) is not str
+            or value["refusal"] not in _CODEX_OUTPUT_REFUSALS):
+        raise ValueError("invalid Codex output refusal diagnostic")
+    return "codex_output_refusal_" + value["refusal"]
 
 
 def _startup_failure_category(raw: bytes, host: bool) -> str:
@@ -142,6 +166,16 @@ class CappedCapture:
                 item["count"] = min(1000000, item["count"] + 1)
                 item["last_ns"] = now
                 return
+        codex_prefix = b"[codex-output-refusal] "
+        if raw.startswith(codex_prefix):
+            try:
+                name = _codex_output_refusal_category(raw[len(codex_prefix):])
+            except (ValueError, TypeError, RecursionError):
+                name = "codex_output_refusal_invalid"
+            item = self.categories.setdefault(name, {"count": 0, "first_ns": now, "last_ns": now})
+            item["count"] = min(1000000, item["count"] + 1)
+            item["last_ns"] = now
+            return
         prefix = b"[foreground-failure] "
         if raw.startswith(prefix):
             try:
