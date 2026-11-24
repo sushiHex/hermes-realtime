@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import sqlite3
+import sys
 import time
 from types import SimpleNamespace
 
@@ -1014,12 +1015,16 @@ def test_main_os_error_receipt_identifies_trusted_read_context_without_private_d
             client.read_journal(journal)
         monkeypatch.setattr(client, "execute", execute)
         argv.append("--execute")
+    monkeypatch.setattr(client.time, "sleep", lambda _: None)
     assert client.main(argv) == 1
-    assert attempts == [True]
+    # Only the journal read retries, and only within its bound; the scenario read never does.
+    bound = client._JOURNAL_READ_ATTEMPTS if role == "journal" else 1
+    assert attempts == [True] * bound
     output = capsys.readouterr()
     saved = json.loads(receipt.read_text()) if receipt.exists() else json.loads(
         output.out.removeprefix("[native-typed-journey] "))
     assert saved["failure"] == "PermissionError" and saved["outcome"] == "refused"
+    assert saved.get("journalReadDenials") == (bound if role == "journal" else None)
     metadata = saved["osError"]
     assert metadata == {
         "sourceFunction": "read_json", "sourceLine": metadata["sourceLine"],
@@ -1032,6 +1037,121 @@ def test_main_os_error_receipt_identifies_trusted_read_context_without_private_d
     assert "SYNTHETIC_PRIVATE_MESSAGE" not in serialized
     assert "SYNTHETIC_PRIVATE_PATH" not in serialized
     assert str(tmp_path) not in serialized
+
+
+def _deny_journal_opens(monkeypatch, client, journal, errors):
+    """Fail the next ``len(errors)`` opens of ``journal``; record sleeps instead of sleeping."""
+    from pathlib import Path
+
+    original, pending, sleeps = Path.open, list(errors), []
+
+    def open_file(path, *args, **kwargs):
+        if path == journal and pending:
+            raise pending.pop(0)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_file)
+    monkeypatch.setattr(client.time, "sleep", sleeps.append)
+    return pending, sleeps
+
+
+def _journal(tmp_path):
+    journal = tmp_path / "state" / "hermes-runs-v1.json"
+    journal.parent.mkdir()
+    journal.write_text(json.dumps({"version": 3, "pending": [], "admitted": []}))
+    return journal
+
+
+def test_journal_read_retries_a_denied_open_and_the_receipt_counts_each_denial(
+    tmp_path, monkeypatch, capsys,
+):
+    import scripts.native_typed_journey as client
+    _, receipt, argv = os_error_options(tmp_path)
+    journal = _journal(tmp_path)
+    pending, sleeps = _deny_journal_opens(
+        monkeypatch, client, journal, [PermissionError(13, "SYNTHETIC")] * 3)
+
+    async def execute(options, steps, result):
+        assert client.read_journal(journal) == (set(), 0)
+        result["outcome"] = "completed"
+
+    monkeypatch.setattr(client, "execute", execute)
+    assert client.main([*argv, "--execute"]) == 0
+    assert pending == [] and sleeps == [client._JOURNAL_READ_RETRY_SECONDS] * 3
+    saved = json.loads(receipt.read_text())
+    assert saved["outcome"] == "completed" and saved["journalReadDenials"] == 3
+    # The count belongs to one run: a later run with no denial records none.
+    receipt.unlink()
+    assert client.main([*argv, "--execute"]) == 0
+    assert "journalReadDenials" not in json.loads(receipt.read_text())
+    assert "SYNTHETIC" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("error", [OSError(5, "SYNTHETIC"), IsADirectoryError(21, "SYNTHETIC")])
+def test_journal_read_does_not_retry_other_os_errors(tmp_path, monkeypatch, error):
+    import scripts.native_typed_journey as client
+    journal = _journal(tmp_path)
+    pending, sleeps = _deny_journal_opens(monkeypatch, client, journal, [error, error])
+    with pytest.raises(OSError) as caught:
+        client.read_journal(journal)
+    assert caught.value is error and len(pending) == 1 and sleeps == []
+
+
+def test_journal_read_exhaustion_raises_the_last_original_error(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+    journal = _journal(tmp_path)
+    errors = [PermissionError(13, "SYNTHETIC") for _ in range(client._JOURNAL_READ_ATTEMPTS + 1)]
+    pending, sleeps = _deny_journal_opens(monkeypatch, client, journal, errors)
+    with pytest.raises(PermissionError) as caught:
+        client.read_journal(journal)
+    assert caught.value is errors[client._JOURNAL_READ_ATTEMPTS - 1]
+    assert len(pending) == 1 and len(sleeps) == client._JOURNAL_READ_ATTEMPTS - 1
+
+
+def test_a_missing_journal_is_still_empty_without_a_retry(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+    sleeps = []
+    monkeypatch.setattr(client.time, "sleep", sleeps.append)
+    monkeypatch.setattr(client, "_journal_read_denials", 0)
+    assert client.read_journal(tmp_path / "absent.json") == (set(), 0)
+    assert sleeps == [] and client._journal_read_denials == 0
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows file-sharing semantics")
+@pytest.mark.timeout(60)
+def test_journal_reads_survive_200_real_host_replaces(tmp_path, monkeypatch):
+    """The host's real writer replaces the journal 200 times while the client reads it in a
+    loop: no read fails. Denials are counted, not asserted: their rate is not a contract."""
+    import threading
+
+    import scripts.native_typed_journey as client
+    from hermes_realtime.integration.run_record import write_run_record
+    journal = _journal(tmp_path)
+    raw = journal.read_bytes()
+    monkeypatch.setattr(client, "_journal_read_denials", 0)
+    errors, stop = [], threading.Event()
+
+    def writer():
+        try:
+            for _ in range(200):
+                if stop.is_set():
+                    return
+                write_run_record(journal, raw)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    reads = 0
+    try:
+        while thread.is_alive():
+            assert client.read_journal(journal) == (set(), 0)
+            reads += 1
+    finally:
+        stop.set()
+        thread.join(timeout=30)
+    assert not thread.is_alive() and errors == [] and reads > 0
+    print(f"reads={reads} denied={client._journal_read_denials}")
 
 
 def test_passive_os_metadata_keeps_original_reader_exception(tmp_path, monkeypatch):

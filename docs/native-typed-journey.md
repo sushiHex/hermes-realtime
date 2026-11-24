@@ -153,6 +153,13 @@ No exception message, filename, frame locals or credentials are retained. Pair
 the context with the client revision used for the check. Collection is best
 effort; it adds no reads or retries and does not change failure or cleanup rules.
 
+The host replaces the run journal atomically, and on Windows a plain open of it
+was observed to be denied while a replace is in flight. The journal read alone
+therefore retries a `PermissionError`, at most 20 attempts 10 ms apart, and then
+raises the original error. No other read and no other error is retried. A receipt
+whose run saw any denied journal open carries `journalReadDenials`, the count;
+the key is absent when there were none.
+
 Warm measurements require matching turn ID **and** generation. A foreground
 pair is bound only after the matching typed admission and user transcript;
 background/replayed speech cannot supply that pair. Missing identities remain

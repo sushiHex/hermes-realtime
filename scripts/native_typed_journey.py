@@ -917,13 +917,29 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
     return value["steps"]
 
 
+# The host replaces the run journal atomically. On Windows a plain open was observed to be
+# denied while that replace is in flight, so only the journal read retries, only on
+# PermissionError, within a fixed bound. Every denial is counted into the receipt.
+_JOURNAL_READ_ATTEMPTS = 20
+_JOURNAL_READ_RETRY_SECONDS = 0.01
+_journal_read_denials = 0
+
+
 def read_journal(path: Path) -> tuple[set[str], int]:
-    try:
-        value = read_json(path)
-    except FileNotFoundError:
-        # A fresh native adapter has not created its first run record yet.
-        # This never supplies an admitted ID or qualifies a dispatch.
-        return set(), 0
+    global _journal_read_denials
+    for attempt in range(_JOURNAL_READ_ATTEMPTS):
+        try:
+            value = read_json(path)
+            break
+        except FileNotFoundError:
+            # A fresh native adapter has not created its first run record yet.
+            # This never supplies an admitted ID or qualifies a dispatch.
+            return set(), 0
+        except PermissionError:
+            _journal_read_denials += 1
+            if attempt == _JOURNAL_READ_ATTEMPTS - 1:
+                raise
+            time.sleep(_JOURNAL_READ_RETRY_SECONDS)
     require(
         type(value) is dict
         and set(value) == {"version", "pending", "admitted"}
@@ -2429,6 +2445,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--execute", action="store_true")
     options = parser.parse_args(argv)
+    global _journal_read_denials
+    _journal_read_denials = 0
     receipt: dict[str, Any] = {"version": 1, "outcome": "refused", "executed": False}
     reserved = None
     try:
@@ -2458,6 +2476,8 @@ def main(argv: list[str] | None = None) -> int:
             with contextlib.suppress(Exception):
                 receipt["osError"] = _os_error_evidence(error)
     finally:
+        if _journal_read_denials:
+            receipt["journalReadDenials"] = _journal_read_denials
         raw = json.dumps(receipt, sort_keys=True)
         if len(raw) > 65_536 and "diagnostics" in receipt:
             # Diagnosis is the most optional evidence: it goes first, never the verdict.
