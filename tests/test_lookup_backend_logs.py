@@ -46,7 +46,7 @@ def test_refused_foreground_failure_is_counted_not_invalid(tmp_path):
     assert facts["categories"]["foreground_producer_refused_after_text"]["count"] == 1
 
 
-@pytest.mark.parametrize("kind", ["value", "cancelled", "group"])
+@pytest.mark.parametrize("kind", ["value", "group"])
 def test_consumer_failure_survives_normal_stop_without_raw_output(tmp_path, kind):
     owner = SimpleNamespace(roots={}, stop_all=lambda containment: None)
     collector = CappedProcesses(owner, tmp_path)
@@ -78,6 +78,7 @@ def test_unterminated_final_marker_is_counted_exactly_once(tmp_path):
     {"stage": "producer", "text_phase": "after_publication"},
     {"stage": "consumer", "failure_kind": "PRIVATE", "text_phase": "before_publication"},
     {"stage": "producer", "failure_kind": "cancelled"},
+    {"stage": "consumer", "failure_kind": "cancelled", "text_phase": "before_publication"},
     {"version": True}, {"version": 2},
     {"message": "SYNTHETIC_PRIVATE_EXCEPTION"},
 ])

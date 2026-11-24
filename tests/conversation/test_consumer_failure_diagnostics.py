@@ -95,7 +95,7 @@ async def test_pretext_consumer_error_retains_original_and_cleanup_outcome(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("after_publication", [False, True])
-async def test_consumer_cancellation_is_not_classified_as_provider_failure(
+async def test_consumer_cancellation_emits_no_failure_marker(
     capsys, after_publication,
 ):
     entered = asyncio.Event()
@@ -127,10 +127,8 @@ async def test_consumer_cancellation_is_not_classified_as_provider_failure(
         await loop.cancel()
         with pytest.raises(asyncio.CancelledError):
             await response
-        assert consumer_markers(capsys.readouterr().out) == [{
-            "version": 1, "stage": "consumer", "failure_kind": "cancelled",
-            "text_phase": "after_publication" if after_publication else "before_publication",
-        }]
+        # An ordinary interruption is not a failure (docs/ordinary-lookup-setup.md).
+        assert "[foreground-failure]" not in capsys.readouterr().out
     finally:
         if not response.done():
             response.cancel()

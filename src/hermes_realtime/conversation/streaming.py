@@ -2932,6 +2932,10 @@ class StreamingSpeechLoop:
     def _report_consumer_failure(error: BaseException, *, after_publication: bool) -> None:
         # This is the consumer's original exception, before cleanup can replace or group it.
         # Publication evidence is local to this turn; it does not establish model token arrival.
+        # Cancellation-only paths (interruption, or a producer failure already reported by the
+        # producer) are not failures and emit no marker.
+        if _is_cancellation_only(error):
+            return
         with suppress(BaseException):
             print("[foreground-failure] " + json.dumps({
                 "version": 1, "stage": "consumer",
@@ -2941,8 +2945,7 @@ class StreamingSpeechLoop:
 
     @staticmethod
     def _failure_kind(error: BaseException) -> str:
-        if _is_cancellation_only(error):
-            return "cancelled"
+        # Callers report only non-cancellation failures, so "cancelled" is not a category.
         if isinstance(error, BaseExceptionGroup):
             return "group"
         if type(error) is ModelOutputRefused:

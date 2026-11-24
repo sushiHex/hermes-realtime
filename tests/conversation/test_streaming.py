@@ -1466,13 +1466,7 @@ async def test_cancelled_assistant_turn_projects_exact_terminal_identity(capsys)
         "assistant_turn_interrupted",
         {"turnId": "turn_001", "turnGeneration": 1},
     )
-    markers = [json.loads(line.removeprefix("[foreground-failure] "))
-               for line in capsys.readouterr().out.splitlines()
-               if line.startswith("[foreground-failure] ")]
-    assert markers == [{
-        "version": 1, "stage": "consumer", "failure_kind": "cancelled",
-        "text_phase": "after_publication",
-    }]
+    assert "[foreground-failure]" not in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
