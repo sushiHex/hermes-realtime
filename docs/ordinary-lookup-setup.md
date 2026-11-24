@@ -526,9 +526,11 @@ discarded cannot recover markers from an earlier run.
 
 Foreground inference iteration/closure failures emit `[foreground-failure]` with a fixed version,
 component, exception-kind label and before/after-speech-text phase. Speech-consumer failures
-emit the same marker with stage `consumer` and a before/after-publication phase taken from
-the consumer's original exception. Cancellation-only paths, including an ordinary
-interruption, do not emit this failure marker. The existing child-output collector retains
+emit the same marker with stage `consumer`; its before/after-publication phase records whether
+a publication had been admitted for this turn when the consumer's original exception was
+caught. Admitted text is not heard speech. A producer failure that the consumer re-raises is
+reported once, by the producer. Cancellation-only paths, including an ordinary interruption
+and an interruption whose cleanup then fails, do not emit a consumer failure marker. The existing child-output collector retains
 only fixed category counts and drain-observation times in
 `child_output_metadata.host.categories`; arbitrary exception text and extra marker
 fields are excluded. Scalar observations continue after the raw-storage cap, with
