@@ -155,10 +155,13 @@ effort; it adds no reads or retries and does not change failure or cleanup rules
 
 The host replaces the run journal atomically, and on Windows a plain open of it
 was observed to be denied while a replace is in flight. The journal read alone
-therefore retries a `PermissionError`, at most 20 attempts 10 ms apart, and then
-raises the original error. No other read and no other error is retried. A receipt
-whose run saw any denied journal open carries `journalReadDenials`, the count;
-the key is absent when there were none.
+therefore retries a `PermissionError`, at most 50 attempts 20 ms apart, and then
+raises the last denial unchanged. It yields to the event loop between attempts.
+No other read and no other error is retried. A receipt whose run saw any denied
+journal open carries `journalReadDenials`, the count; the key is absent when
+there were none, and is dropped like other optional evidence if it would
+overflow the receipt. Treat timings in a receipt that carries it with care:
+each retry delayed that poll.
 
 Warm measurements require matching turn ID **and** generation. A foreground
 pair is bound only after the matching typed admission and user transcript;

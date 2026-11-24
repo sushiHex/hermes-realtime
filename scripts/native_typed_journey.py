@@ -917,29 +917,13 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
     return value["steps"]
 
 
-# The host replaces the run journal atomically. On Windows a plain open was observed to be
-# denied while that replace is in flight, so only the journal read retries, only on
-# PermissionError, within a fixed bound. Every denial is counted into the receipt.
-_JOURNAL_READ_ATTEMPTS = 20
-_JOURNAL_READ_RETRY_SECONDS = 0.01
-_journal_read_denials = 0
-
-
 def read_journal(path: Path) -> tuple[set[str], int]:
-    global _journal_read_denials
-    for attempt in range(_JOURNAL_READ_ATTEMPTS):
-        try:
-            value = read_json(path)
-            break
-        except FileNotFoundError:
-            # A fresh native adapter has not created its first run record yet.
-            # This never supplies an admitted ID or qualifies a dispatch.
-            return set(), 0
-        except PermissionError:
-            _journal_read_denials += 1
-            if attempt == _JOURNAL_READ_ATTEMPTS - 1:
-                raise
-            time.sleep(_JOURNAL_READ_RETRY_SECONDS)
+    try:
+        value = read_json(path)
+    except FileNotFoundError:
+        # A fresh native adapter has not created its first run record yet.
+        # This never supplies an admitted ID or qualifies a dispatch.
+        return set(), 0
     require(
         type(value) is dict
         and set(value) == {"version", "pending", "admitted"}
@@ -957,6 +941,28 @@ def read_journal(path: Path) -> tuple[set[str], int]:
         "journey_journal_identity",
     )
     return set(ids), len(value["pending"])
+
+
+# The host replaces the run journal atomically. On Windows a plain open was observed to be
+# denied while that replace is in flight, so the journey's journal reads retry, only on
+# PermissionError, within a fixed bound, yielding to the loop between attempts so audio
+# pacing and metering continue. Every denial is counted into the receipt.
+_JOURNAL_READ_ATTEMPTS = 50
+_JOURNAL_READ_RETRY_SECONDS = 0.02
+_journal_read_denials = 0
+
+
+async def journal_snapshot(path: Path) -> tuple[set[str], int]:
+    global _journal_read_denials
+    for attempt in range(_JOURNAL_READ_ATTEMPTS):
+        try:
+            return read_journal(path)
+        except PermissionError:
+            _journal_read_denials += 1
+            if attempt == _JOURNAL_READ_ATTEMPTS - 1:
+                raise
+        await asyncio.sleep(_JOURNAL_READ_RETRY_SECONDS)
+    raise AssertionError("unreachable")
 
 
 class EventTracker:
@@ -1311,7 +1317,7 @@ class Journey:
         return value
 
     async def poll(self) -> None:
-        ids, self.pending = read_journal(self.journal)
+        ids, self.pending = await journal_snapshot(self.journal)
         self.admissions.update(ids)
         require(len(self.admissions) <= 12, "journey_admission_bound")
         if time.monotonic() >= self.expiry:
@@ -1332,7 +1338,7 @@ class Journey:
             self.credential = value
             self.expiry = time.monotonic() + value["expiresInSeconds"] / 2
         value = await self.request("events", {"after": self.tracker.cursor})
-        ids, self.pending = read_journal(self.journal)
+        ids, self.pending = await journal_snapshot(self.journal)
         self.admissions.update(ids)
         require(len(self.admissions) <= 12, "journey_admission_bound")
         require(value.get("version") == 2, "journey_event_version")
@@ -2300,7 +2306,7 @@ class Journey:
                 )
                 await self.wait(lambda task=task: self.tracker.tasks.get(task) in TERMINAL, 45)
                 await self.collect(label)
-        return read_journal(self.journal) == (set(), 0)
+        return await journal_snapshot(self.journal) == (set(), 0)
 
 
 async def execute(options, steps, receipt) -> None:
@@ -2310,7 +2316,7 @@ async def execute(options, steps, receipt) -> None:
     from livekit import rtc
 
     require(
-        read_journal(options.preview_dir / "state/hermes-runs-v1.json") == (set(), 0),
+        await journal_snapshot(options.preview_dir / "state/hermes-runs-v1.json") == (set(), 0),
         "journey_initial_work",
     )
     credential, journey, room, bootstrap_code = None, None, None, None
@@ -2357,7 +2363,7 @@ async def execute(options, steps, receipt) -> None:
         for label in journey.bindings:
             if label not in journey.results:
                 await journey.collect(label)
-        require(read_journal(journey.journal) == (set(), 0), "journey_unsettled")
+        require(await journal_snapshot(journey.journal) == (set(), 0), "journey_unsettled")
         receipt["outcome"] = "completed"
     finally:
         receipt["cleanup"] = {
@@ -2494,6 +2500,9 @@ def main(argv: list[str] | None = None) -> int:
         if "osError" in receipt and len(raw) > 65_536:
             # Optional evidence cannot make a previously fitting receipt fail.
             receipt.pop("osError")
+            raw = json.dumps(receipt, sort_keys=True)
+        if "journalReadDenials" in receipt and len(raw) > 65_536:
+            receipt.pop("journalReadDenials")  # the same rule: optional evidence
             raw = json.dumps(receipt, sort_keys=True)
         if reserved is not None:
             with reserved:
