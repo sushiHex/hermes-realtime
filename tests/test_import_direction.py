@@ -20,7 +20,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "src" / PACKAGE
 # of each other. Placing a unit here is a design decision: review it as one.
 TIERS: tuple[frozenset[str], ...] = (
     # Contracts: depend on nothing else in the package.
-    frozenset({"__init__", "protocol", "speech"}),
+    frozenset({"__init__", "markers", "protocol", "speech"}),
     # The deterministic core: depends only on the contracts.
     frozenset({"conversation"}),
     # Shared facts and instrumentation that the core must not reach.
