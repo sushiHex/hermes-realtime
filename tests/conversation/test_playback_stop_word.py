@@ -39,6 +39,7 @@ from hermes_realtime.conversation import (
     StreamingSpeechLoop,
 )
 from hermes_realtime.conversation import worker as worker_module
+from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.task_proposals import (
     ConversationTaskProposals,
     HostTaskProposalRequest,
@@ -56,10 +57,11 @@ from hermes_realtime.speech import (
     Transcript,
     VoiceActivity,
 )
-from tests.conversation.test_actions import RecordingInference, Synthesizer
+from tests.conversation.test_actions import RecordingInference
 from tests.conversation.test_deferred_cancel_note import _GatedPlayback
 from tests.conversation.test_idle_cancel_note import _until
 from tests.conversation.test_proposal_capture import CommandSurface
+from tests.conversation.test_streaming import SegmentSynthesizer
 from tests.conversation.test_tasks import QueuedUpdateSession
 from tests.conversation.test_worker import (
     ScriptedEchoGuard,
@@ -420,15 +422,46 @@ async def test_a_text_echo_from_an_unfinished_capture_does_not_refuse_the_next_s
 _TASK_TEXT = "task: Keep working on the synthetic background task."
 
 
-class _BargeInPlayback(_GatedPlayback):
-    """Held playback that also accepts the barge-in's finish-the-word request."""
+class _TwoSegmentInference(RecordingInference):
+    first = "The first complete answer has enough words to stay separately spoken."
+    second = "The second complete answer has enough words to stay separately spoken."
 
-    def __init__(self) -> None:
+    async def _stream(
+        self, snapshot: ConversationContextSnapshot, *, turn_id: str
+    ) -> AsyncIterator[str]:
+        del turn_id
+        self.requests.append(snapshot)  # type: ignore[arg-type]
+        yield self.first
+        yield self.second
+
+
+class _BargeInPlayback(_GatedPlayback):
+    """Held playback that records what it played and accepts finish-the-word.
+
+    Armed, it holds the next chunk; with ``hold_second`` it plays the first segment
+    through (delivered) and holds the second, leaving a resumable unheard suffix.
+    """
+
+    def __init__(self, *, hold_second: bool = False) -> None:
         super().__init__()
+        self.hold_second = hold_second
+        self.played: list[str] = []
         self.barge_in_turn_ids: list[str] = []
 
     def finish_word_on_cancel(self, turn_id: str) -> None:
         self.barge_in_turn_ids.append(turn_id)
+
+    async def play(self, chunk: Any, *, is_valid: Any) -> None:
+        if not is_valid():
+            raise asyncio.CancelledError
+        self.played.append(chunk.text)
+        if not self.armed or (self.hold_second and chunk.text != _TwoSegmentInference.second):
+            return
+        self.armed = False
+        self.started.set()
+        await self.release.wait()
+        if not is_valid():
+            raise asyncio.CancelledError
 
 
 @dataclass
@@ -479,7 +512,9 @@ class _ScriptedTranscriber:
 
 @asynccontextmanager
 async def _stack(
-    *captures: tuple[tuple[str, ...], str], recent_playback: bool = False
+    *captures: tuple[tuple[str, ...], str],
+    recent_playback: bool = False,
+    hold_second: bool = False,
 ) -> AsyncIterator[_Stack]:
     context = ConversationContextStore()
     session = QueuedUpdateSession()
@@ -498,11 +533,11 @@ async def _stack(
         controller=controller, context=context, observer=observe,
         reserve_observer_capacity=lambda: None,
     )
-    inference = RecordingInference()
-    playback = _BargeInPlayback()
+    inference = _TwoSegmentInference() if hold_second else RecordingInference()
+    playback = _BargeInPlayback(hold_second=hold_second)
     speech = StreamingSpeechLoop(
         context=context, foreground=ForegroundTurnCoordinator(), inference=inference,
-        synthesizer=Synthesizer(), playback=playback, ledger=DeliveredSpeechLedger(),
+        synthesizer=SegmentSynthesizer(), playback=playback, ledger=DeliveredSpeechLedger(),
     )
 
     async def record_command_input(text: str) -> None:
@@ -634,6 +669,36 @@ async def test_spoken_stop_silences_speech_that_started_after_a_tail_onset(
         await _assert_next_spoken_utterance_is_a_turn(stack, task)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "partials", [(), ("Stop",)], ids=["no-partial", "streaming-partial"]
+)
+async def test_consumed_stop_word_does_not_resume_the_interrupted_reply(
+    partials: tuple[str, ...],
+) -> None:
+    first, second = _TwoSegmentInference.first, _TwoSegmentInference.second
+    async with _stack((partials, "Stop."), *_NEXT, hold_second=True) as stack:
+        task = await _start_task(stack)
+        await _start_speaking(stack)
+        # The first segment was heard; the second is playing when "Stop." arrives.
+        assert stack.playback.played == [first, second]
+
+        await stack.speak()
+        await _assert_stopped_without_a_turn(stack, task)
+
+        # Nothing replayed the unheard suffix, which is still retained as resumable.
+        assert stack.playback.played == [first, second]
+        assert stack.executor._speech._resumable_speech is not None
+        (heard,) = [
+            row for row in stack.context.durable_view().messages if row.role == "assistant"
+        ]
+        assert (heard.text, heard.interrupted) == (first, True)
+
+        await _assert_next_spoken_utterance_is_a_turn(stack, task)
+        # Only fresh replies followed; the cut-off suffix was never replayed on its own.
+        assert stack.playback.played == [first, second, first, second, first, second]
+
+
 # --- Pending proposals: a consumed stop word is intervening input, never a confirmation ---
 
 
@@ -706,3 +771,22 @@ async def test_consumed_stop_word_retires_a_pending_proposal(
         assert [transcript.text for _turn, transcript in responses] == ["yes"]
     finally:
         await worker.close()
+
+
+class _RouterWithoutInterveningInput:
+    async def route(self, text: str) -> bool:
+        del text
+        return False
+
+    route_spoken = route
+
+
+def test_a_command_router_without_the_intervening_input_hook_fails_at_construction() -> None:
+    # Checked when the worker is built, not when a stop word is first consumed.
+    actions, _cancelled, _responses = action_executor_probe()
+    with pytest.raises(TypeError, match=r"command_router must provide intervening_spoken_input"):
+        ConversationSessionWorker(
+            participant_identity="participant", session_generation=1,
+            vad=ScriptedVad(), stt=_ScriptedTranscriber(), actions=actions,
+            command_router=_RouterWithoutInterveningInput(),  # type: ignore[arg-type]
+        )

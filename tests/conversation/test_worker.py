@@ -288,6 +288,9 @@ class CommandRouterProbe:
 
     route_spoken = route
 
+    def intervening_spoken_input(self) -> None:
+        return None
+
 
 class EvidenceCommandRouterProbe:
     def __init__(self, owner: EvidenceLifecycleOwner) -> None:
@@ -310,6 +313,9 @@ class EvidenceCommandRouterProbe:
         )
 
     route_spoken = route
+
+    def intervening_spoken_input(self) -> None:
+        return None
 
 
 def action_executor_probe() -> tuple[
