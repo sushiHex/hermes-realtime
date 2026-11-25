@@ -140,14 +140,17 @@ _RECEIVE_AUDIO_CONTEXT_STATES = frozenset({"running", "suspended", "closed", "in
 
 @dataclass(frozen=True, slots=True)
 class BrowserReceiveSample:
-    """Content-free deltas of the speech track's inbound audio stats around one chunk end.
+    """Content-free deltas of the speech track's inbound audio stats for one delivered publication.
 
+    The window runs from the start of the publication's last chunk to 500 ms after its end.
     ``None`` means the browser did not report the field; it is never read as zero.
+    ``stats_read`` is false when a stats read failed; such a sample carries no delta field.
     """
 
     MAX_PER_BINDING: ClassVar[int] = 2_048
 
     window_ms: int
+    stats_read: bool
     duck_active: bool
     page_uptime_s: int
     room_uptime_s: int
@@ -160,8 +163,8 @@ class BrowserReceiveSample:
     mean_target_delay_ms: int | None
 
     def __post_init__(self) -> None:
-        if type(self.duck_active) is not bool:
-            raise TypeError("receive sample duck_active must be an exact boolean")
+        if type(self.duck_active) is not bool or type(self.stats_read) is not bool:
+            raise TypeError("receive sample flags must be exact booleans")
         bounded: tuple[tuple[int | None, int, bool], ...] = (
             (self.window_ms, 600_000, True),
             (self.page_uptime_s, 31_536_000, True),
@@ -185,11 +188,16 @@ class BrowserReceiveSample:
             or self.audio_context not in _RECEIVE_AUDIO_CONTEXT_STATES
         ):
             raise ValueError("receive sample audio context state is invalid")
+        if not self.stats_read and any(
+            value is not None for value, _, required in bounded if not required
+        ):
+            raise ValueError("an unread receive sample must not carry a delta field")
 
     def evidence(self, generation: int) -> dict[str, int | bool | str]:
         evidence: dict[str, int | bool | str] = {"version": 1, "generation": generation}
         for name, value in (
             ("window_ms", self.window_ms),
+            ("stats_read", self.stats_read),
             ("removed_samples_for_acceleration", self.removed_samples_for_acceleration),
             ("inserted_samples_for_deceleration", self.inserted_samples_for_deceleration),
             ("concealed_samples", self.concealed_samples),

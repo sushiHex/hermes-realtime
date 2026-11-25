@@ -1,6 +1,8 @@
-// Content-free receive-side evidence around the end of each delivered speech chunk (#556).
-// Only integer deltas of the speech track's inbound audio counters, two uptimes, the duck flag
-// and a closed audio-context enum leave the page: no text, identifiers, track ids or audio.
+// Content-free receive-side evidence around the end of each delivered speech publication (#556).
+// One sample per delivered publication, windowed from the start of its LAST chunk (each chunk
+// start replaces the baseline) to 500 ms after the publication's end. Only integer deltas of the
+// speech track's inbound audio counters, whether both stats reads succeeded, two uptimes, the
+// duck flag and a closed audio-context enum leave the page: no text, ids, track ids or audio.
 
 const COUNTER_FIELDS = [
   "removedSamplesForAcceleration",
@@ -48,8 +50,11 @@ export interface ReceiveStatsContext {
   readonly roomUptimeS: number;
 }
 
+// statsRead is false when either read failed, timed out or found no inbound audio entry; the
+// deltas are then all absent, so a failed read never looks like an unobserved publication.
 export type ReceiveStatsSample = ReceiveStatsDelta & {
   readonly windowMs: number;
+  readonly statsRead: boolean;
   readonly duckActive: boolean;
   readonly audioContext?: AudioContextStateName;
   readonly pageUptimeS: number;
@@ -134,11 +139,54 @@ export interface ReceiveStatsSamplerOptions {
   readonly cap?: number;
 }
 
-// Each call returns at once and never throws; every read is time-bound and any failure drops
-// that one sample. Attempts, failed or not, count toward the cap.
+interface EndedContext {
+  readonly duckActive: boolean;
+  readonly audioContext: AudioContextStateName | null;
+  readonly pageUptimeS: number;
+  readonly roomUptimeS: number;
+  readonly endedAt: number;
+}
+
+// Why a delivered publication was not sampled. "capped" is returned once, then "ignored".
+export type ReceiveStatsDisposition =
+  | "sampled"
+  | "capped"
+  | "ignored"
+  | "busy"
+  | "invalid-context";
+
+function sampleFrom(
+  ended: EndedContext,
+  before: Snapshot | null,
+  after: Snapshot | null,
+): ReceiveStatsSample {
+  const startAt = before?.at ?? ended.endedAt;
+  const endAt = after?.at ?? startAt;
+  const span = Math.round(endAt - startAt);
+  const windowMs = Number.isFinite(span) ? Math.min(Math.max(span, 0), MAX_RECEIVE_WINDOW_MS) : 0;
+  const beforeCounters = before === null ? null : before.counters;
+  const afterCounters = after === null ? null : after.counters;
+  const statsRead = beforeCounters !== null && afterCounters !== null;
+  return {
+    windowMs,
+    statsRead,
+    ...(beforeCounters !== null && afterCounters !== null
+      ? receiveStatsDelta(beforeCounters, afterCounters)
+      : {}),
+    duckActive: ended.duckActive,
+    ...(ended.audioContext === null ? {} : { audioContext: ended.audioContext }),
+    pageUptimeS: ended.pageUptimeS,
+    roomUptimeS: ended.roomUptimeS,
+  };
+}
+
+// Each call returns at once and never throws. Every read is time-bound, and every admitted
+// publication submits exactly one sample from a `finally`: a failed read is reported as
+// statsRead=false, never dropped. Admitted attempts count toward the cap.
 export class ReceiveStatsSampler {
   private baseline: Promise<Snapshot> | null = null;
   private attempts = 0;
+  private capReported = false;
   private inFlight = 0;
   private readonly cap: number;
 
@@ -146,53 +194,63 @@ export class ReceiveStatsSampler {
     this.cap = options.cap ?? RECEIVE_SAMPLE_CAP;
   }
 
+  // Each chunk start replaces the baseline, so a publication of several chunks is windowed
+  // from its last chunk's start. A stale first-chunk baseline would outlive an interrupted reply.
   chunkStarted(): void {
     if (this.attempts >= this.cap) return;
     this.baseline = this.snapshot();
   }
 
-  chunkEnded(context: () => ReceiveStatsContext): void {
-    if (this.attempts >= this.cap || this.inFlight >= MAX_IN_FLIGHT) return;
+  publicationDelivered(context: ReceiveStatsContext): ReceiveStatsDisposition {
+    if (this.attempts >= this.cap) {
+      if (this.capReported) return "ignored";
+      this.capReported = true;
+      return "capped";
+    }
+    if (this.inFlight >= MAX_IN_FLIGHT) return "busy";
+    let ended: EndedContext;
+    try {
+      const pageUptimeS = boundedInteger(Math.floor(context.pageUptimeS), MAX_RECEIVE_UPTIME_S);
+      const roomUptimeS = boundedInteger(Math.floor(context.roomUptimeS), MAX_RECEIVE_UPTIME_S);
+      if (
+        pageUptimeS === undefined ||
+        roomUptimeS === undefined ||
+        typeof context.duckActive !== "boolean"
+      ) {
+        return "invalid-context";
+      }
+      ended = {
+        duckActive: context.duckActive,
+        audioContext: audioContextStateName(context.audioContext),
+        pageUptimeS,
+        roomUptimeS,
+        endedAt: this.options.now(),
+      };
+    } catch {
+      return "invalid-context";
+    }
     this.attempts += 1;
     this.inFlight += 1;
     const baseline = this.baseline ?? this.snapshot();
     this.baseline = null;
-    void this.complete(baseline, context)
+    void this.complete(baseline, ended)
       .catch(() => undefined)
       .finally(() => {
         this.inFlight -= 1;
       });
+    return "sampled";
   }
 
-  private async complete(
-    baseline: Promise<Snapshot>,
-    context: () => ReceiveStatsContext,
-  ): Promise<void> {
-    const ended = context();
-    await this.options.delay(SETTLE_MS);
-    const after = await this.snapshot();
-    const before = await baseline;
-    if (before.counters === null || after.counters === null) return;
-    const windowMs = boundedInteger(after.at - before.at, MAX_RECEIVE_WINDOW_MS);
-    const pageUptimeS = boundedInteger(Math.floor(ended.pageUptimeS), MAX_RECEIVE_UPTIME_S);
-    const roomUptimeS = boundedInteger(Math.floor(ended.roomUptimeS), MAX_RECEIVE_UPTIME_S);
-    if (
-      windowMs === undefined ||
-      pageUptimeS === undefined ||
-      roomUptimeS === undefined ||
-      typeof ended.duckActive !== "boolean"
-    ) {
-      return;
+  private async complete(baseline: Promise<Snapshot>, ended: EndedContext): Promise<void> {
+    let before: Snapshot | null = null;
+    let after: Snapshot | null = null;
+    try {
+      await this.options.delay(SETTLE_MS);
+      after = await this.snapshot();
+      before = await baseline;
+    } finally {
+      await this.options.submit(sampleFrom(ended, before, after));
     }
-    const audioContext = audioContextStateName(ended.audioContext);
-    await this.options.submit({
-      windowMs,
-      ...receiveStatsDelta(before.counters, after.counters),
-      duckActive: ended.duckActive,
-      ...(audioContext === null ? {} : { audioContext }),
-      pageUptimeS,
-      roomUptimeS,
-    });
   }
 
   private snapshot(): Promise<Snapshot> {

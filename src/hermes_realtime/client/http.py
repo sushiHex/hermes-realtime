@@ -62,6 +62,7 @@ def _strict_json_body(body: bytes, label: str) -> Any:
 
 _RECEIVE_REQUIRED = {
     "windowMs": "window_ms",
+    "statsRead": "stats_read",
     "duckActive": "duck_active",
     "pageUptimeS": "page_uptime_s",
     "roomUptimeS": "room_uptime_s",

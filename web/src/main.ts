@@ -1921,7 +1921,8 @@ function projectPublicEvent(event: PublicEvent): void {
       if (role === "assistant") {
         const identity = assistantEventIdentity(event);
         if (identity !== null && activeRemoteTrack !== null) {
-          receiveStatsSampler.chunkEnded(receiveStatsContext);
+          // One receive-stats sample per delivered publication, from its last chunk's start.
+          recordReceiveStatsDisposition();
         }
         if (identity === null) {
           addTranscript("Assistant", text);
@@ -3002,6 +3003,18 @@ async function submitAudioDiagnostic(
     }
     if (!accepted) throw new Error("audio diagnostic rejected");
   });
+}
+
+function recordReceiveStatsDisposition(): void {
+  let disposition: string;
+  try {
+    disposition = receiveStatsSampler.publicationDelivered(receiveStatsContext());
+  } catch {
+    disposition = "invalid-context";
+  }
+  if (disposition !== "sampled" && disposition !== "ignored") {
+    addMarker(`receive_stats_${disposition.replace("-", "_")}`);
+  }
 }
 
 function receiveStatsContext(): ReceiveStatsContext {
