@@ -569,7 +569,8 @@ async def _start_speaking(stack: _Stack) -> None:
 
 
 async def _assert_stopped_without_a_turn(stack: _Stack, task: object) -> None:
-    await stack.worker.wait_for_responses()
+    # Bounded: speech that was not silenced would hold its gated playback forever.
+    await asyncio.wait_for(stack.worker.wait_for_responses(), timeout=2)
     # Speech stopped exactly as a barge-in stops it.
     assert stack.executor.foreground_active is False
     assert len(stack.playback.barge_in_turn_ids) == 1
@@ -587,10 +588,15 @@ async def _assert_next_spoken_utterance_is_a_turn(stack: _Stack, task: object) -
     await stack.worker.wait_for_responses()
     assert len(stack.inference.requests) == 2
     assert _user_rows(stack.context)[-1] == "What were you saying?"
+    # Nothing of the consumed capture carries over: "Stop." outside playback is a turn.
+    await stack.speak()
+    await stack.worker.wait_for_responses()
+    assert len(stack.inference.requests) == 3
+    assert _user_rows(stack.context)[-1] == "Stop."
     assert stack.context.snapshot().active_tasks == (task,)
 
 
-_NEXT = ((), "What were you saying?")
+_NEXT = (((), "What were you saying?"), ((), "Stop."))
 
 
 @pytest.mark.asyncio
@@ -600,7 +606,7 @@ _NEXT = ((), "What were you saying?")
 async def test_spoken_stop_during_playback_leaves_a_running_task_running(
     partials: tuple[str, ...],
 ) -> None:
-    async with _stack((partials, "Stop."), _NEXT) as stack:
+    async with _stack((partials, "Stop."), *_NEXT) as stack:
         task = await _start_task(stack)
         await _start_speaking(stack)
 
@@ -616,7 +622,7 @@ async def test_spoken_stop_during_playback_leaves_a_running_task_running(
 async def test_spoken_stop_silences_speech_that_started_after_a_tail_onset(
     partials: tuple[str, ...],
 ) -> None:
-    async with _stack((partials, "Stop."), _NEXT, recent_playback=True) as stack:
+    async with _stack((partials, "Stop."), *_NEXT, recent_playback=True) as stack:
         task = await _start_task(stack)
         # Onset in the playback tail with nothing speaking ...
         await stack.worker.receive_audio("browser_user", 7, _FRAMES[0])
