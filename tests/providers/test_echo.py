@@ -426,3 +426,71 @@ def test_playback_echo_guard_rejects_excessive_correlation_work_before_reference
         guard.is_echo_dominated((microphone_frame,))
 
     assert converted_bytes == [len(microphone_frame.pcm)]
+
+
+_TAIL_ACOUSTIC_DELAY_SECONDS = 0.06
+_TAIL_LEAK_SECONDS = 0.4
+
+
+def _tail_capture(
+    leak_source: np.ndarray,
+    level: float,
+    endpoint_after_playback: float,
+    ended_at: float,
+) -> np.ndarray:
+    """A capture holding the end of ``leak_source`` after the acoustic delay."""
+
+    start = ended_at - _TAIL_LEAK_SECONDS + _TAIL_ACOUSTIC_DELAY_SECONDS
+    length = round((ended_at + endpoint_after_playback - start) * 48_000)
+    capture = np.random.default_rng(5).normal(0.0, 0.002, length)
+    leak = level * leak_source[-round(_TAIL_LEAK_SECONDS * 48_000) :]
+    capture[: len(leak)] += leak
+    return capture
+
+
+def _classify_tail(leak_seed: int | None, level: float, endpoint_after_playback: float) -> bool:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock)
+    reference = _syllabic_speech(96_000, 301)
+    token = guard.begin_playback(_frame(reference))
+    clock.now = 2.0
+    guard.end_playback(token)
+    source = reference if leak_seed is None else _syllabic_speech(96_000, leak_seed)
+    capture = _tail_capture(source, level, endpoint_after_playback, 2.0)
+    clock.now = 2.0 + endpoint_after_playback
+    return guard.is_echo_dominated((_frame(capture),))
+
+
+@pytest.mark.parametrize("endpoint_after_playback", [0.06, 0.3, 0.6])
+@pytest.mark.parametrize("level", [0.3, 0.8])
+def test_playback_echo_guard_catches_leaked_last_word_when_endpoint_follows_playback(
+    level: float,
+    endpoint_after_playback: float,
+) -> None:
+    assert _classify_tail(None, level, endpoint_after_playback) is True
+
+
+@pytest.mark.parametrize("endpoint_after_playback", [0.06, 0.3, 0.6])
+@pytest.mark.parametrize("level", [0.3, 0.8])
+def test_playback_echo_guard_does_not_flag_unrelated_capture_after_playback(
+    level: float,
+    endpoint_after_playback: float,
+) -> None:
+    assert _classify_tail(302, level, endpoint_after_playback) is False
+
+
+@pytest.mark.parametrize("endpoint_after_playback", [0.6, 0.9])
+def test_playback_echo_guard_does_not_flag_user_speech_that_starts_after_playback(
+    endpoint_after_playback: float,
+) -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock)
+    reference = _syllabic_speech(96_000, 301)
+    token = guard.begin_playback(_frame(reference))
+    clock.now = 2.0
+    guard.end_playback(token)
+    user = _syllabic_speech(round(0.4 * 48_000), 303)
+    silence = np.zeros(round((endpoint_after_playback - 0.5) * 48_000))
+    clock.now = 2.0 + endpoint_after_playback
+
+    assert guard.is_echo_dominated((_frame(np.concatenate((user, silence))),)) is False
