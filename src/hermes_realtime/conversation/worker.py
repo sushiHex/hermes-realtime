@@ -189,6 +189,10 @@ class ConversationSessionWorker:
             getattr(command_router, "route_spoken", None)
         ):
             raise TypeError("command_router must provide route_spoken()")
+        if command_router is not None and not callable(
+            getattr(command_router, "intervening_spoken_input", None)
+        ):
+            raise TypeError("command_router must provide intervening_spoken_input()")
         if (
             evidence_lifecycle is not None
             and type(evidence_lifecycle) is not EvidenceConversationAuthorityV1
