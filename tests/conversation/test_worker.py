@@ -133,9 +133,9 @@ class ScriptedEchoGuard:
     def has_recent_playback(self) -> bool:
         return self._recent_playback
 
-    def has_recent_outbound_word(self, word: str) -> bool:
-        self.outbound_word_queries.append(word)
-        return word in self._outbound_words
+    def has_recent_outbound_word_prefix(self, prefix: str) -> bool:
+        self.outbound_word_queries.append(prefix)
+        return any(word.startswith(prefix) for word in self._outbound_words)
 
 
 class ScriptedSpeechPresenceVerifier:
