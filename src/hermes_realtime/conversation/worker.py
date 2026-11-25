@@ -120,6 +120,8 @@ class _PlaybackEchoGuard(Protocol):
 
     def is_transcript_echo(self, text: str) -> bool: ...
 
+    def has_recent_outbound_word(self, word: str) -> bool: ...
+
     def has_recent_playback(self) -> bool: ...
 
 
@@ -247,6 +249,7 @@ class ConversationSessionWorker:
             for method in (
                 "is_echo_dominated",
                 "is_transcript_echo",
+                "has_recent_outbound_word",
                 "has_recent_playback",
             ):
                 if not callable(getattr(echo_guard, method, None)):
@@ -323,6 +326,7 @@ class ConversationSessionWorker:
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
         self._playback_candidate_text_echo_seen = False
+        self._playback_capture = False
         self._playback_candidate_short_partial: str | None = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id: str | None = None
@@ -451,6 +455,7 @@ class ConversationSessionWorker:
                     )
                     self._playback_candidate_streaming_evidence = False
                     self._playback_candidate_text_echo_seen = False
+                    self._playback_capture = interrupting or recent_playback
                     self._playback_candidate_short_partial = None
                     if echo_dominated or confirmation_required:
                         self._echo_suppressed = True
@@ -540,6 +545,7 @@ class ConversationSessionWorker:
                         utterance_ended = True
 
                 transcripts: tuple[Transcript, ...] = ()
+                speech_only_final: Transcript | None = None
                 for utterance_frame in frames_to_push:
                     raw_transcripts = self._without_transcript_echoes(
                         self._trusted_transcripts(await self._stt.push(utterance_frame))
@@ -607,6 +613,12 @@ class ConversationSessionWorker:
                         if admitted_final:
                             transcripts = (*transcripts, *admitted_final)
                             self._utterance_has_final_transcript = True
+                            # Owner decision (#576): a bare stop word during playback has
+                            # already stopped speech as a barge-in; it starts no turn.
+                            if self._playback_capture and _is_playback_stop_word(
+                                admitted_final[0].text
+                            ):
+                                speech_only_final = admitted_final[0]
                     if (
                         self._interruption_committed
                         and not self._utterance_has_final_transcript
@@ -622,6 +634,9 @@ class ConversationSessionWorker:
                 for transcript in transcripts:
                     if transcript.final:
                         self._observe_final_transcript(transcript)
+                        if transcript is speech_only_final:
+                            await self._revoke_active_ticket("playback_stop_word")
+                            continue
                         router = self._command_router
                         lifecycle = self._resolve_evidence_lifecycle()
                         authority: FinalInputAuthorityV1 | None = None
@@ -738,12 +753,16 @@ class ConversationSessionWorker:
                                 and key == self._playback_candidate_short_partial)
                     # The exact stop word needs no partial (#576), under the same promotion
                     # and explicit verifier, unless this capture already matched outbound
-                    # text. Residual: the assistant's own spoken "stop" that passes the
-                    # acoustic echo check and the verifier is not distinguished here.
+                    # text or recently played text contains the word itself: the text-echo
+                    # match cannot see a four-character word, so the assistant's own "stop"
+                    # would otherwise interrupt it.
+                    guard = self._echo_guard
                     accepted = accepted or (
                         verified
+                        and guard is not None
                         and not self._playback_candidate_text_echo_seen
                         and _is_playback_stop_word(transcript.text)
+                        and not guard.has_recent_outbound_word(_PLAYBACK_STOP_WORD)
                     )
                     if accepted:
                         admitted.append(transcript)
@@ -768,6 +787,7 @@ class ConversationSessionWorker:
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
         self._playback_candidate_text_echo_seen = False
+        self._playback_capture = False
         self._playback_candidate_short_partial = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id = None

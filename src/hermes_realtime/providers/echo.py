@@ -185,6 +185,23 @@ class PlaybackEchoGuard:
                 return True
         return False
 
+    def has_recent_outbound_word(self, word: str) -> bool:
+        """Whether active or retained outbound text contains ``word`` as a whole word."""
+
+        if type(word) is not str:
+            raise TypeError("word must be an exact built-in string")
+        if not word or self._normalized_text(word) != word or " " in word:
+            raise ValueError("word must be one normalized word")
+        now = float(self._clock())
+        self._purge_retired(now)
+        references = (
+            *((self._active,) if self._active is not None else ()),
+            *self._retired,
+        )
+        return any(
+            f" {word} " in f" {reference.normalized_text} " for reference in references
+        )
+
     def has_recent_playback(self) -> bool:
         """Whether active or retained playback can still contaminate microphone PCM."""
 
