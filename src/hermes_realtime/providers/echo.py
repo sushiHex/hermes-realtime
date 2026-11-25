@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -127,6 +128,9 @@ class PlaybackEchoGuard:
         self._active: _Reference | None = None
         self._retired: deque[_Reference] = deque()
         self._echo_residual_baseline: float | None = None
+        # Printing state only: it never influences a verdict.
+        self._tail_scan_reported = False
+        self._tail_scan_suppressed = 0
 
     def begin_playback(self, frame: AudioFrame, text: str = "") -> object:
         trusted = self._trusted_frame(frame)
@@ -146,6 +150,7 @@ class PlaybackEchoGuard:
         ):
             raise RuntimeError("echo reference retention capacity exhausted")
         token = object()
+        self._tail_scan_reported = False
         self._active = _Reference(
             frame=trusted,
             normalized_text=normalized_text,
@@ -442,10 +447,47 @@ class PlaybackEchoGuard:
         """Coherence-only scan of captures that end after playback ended.
 
         Delays count back from ``now``; the reference is the played audio followed by
-        silence. It reads and writes no state and never raises: on any bound it
-        stops and leaves the verdict to the caller's other paths.
+        silence. It never raises and keeps no verdict state: on any bound it stops,
+        reports the incomplete scan, and leaves the verdict to the other paths.
         """
 
+        stop: list[tuple[int, int]] = []
+        try:
+            return self._scan_after_playback(
+                mic, mic_energy, references, now, factor, residual_limit, stop
+            )
+        finally:
+            if stop:
+                work, reference_bytes = stop[0]
+                self._report_tail_scan_stop(work, reference_bytes, len(references))
+
+    def _report_tail_scan_stop(
+        self, work: int, reference_bytes: int, references: int
+    ) -> None:
+        if self._tail_scan_reported:
+            self._tail_scan_suppressed += 1
+            return
+        evidence = {
+            "category": "work_budget",
+            "work": work,
+            "reference_bytes": reference_bytes,
+            "references": references,
+            "suppressed": self._tail_scan_suppressed,
+        }
+        self._tail_scan_reported = True
+        self._tail_scan_suppressed = 0
+        print("[echo-tail-scan] " + json.dumps(evidence, separators=(",", ":")), flush=True)
+
+    def _scan_after_playback(
+        self,
+        mic: NDArray[np.float64],
+        mic_energy: float,
+        references: tuple[_Reference, ...],
+        now: float,
+        factor: int,
+        residual_limit: float,
+        stop: list[tuple[int, int]],
+    ) -> bool:
         rate = self._analysis_rate_hz
         max_delay_samples = round(self._max_delay_seconds * rate)
         step_samples = max(1, round(self._delay_step_ms * rate / 1_000))
@@ -467,9 +509,9 @@ class PlaybackEchoGuard:
             raw = memoryview(reference.frame.pcm)[
                 window_start * factor * 2 : played_end * factor * 2
             ]
+            # No byte cap here: this window lies inside the one the main scan already
+            # bounded by max_reference_analysis_bytes, and that scan raised if it was over.
             reference_bytes += raw.nbytes
-            if reference_bytes > self._max_reference_analysis_bytes:
-                return False
             played = self._downsample(np.frombuffer(raw, dtype="<i2").astype(np.float64), factor)
             outbound = np.pad(played, (0, anchor - window_start - len(played)))
             for delay_samples in range(0, max_delay_samples + 1, step_samples):
@@ -481,6 +523,7 @@ class PlaybackEchoGuard:
                     continue
                 work += len(mic)
                 if work > self._max_correlation_work:
+                    stop.append((work, reference_bytes))
                     return False
                 candidate = outbound[start:end]
                 candidate_mean = float(candidate.mean())

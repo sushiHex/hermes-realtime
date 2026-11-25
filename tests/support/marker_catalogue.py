@@ -53,6 +53,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "cancel-choice-refusal": {
         "src/hermes_realtime/conversation/streaming.py": 1,
     },
+    "echo-tail-scan": {
+        "src/hermes_realtime/providers/echo.py": 1,
+    },
     "codex-access-credential": {
         "src/hermes_realtime/integration/codex_access_credentials.py": 1,
     },
@@ -1049,6 +1052,11 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
             "tail_ms: attribute: audio.sample_rate_hz",
             "tail_ms: bound: position",
             "tail_ms: call: word_boundary_stop(audio, position)",
+        ),
+    },
+    "src/hermes_realtime/providers/echo.py": {
+        "echo-tail-scan": (
+            "suppressed: attribute: self._tail_scan_suppressed",
         ),
     },
     "src/hermes_realtime/providers/codex_app_server.py": {

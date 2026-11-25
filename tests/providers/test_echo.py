@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import numpy as np
@@ -626,3 +627,69 @@ def test_after_playback_scan_never_raises_over_many_short_references() -> None:
 def test_after_playback_scan_ignores_candidates_with_too_little_played_audio() -> None:
     assert _classify_tail("leak", 0.8, 0.6, leak_seconds=0.2) is True
     assert _classify_tail("leak", 0.8, 0.6, leak_seconds=0.1) is False
+
+
+def _tail_scan_lines(captured: str) -> list[dict[str, Any]]:
+    prefix = "[echo-tail-scan] "
+    return [
+        json.loads(line[len(prefix) :]) for line in captured.splitlines() if line.startswith(prefix)
+    ]
+
+
+def _exhausted_scan(guard: PlaybackEchoGuard, clock: Clock, *, begin: bool) -> bool:
+    reference = _syllabic_speech(48_000, 311)
+    if begin:
+        clock.now = 0.0
+        token = guard.begin_playback(_frame(reference))
+        clock.now = 1.0
+        guard.end_playback(token)
+    capture = _tail_capture("leak", reference, 0.8, 0.75, ended_at=1.0)
+    clock.now = 1.75
+    return bool(guard.is_echo_dominated((_frame(capture),)))
+
+
+def test_exhausted_after_playback_scan_prints_one_bounded_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock, max_correlation_work=200_000)
+
+    assert _exhausted_scan(guard, clock, begin=True) is False
+
+    lines = _tail_scan_lines(capsys.readouterr().out)
+    assert len(lines) == 1
+    assert set(lines[0]) == {"category", "work", "reference_bytes", "references", "suppressed"}
+    assert lines[0]["category"] == "work_budget"
+    assert lines[0]["references"] == 1
+    assert lines[0]["suppressed"] == 0
+    assert all(type(lines[0][key]) is int for key in ("work", "reference_bytes", "suppressed"))
+    assert lines[0]["work"] > 200_000
+
+
+def test_completed_after_playback_scan_prints_nothing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock)
+
+    assert _exhausted_scan(guard, clock, begin=True) is True
+    assert _classify_tail("unrelated", 0.8, 0.6) is False
+
+    assert _tail_scan_lines(capsys.readouterr().out) == []
+
+
+def test_exhausted_after_playback_scan_prints_once_per_playback_and_counts_the_rest(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock, max_correlation_work=200_000)
+
+    assert _exhausted_scan(guard, clock, begin=True) is False
+    assert _exhausted_scan(guard, clock, begin=False) is False
+    assert len(_tail_scan_lines(capsys.readouterr().out)) == 1
+
+    guard.begin_playback(_frame(_speech(4_800, 5)))
+    assert _exhausted_scan(guard, clock, begin=False) is False
+
+    lines = _tail_scan_lines(capsys.readouterr().out)
+    assert [line["suppressed"] for line in lines] == [1]
