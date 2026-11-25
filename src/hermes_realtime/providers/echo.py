@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -127,6 +128,9 @@ class PlaybackEchoGuard:
         self._active: _Reference | None = None
         self._retired: deque[_Reference] = deque()
         self._echo_residual_baseline: float | None = None
+        # Printing state only: it never influences a verdict.
+        self._tail_scan_reported = False
+        self._tail_scan_suppressed = 0
 
     def begin_playback(self, frame: AudioFrame, text: str = "") -> object:
         trusted = self._trusted_frame(frame)
@@ -146,6 +150,7 @@ class PlaybackEchoGuard:
         ):
             raise RuntimeError("echo reference retention capacity exhausted")
         token = object()
+        self._tail_scan_reported = False
         self._active = _Reference(
             frame=trusted,
             normalized_text=normalized_text,
@@ -396,6 +401,10 @@ class PlaybackEchoGuard:
                         delay_samples * 1_000 / self._analysis_rate_hz
                     )
         echo_dominated = coherent_echo or relative_level_echo or robust_echo
+        tail_echo = not echo_dominated and self._after_playback_coherent_echo(
+            mic, mic_energy, references, now, factor, residual_limit
+        )
+        echo_dominated = echo_dominated or tail_echo
         if coherent_echo:
             if baseline is None:
                 self._echo_residual_baseline = residual
@@ -408,7 +417,7 @@ class PlaybackEchoGuard:
             "limit_milli=%d delay_ms=%d mic_rms=%d reference_rms=%d "
             "mic_reference_ratio_milli=%d robust_echo=%s "
             "robust_envelope_milli=%d robust_band_temporal_milli=%d "
-            "robust_delay_ms=%d robust_ratio_milli=%d",
+            "robust_delay_ms=%d robust_ratio_milli=%d tail_echo=%s",
             echo_dominated,
             round(best_coherence * 1_000),
             round(residual * 1_000),
@@ -422,8 +431,112 @@ class PlaybackEchoGuard:
             round(best_robust_band_temporal_coherence * 1_000),
             best_robust_delay_ms,
             round(best_robust_ratio * 1_000) if math.isfinite(best_robust_ratio) else -1,
+            tail_echo,
         )
         return echo_dominated
+
+    def _after_playback_coherent_echo(
+        self,
+        mic: NDArray[np.float64],
+        mic_energy: float,
+        references: tuple[_Reference, ...],
+        now: float,
+        factor: int,
+        residual_limit: float,
+    ) -> bool:
+        """Coherence-only scan of captures that end after playback ended.
+
+        Delays count back from ``now``; the reference is the played audio followed by
+        silence. It never raises and keeps no verdict state: on any bound it stops,
+        reports the incomplete scan, and leaves the verdict to the other paths.
+        """
+
+        stop: list[tuple[int, int]] = []
+        try:
+            return self._scan_after_playback(
+                mic, mic_energy, references, now, factor, residual_limit, stop
+            )
+        finally:
+            if stop:
+                work, reference_bytes = stop[0]
+                self._report_tail_scan_stop(work, reference_bytes, len(references))
+
+    def _report_tail_scan_stop(
+        self, work: int, reference_bytes: int, references: int
+    ) -> None:
+        if self._tail_scan_reported:
+            self._tail_scan_suppressed += 1
+            return
+        evidence = {
+            "category": "work_budget",
+            "work": work,
+            "reference_bytes": reference_bytes,
+            "references": references,
+            "suppressed": self._tail_scan_suppressed,
+        }
+        self._tail_scan_reported = True
+        self._tail_scan_suppressed = 0
+        print("[echo-tail-scan] " + json.dumps(evidence, separators=(",", ":")), flush=True)
+
+    def _scan_after_playback(
+        self,
+        mic: NDArray[np.float64],
+        mic_energy: float,
+        references: tuple[_Reference, ...],
+        now: float,
+        factor: int,
+        residual_limit: float,
+        stop: list[tuple[int, int]],
+    ) -> bool:
+        rate = self._analysis_rate_hz
+        max_delay_samples = round(self._max_delay_seconds * rate)
+        step_samples = max(1, round(self._delay_step_ms * rate / 1_000))
+        minimum_played = round(_ROBUST_MINIMUM_SECONDS * rate)
+        work = 0
+        reference_bytes = 0
+        best_coherence = 0.0
+        for reference in references:
+            if reference.ended_at is None:
+                continue
+            anchor = round((now - reference.started_at) * rate)
+            played_end = min(
+                len(reference.frame.pcm) // (2 * factor),
+                round((min(now, reference.ended_at) - reference.started_at) * rate),
+            )
+            window_start = max(0, anchor - max_delay_samples - len(mic))
+            if anchor <= played_end or played_end - window_start < minimum_played:
+                continue
+            raw = memoryview(reference.frame.pcm)[
+                window_start * factor * 2 : played_end * factor * 2
+            ]
+            # No byte cap here: this window lies inside the one the main scan already
+            # bounded by max_reference_analysis_bytes, and that scan raised if it was over.
+            reference_bytes += raw.nbytes
+            played = self._downsample(np.frombuffer(raw, dtype="<i2").astype(np.float64), factor)
+            outbound = np.pad(played, (0, anchor - window_start - len(played)))
+            for delay_samples in range(0, max_delay_samples + 1, step_samples):
+                end = anchor - window_start - delay_samples
+                start = end - len(mic)
+                if end <= len(played) or start < 0:
+                    break
+                if len(played) - start < minimum_played:
+                    continue
+                work += len(mic)
+                if work > self._max_correlation_work:
+                    stop.append((work, reference_bytes))
+                    return False
+                candidate = outbound[start:end]
+                candidate_mean = float(candidate.mean())
+                reference_energy = float(candidate @ candidate) - len(candidate) * candidate_mean**2
+                if reference_energy < len(candidate) * 16.0:
+                    continue
+                dot = float(mic @ candidate)
+                best_coherence = max(
+                    best_coherence, min(1.0, (dot * dot) / (mic_energy * reference_energy))
+                )
+        return (
+            best_coherence >= self._minimum_coherence and 1.0 - best_coherence <= residual_limit
+        )
 
     def _purge_retired(self, now: float) -> None:
         while self._retired:

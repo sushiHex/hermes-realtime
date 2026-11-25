@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import numpy as np
@@ -426,3 +427,269 @@ def test_playback_echo_guard_rejects_excessive_correlation_work_before_reference
         guard.is_echo_dominated((microphone_frame,))
 
     assert converted_bytes == [len(microphone_frame.pcm)]
+
+
+_TAIL_ACOUSTIC_DELAY_SECONDS = 0.06
+_TAIL_LEAK_SECONDS = 0.4
+_TAIL_PLAYBACK_SECONDS = 2.0
+
+
+def _tail_capture(
+    kind: str,
+    source: np.ndarray,
+    level: float,
+    endpoint_after_playback: float,
+    *,
+    ended_at: float = _TAIL_PLAYBACK_SECONDS,
+    leak_seconds: float = _TAIL_LEAK_SECONDS,
+) -> np.ndarray:
+    """A capture ending ``endpoint_after_playback`` after playback ended.
+
+    ``leak``/``reverb`` hold the end of ``source`` after the acoustic delay; ``unrelated``
+    holds the end of an unrelated signal at the same place; ``user`` holds unrelated speech
+    that starts 100 ms after playback ended.
+    """
+
+    noise = np.random.default_rng(5)
+    if kind == "user":
+        length = round((endpoint_after_playback - 0.1) * 48_000)
+        capture = noise.normal(0.0, 0.002, length)
+        speech = level * source[: round(0.4 * 48_000)]
+        capture[: len(speech)] += speech
+        return capture
+    start = ended_at - leak_seconds + _TAIL_ACOUSTIC_DELAY_SECONDS
+    length = round((ended_at + endpoint_after_playback - start) * 48_000)
+    capture = noise.normal(0.0, 0.002, length)
+    leak = source[-round(leak_seconds * 48_000) :]
+    if kind == "reverb":
+        rng = np.random.default_rng(6)
+        response = rng.normal(0.0, 1.0, 5_760) * np.exp(-np.arange(5_760) / 1_200.0)
+        response[0] = 3.0
+        wet = np.convolve(leak, response)[: len(leak)]
+        leak = wet * float(np.sqrt(np.mean(leak * leak)) / np.sqrt(np.mean(wet * wet)))
+    capture[: len(leak)] += level * leak
+    return capture
+
+
+def _classify_tail(
+    kind: str,
+    level: float,
+    endpoint_after_playback: float,
+    *,
+    guard_type: Any = PlaybackEchoGuard,
+    leak_seconds: float = _TAIL_LEAK_SECONDS,
+) -> bool:
+    clock = Clock()
+    guard = guard_type(clock=clock)
+    reference = _syllabic_speech(round(_TAIL_PLAYBACK_SECONDS * 48_000), 301)
+    token = guard.begin_playback(_frame(reference))
+    clock.now = _TAIL_PLAYBACK_SECONDS
+    guard.end_playback(token)
+    source = reference if kind in ("leak", "reverb") else _syllabic_speech(96_000, 302)
+    capture = _tail_capture(
+        kind, source, level, endpoint_after_playback, leak_seconds=leak_seconds
+    )
+    clock.now = _TAIL_PLAYBACK_SECONDS + endpoint_after_playback
+    return bool(guard.is_echo_dominated((_frame(capture),)))
+
+
+def _tail_grid() -> list[tuple[str, float, float]]:
+    cells: list[tuple[str, float, float]] = []
+    for level in (0.03, 0.05, 0.3, 0.8):
+        cells += [("leak", level, after) for after in (0.06, 0.3, 0.6, 0.9, 1.2)]
+    for level in (0.05, 0.3):
+        cells += [("reverb", level, after) for after in (0.06, 0.3, 0.6, 1.2)]
+    for level in (0.05, 0.1, 0.2):
+        cells += [("unrelated", level, after) for after in (0.06, 0.3, 0.6, 1.2)]
+    for level in (0.05, 0.2, 0.5, 1.0):
+        cells += [("user", level, after) for after in (0.6, 0.9, 1.2)]
+    return cells
+
+
+def _tail_key(cell: tuple[str, float, float]) -> str:
+    return f"{cell[0]}/{cell[1]}/{cell[2]}"
+
+
+# Cells the guard flagged before the after-playback scan existed (generated once from the
+# pre-change implementation); the scan may only add to them.
+_MAIN_FLAGGED: frozenset[str] = frozenset(
+    {
+        "leak/0.03/0.06",
+        "leak/0.03/0.3",
+        "leak/0.03/0.6",
+        "leak/0.03/0.9",
+        "leak/0.03/1.2",
+        "leak/0.05/0.06",
+        "leak/0.05/0.3",
+        "leak/0.05/0.6",
+        "leak/0.05/0.9",
+        "leak/0.05/1.2",
+        "leak/0.3/0.06",
+        "leak/0.8/0.06",
+        "reverb/0.05/0.3",
+        "reverb/0.05/0.6",
+        "reverb/0.05/1.2",
+        "unrelated/0.05/0.06",
+        "unrelated/0.05/0.3",
+        "unrelated/0.05/0.6",
+        "unrelated/0.05/1.2",
+        "unrelated/0.1/0.6",
+        "unrelated/0.1/1.2",
+        "user/0.05/1.2",
+    }
+)
+
+
+@pytest.mark.parametrize("endpoint_after_playback", [0.3, 0.6])
+@pytest.mark.parametrize("level", [0.3, 0.8])
+def test_playback_echo_guard_catches_leaked_last_word_when_endpoint_follows_playback(
+    level: float,
+    endpoint_after_playback: float,
+) -> None:
+    assert _classify_tail("leak", level, endpoint_after_playback) is True
+
+
+@pytest.mark.parametrize("level", [0.3, 0.8])
+def test_playback_echo_guard_catches_leaked_last_word_when_endpoint_is_aligned(
+    level: float,
+) -> None:
+    assert _classify_tail("leak", level, _TAIL_ACOUSTIC_DELAY_SECONDS) is True
+
+
+@pytest.mark.parametrize("endpoint_after_playback", [0.06, 0.3, 0.6])
+@pytest.mark.parametrize("level", [0.3, 0.8])
+def test_playback_echo_guard_does_not_flag_unrelated_capture_after_playback(
+    level: float,
+    endpoint_after_playback: float,
+) -> None:
+    assert _classify_tail("unrelated", level, endpoint_after_playback) is False
+
+
+def test_after_playback_scan_only_adds_to_the_verdicts_of_the_pre_change_guard() -> None:
+    grid = _tail_grid()
+    for cell in grid:
+        verdict = _classify_tail(*cell)
+        if _tail_key(cell) in _MAIN_FLAGGED:
+            assert verdict is True, _tail_key(cell)
+        elif cell[0] in ("unrelated", "user"):
+            assert verdict is False, _tail_key(cell)
+
+
+def test_after_playback_scan_writes_no_baseline() -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock)
+    reference = _syllabic_speech(96_000, 301)
+    token = guard.begin_playback(_frame(reference))
+    clock.now = _TAIL_PLAYBACK_SECONDS
+    guard.end_playback(token)
+
+    clock.now = _TAIL_PLAYBACK_SECONDS + 0.06
+    aligned = _tail_capture("leak", reference, 0.8, 0.06)
+    assert guard.is_echo_dominated((_frame(aligned),)) is True
+    baseline = guard._echo_residual_baseline
+    assert baseline is not None
+
+    clock.now = _TAIL_PLAYBACK_SECONDS + 0.6
+    late = _tail_capture("leak", reference, 0.8, 0.6)
+    assert guard.is_echo_dominated((_frame(late),)) is True
+    assert guard._echo_residual_baseline == baseline
+
+
+def test_after_playback_scan_stops_at_its_own_budget_without_raising() -> None:
+    def classify(budget: int) -> bool:
+        clock = Clock()
+        guard = PlaybackEchoGuard(clock=clock, max_correlation_work=budget)
+        reference = _syllabic_speech(48_000, 311)
+        token = guard.begin_playback(_frame(reference))
+        clock.now = 1.0
+        guard.end_playback(token)
+        capture = _tail_capture("leak", reference, 0.8, 0.75, ended_at=1.0)
+        clock.now = 1.75
+        return bool(guard.is_echo_dominated((_frame(capture),)))
+
+    assert classify(16_000_000) is True
+    assert classify(200_000) is False
+
+
+def test_after_playback_scan_never_raises_over_many_short_references() -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock)
+    for seed in range(200):
+        token = guard.begin_playback(_frame(_speech(480, seed)))
+        clock.now += 0.01
+        guard.end_playback(token)
+    clock.now += 0.75
+    capture = _speech(36_000, 7) * 0.5
+
+    assert guard.is_echo_dominated((_frame(capture),)) is False
+
+
+def test_after_playback_scan_ignores_candidates_with_too_little_played_audio() -> None:
+    assert _classify_tail("leak", 0.8, 0.6, leak_seconds=0.2) is True
+    assert _classify_tail("leak", 0.8, 0.6, leak_seconds=0.1) is False
+
+
+def _tail_scan_lines(captured: str) -> list[dict[str, Any]]:
+    prefix = "[echo-tail-scan] "
+    return [
+        json.loads(line[len(prefix) :]) for line in captured.splitlines() if line.startswith(prefix)
+    ]
+
+
+def _exhausted_scan(guard: PlaybackEchoGuard, clock: Clock, *, begin: bool) -> bool:
+    reference = _syllabic_speech(48_000, 311)
+    if begin:
+        clock.now = 0.0
+        token = guard.begin_playback(_frame(reference))
+        clock.now = 1.0
+        guard.end_playback(token)
+    capture = _tail_capture("leak", reference, 0.8, 0.75, ended_at=1.0)
+    clock.now = 1.75
+    return bool(guard.is_echo_dominated((_frame(capture),)))
+
+
+def test_exhausted_after_playback_scan_prints_one_bounded_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock, max_correlation_work=200_000)
+
+    assert _exhausted_scan(guard, clock, begin=True) is False
+
+    lines = _tail_scan_lines(capsys.readouterr().out)
+    assert len(lines) == 1
+    assert set(lines[0]) == {"category", "work", "reference_bytes", "references", "suppressed"}
+    assert lines[0]["category"] == "work_budget"
+    assert lines[0]["references"] == 1
+    assert lines[0]["suppressed"] == 0
+    assert all(type(lines[0][key]) is int for key in ("work", "reference_bytes", "suppressed"))
+    assert lines[0]["work"] > 200_000
+
+
+def test_completed_after_playback_scan_prints_nothing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock)
+
+    assert _exhausted_scan(guard, clock, begin=True) is True
+    assert _classify_tail("unrelated", 0.8, 0.6) is False
+
+    assert _tail_scan_lines(capsys.readouterr().out) == []
+
+
+def test_exhausted_after_playback_scan_prints_once_per_playback_and_counts_the_rest(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock, max_correlation_work=200_000)
+
+    assert _exhausted_scan(guard, clock, begin=True) is False
+    assert _exhausted_scan(guard, clock, begin=False) is False
+    assert len(_tail_scan_lines(capsys.readouterr().out)) == 1
+
+    guard.begin_playback(_frame(_speech(4_800, 5)))
+    assert _exhausted_scan(guard, clock, begin=False) is False
+
+    lines = _tail_scan_lines(capsys.readouterr().out)
+    assert [line["suppressed"] for line in lines] == [1]
