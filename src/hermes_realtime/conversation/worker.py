@@ -332,7 +332,6 @@ class ConversationSessionWorker:
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
         self._playback_candidate_text_echo_seen = False
-        self._playback_capture = False
         self._playback_candidate_short_partial: str | None = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id: str | None = None
@@ -461,7 +460,6 @@ class ConversationSessionWorker:
                     )
                     self._playback_candidate_streaming_evidence = False
                     self._playback_candidate_text_echo_seen = False
-                    self._playback_capture = interrupting or recent_playback
                     self._playback_candidate_short_partial = None
                     if echo_dominated or confirmation_required:
                         self._echo_suppressed = True
@@ -619,10 +617,10 @@ class ConversationSessionWorker:
                         if admitted_final:
                             transcripts = (*transcripts, *admitted_final)
                             self._utterance_has_final_transcript = True
-                            # Owner decision (#576): a bare stop word during playback has
-                            # already stopped speech as a barge-in; it starts no turn.
-                            if self._playback_capture and _is_playback_stop_word(
-                                admitted_final[0].text
+                            # Owner decision (#576): a bare stop word with a reply to
+                            # silence only silences it; it starts no turn.
+                            if self._stop_word_has_reply_to_silence() and (
+                                _is_playback_stop_word(admitted_final[0].text)
                             ):
                                 speech_only_final = admitted_final[0]
                     if (
@@ -762,10 +760,13 @@ class ConversationSessionWorker:
                     # text or recently played text has a word starting with it ("stop",
                     # "stopped"): the text-echo match cannot see a four-character word, so
                     # the assistant's own clipped "stop" would otherwise interrupt it.
+                    # It exists only to silence a reply, so it needs one: it never creates
+                    # a turn that main would not have created.
                     guard = self._echo_guard
                     accepted = accepted or (
                         verified
                         and guard is not None
+                        and self._stop_word_has_reply_to_silence()
                         and not self._playback_candidate_text_echo_seen
                         and _is_playback_stop_word(transcript.text)
                         and not guard.has_recent_outbound_word_prefix(_PLAYBACK_STOP_WORD)
@@ -793,7 +794,6 @@ class ConversationSessionWorker:
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
         self._playback_candidate_text_echo_seen = False
-        self._playback_capture = False
         self._playback_candidate_short_partial = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id = None
@@ -832,6 +832,18 @@ class ConversationSessionWorker:
             observer("interrupt_requested", {"turnId": turn_id})
             observer("playback_silenced", {})
             self._notify_advisory(observer, "echo_barge_in_confirmed", {})
+
+    def _stop_word_has_reply_to_silence(self) -> bool:
+        """#576: a stop word is speech-only only when there is a reply to silence.
+
+        A foreground was speaking at this capture's onset (it may since have ended on its
+        own), or one is speaking now. In the playback tail with nothing speaking there is
+        nothing to silence, and the word behaves exactly as on main.
+        """
+
+        return self._interruption_foreground_turn_id is not None or (
+            self._actions.foreground_active
+        )
 
     async def _silence_for_playback_stop_word(self) -> None:
         """Consume a playback stop word (#576): silence speech, start no turn."""
