@@ -248,6 +248,19 @@ describe("receive stats sampler", () => {
     await settle();
     expect(state.submitted).toEqual([]);
 
+    // Hung reads are released by their bound, so they never hold the in-flight slots.
+    const hung = harness(10);
+    for (let index = 0; index < 4; index += 1) hung.sampler.chunkEnded(() => context);
+    fireTimers(hung, 1_000);
+    await settle();
+    fireTimers(hung, 500);
+    await settle();
+    fireTimers(hung, 1_000);
+    await settle();
+    const readsBefore = hung.reads.length;
+    hung.sampler.chunkEnded(() => context);
+    expect(hung.reads.length).toBe(readsBefore + 1);
+
     const rejecting = harness();
     rejecting.sampler.chunkEnded(() => context);
     rejecting.readFailures[0]!(new Error("getStats rejected"));
