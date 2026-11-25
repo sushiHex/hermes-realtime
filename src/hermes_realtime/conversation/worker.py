@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import math
+import string
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -67,6 +68,17 @@ _Observer = Callable[[str, dict[str, _PublicValue]], None]
 def _short_transcript_key(text: str) -> str | None:
     key = text.strip().rstrip(".!?").casefold()
     return key if len(key) == 2 and key.isalnum() else None
+
+
+# The one word a playback final may carry without a streaming partial (#576): a short barge-in
+# can end before the STT raises any partial. Exactly one token; ASCII space and punctuation
+# around it are ignored, nothing else is.
+_PLAYBACK_STOP_WORD = "stop"
+_PLAYBACK_STOP_WORD_SURROUNDINGS = string.whitespace + string.punctuation
+
+
+def _is_playback_stop_word(text: str) -> bool:
+    return text.strip(_PLAYBACK_STOP_WORD_SURROUNDINGS).lower() == _PLAYBACK_STOP_WORD
 
 
 class _VoiceActivityDetector(Protocol):
@@ -310,6 +322,7 @@ class ConversationSessionWorker:
         self._interruption_committed = False
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
+        self._playback_candidate_text_echo_seen = False
         self._playback_candidate_short_partial: str | None = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id: str | None = None
@@ -437,6 +450,7 @@ class ConversationSessionWorker:
                         confirmation_required and self._stt_streams_partials
                     )
                     self._playback_candidate_streaming_evidence = False
+                    self._playback_candidate_text_echo_seen = False
                     self._playback_candidate_short_partial = None
                     if echo_dominated or confirmation_required:
                         self._echo_suppressed = True
@@ -718,9 +732,19 @@ class ConversationSessionWorker:
                     # that check and cannot authorize this additional short-final path.
                     # Agreement is consistency, not independent recognition (the STT
                     # wrapper can fall back to its last partial at the endpoint).
-                    accepted = (self._speech_presence_verifier is not None
+                    verified = self._speech_presence_verifier is not None
+                    accepted = (verified
                                 and key is not None
                                 and key == self._playback_candidate_short_partial)
+                    # The exact stop word needs no partial (#576), under the same promotion
+                    # and explicit verifier, unless this capture already matched outbound
+                    # text. Residual: the assistant's own spoken "stop" that passes the
+                    # acoustic echo check and the verifier is not distinguished here.
+                    accepted = accepted or (
+                        verified
+                        and not self._playback_candidate_text_echo_seen
+                        and _is_playback_stop_word(transcript.text)
+                    )
                     if accepted:
                         admitted.append(transcript)
                 finally:
@@ -743,6 +767,7 @@ class ConversationSessionWorker:
     def _clear_playback_candidate_authority(self) -> None:
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
+        self._playback_candidate_text_echo_seen = False
         self._playback_candidate_short_partial = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id = None
@@ -796,6 +821,7 @@ class ConversationSessionWorker:
         guard = self._echo_guard
         if guard is None or not guard.is_transcript_echo(transcript.text):
             return False
+        self._playback_candidate_text_echo_seen = True
         observer = self._observer
         if observer is not None:
             self._notify_advisory(observer, "transcript_echo_suppressed", {})

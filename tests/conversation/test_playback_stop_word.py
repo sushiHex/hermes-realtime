@@ -14,8 +14,9 @@ import json
 import pytest
 
 from hermes_realtime.conversation import ConversationSessionWorker
+from hermes_realtime.conversation import worker as worker_module
 from hermes_realtime.providers.moonshine import MoonshineStreamingTranscriber
-from hermes_realtime.speech import AudioFrame, SpeechPresence, Transcript, VoiceActivity
+from hermes_realtime.speech import AudioFrame, SpeechPresence, VoiceActivity
 from tests.conversation.test_worker import (
     ScriptedEchoGuard,
     ScriptedSpeechPresenceVerifier,
@@ -85,7 +86,7 @@ async def test_final_only_stop_word_interrupts_playback(
 ) -> None:
     texts, interrupted, observed = await _capture(final)
 
-    assert texts == [final]
+    assert texts == [final.strip()]  # the Moonshine wrapper trims its final
     assert interrupted is True
     assert observed.count("interrupt_requested") == 1
     assert "playback_silenced" in observed
@@ -190,6 +191,18 @@ async def test_any_other_final_without_evidence_is_still_refused(
     final: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     await _assert_refused(capsys, final=final)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Stop.", True), (" stop ", True), ("\tSTOP!\n", True), ("'Stop.'", True),
+        ("stop...", True), ("Stop stop", False), ("st op", False), ("ſtop", False),
+        ("Ｓtop", False), ("", False), ("Stops", False),
+    ],
+)
+def test_stop_word_normalisation_is_one_ascii_token(text: str, expected: bool) -> None:
+    assert worker_module._is_playback_stop_word(text) is expected
 
 
 @pytest.mark.asyncio
