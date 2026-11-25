@@ -137,6 +137,97 @@ async def test_codex_cancel_selection_is_a_terminal_host_item_without_effects() 
         await inference.close()
 
 
+class _ProseAroundCancelTransport(DynamicStartCodexTransport):
+    """An assistant delta before the cancel_work call starts, and one after the call has
+    started but before its request arrives, in the order a real app server can send them.
+
+    ``started`` releases the call's start and the second delta; ``requested`` releases the
+    call's request and everything after it."""
+
+    def __init__(self, *, before: str, during: str) -> None:
+        super().__init__(tool="cancel_work", arguments={}, assistant_delta="Cancelled.")
+        self.started = asyncio.Event()
+        self.requested = asyncio.Event()
+        put = self.incoming.put
+        stages: tuple[list[dict[str, object]], list[dict[str, object]]] = ([], [])
+        flushed = False
+
+        def delta(item_id: str, text: str) -> dict[str, object]:
+            return {"method": "item/agentMessage/delta", "params": {
+                "threadId": "thread_server_1", "turnId": "turn_server_1",
+                "itemId": item_id, "delta": text,
+            }}
+
+        async def flush() -> None:
+            nonlocal flushed
+            for gate, held in zip((self.started, self.requested), stages, strict=True):
+                await gate.wait()
+                for message in held:
+                    await put(message)
+            flushed = True
+
+        async def put_with_prose(message: dict[str, object]) -> None:
+            method = message.get("method")
+            if flushed or method not in {"item/started", "item/tool/call"}:
+                await put(message)
+                return
+            if method == "item/started":
+                await put(delta("item_before_tool", before))
+                stages[0].extend((message, delta("item_during_tool", during)))
+                self._flush = asyncio.ensure_future(flush())
+            else:
+                stages[1].append(message)
+
+        self.incoming.put = put_with_prose  # type: ignore[method-assign]
+
+
+async def _yield_turns(count: int = 50) -> None:
+    for _ in range(count):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_codex_prose_before_the_cancel_call_is_yielded_and_prose_after_it_is_not() -> None:
+    """#582: a streaming provider's prose before the selection is spoken; none after it."""
+    transport = _ProseAroundCancelTransport(
+        before="Okay, let me take care of that for you now. ",
+        during="It has already been stopped for you. ",
+    )
+    handler = FakeWorkToolHandler(can_cancel_work=True)
+    inference = codex.CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    inference.bind_work_tools(handler)
+    stream = inference.stream(_request(offered=True), turn_id="turn_c")
+    rest: list[object] = []
+
+    async def drain() -> None:
+        async for part in stream:
+            rest.append(part)
+
+    remainder: asyncio.Future[None] | None = None
+    try:
+        async with asyncio.timeout(1):
+            assert await anext(stream) == "Okay, let me take care of that for you now."
+            remainder = asyncio.ensure_future(drain())
+            transport.started.set()
+            # The stream reads the delta after the selection started, before its receipt.
+            await _yield_turns()
+            assert rest == []
+            transport.requested.set()
+            await remainder
+            assert rest == [HostCancelRequest()]
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+    finally:
+        transport.started.set()
+        transport.requested.set()
+        if remainder is not None:
+            remainder.cancel()
+            await asyncio.gather(remainder, return_exceptions=True)
+        await stream.aclose()
+        await inference.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("offered", "arguments"),
