@@ -106,6 +106,8 @@ class _TaskCommandRouter(Protocol):
         authority: FinalInputAuthorityV1,
     ) -> CommandRoutingResultV1: ...
 
+    def intervening_spoken_input(self) -> None: ...
+
 
 class _ParticipantAudioSource(Protocol):
     async def receive_participant_audio(
@@ -120,7 +122,7 @@ class _PlaybackEchoGuard(Protocol):
 
     def is_transcript_echo(self, text: str) -> bool: ...
 
-    def has_recent_outbound_word(self, word: str) -> bool: ...
+    def has_recent_outbound_word_prefix(self, prefix: str) -> bool: ...
 
     def has_recent_playback(self) -> bool: ...
 
@@ -249,7 +251,7 @@ class ConversationSessionWorker:
             for method in (
                 "is_echo_dominated",
                 "is_transcript_echo",
-                "has_recent_outbound_word",
+                "has_recent_outbound_word_prefix",
                 "has_recent_playback",
             ):
                 if not callable(getattr(echo_guard, method, None)):
@@ -635,7 +637,7 @@ class ConversationSessionWorker:
                     if transcript.final:
                         self._observe_final_transcript(transcript)
                         if transcript is speech_only_final:
-                            await self._revoke_active_ticket("playback_stop_word")
+                            await self._silence_for_playback_stop_word()
                             continue
                         router = self._command_router
                         lifecycle = self._resolve_evidence_lifecycle()
@@ -753,16 +755,16 @@ class ConversationSessionWorker:
                                 and key == self._playback_candidate_short_partial)
                     # The exact stop word needs no partial (#576), under the same promotion
                     # and explicit verifier, unless this capture already matched outbound
-                    # text or recently played text contains the word itself: the text-echo
-                    # match cannot see a four-character word, so the assistant's own "stop"
-                    # would otherwise interrupt it.
+                    # text or recently played text has a word starting with it ("stop",
+                    # "stopped"): the text-echo match cannot see a four-character word, so
+                    # the assistant's own clipped "stop" would otherwise interrupt it.
                     guard = self._echo_guard
                     accepted = accepted or (
                         verified
                         and guard is not None
                         and not self._playback_candidate_text_echo_seen
                         and _is_playback_stop_word(transcript.text)
-                        and not guard.has_recent_outbound_word(_PLAYBACK_STOP_WORD)
+                        and not guard.has_recent_outbound_word_prefix(_PLAYBACK_STOP_WORD)
                     )
                     if accepted:
                         admitted.append(transcript)
@@ -826,6 +828,25 @@ class ConversationSessionWorker:
             observer("interrupt_requested", {"turnId": turn_id})
             observer("playback_silenced", {})
             self._notify_advisory(observer, "echo_barge_in_confirmed", {})
+
+    async def _silence_for_playback_stop_word(self) -> None:
+        """Consume a playback stop word (#576): silence speech, start no turn."""
+
+        # Whatever is speaking now stops, including a foreground that began after this
+        # capture's onset; the capture's own barge-in has usually already cancelled it.
+        turn_id = self._actions.foreground_turn_id
+        if self._actions.foreground_active and turn_id is not None:
+            cancelled = await self._actions.cancel_foreground_if(turn_id)
+            self._raise_if_closed()
+            observer = self._observer
+            if cancelled and observer is not None:
+                observer("interrupt_requested", {"turnId": turn_id})
+                observer("playback_silenced", {})
+        # Intervening input for a pending proposal; never evaluated as a confirmation.
+        router = self._command_router
+        if router is not None:
+            router.intervening_spoken_input()
+        await self._revoke_active_ticket("playback_stop_word")
 
     def _without_transcript_echoes(
         self,
