@@ -842,6 +842,24 @@ async def test_an_abandoned_chunks_clock_never_positions_another_chunk() -> None
 
 
 @pytest.mark.asyncio
+async def test_a_natural_finish_plays_out_the_exact_chunk_and_never_cuts_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A loud final word that runs to the last sample of the chunk.
+    samples = _word(200)
+    peer, source, _clock, chunk = await _published_peer(samples, played_ms=10)
+
+    await peer.finish_speech_chunk(chunk)
+
+    assert source.events == ["capture", "playout"]
+    assert source.captured == [samples]
+    assert source.closed is False
+    assert peer._publication_sid == "TR_speech"
+    assert peer._room.local_participant.unpublished == []
+    assert _stop_evidence(capsys) == []
+
+
+@pytest.mark.asyncio
 async def test_a_released_chunks_clock_is_retired_with_it() -> None:
     peer, source, clock, chunk = await _published_peer(_word(200), played_ms=50)
     await peer.finish_speech_chunk(chunk)
