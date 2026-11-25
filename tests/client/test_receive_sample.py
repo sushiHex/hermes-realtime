@@ -21,6 +21,7 @@ from hermes_realtime.livekit import LiveKitConnection
 _ORIGIN = "https://phone.test:8443"
 _FULL: dict[str, Any] = {
     "windowMs": 2_480,
+    "statsRead": True,
     "removedSamplesForAcceleration": 480,
     "insertedSamplesForDeceleration": 0,
     "concealedSamples": 240,
@@ -101,7 +102,13 @@ async def test_receive_sample_prints_one_marker_per_sample_and_omits_absent_fiel
     capsys.readouterr()
 
     assert await _post(app, token, _FULL) == 202
-    minimal = {"windowMs": 500, "duckActive": False, "pageUptimeS": 9, "roomUptimeS": 4}
+    minimal = {
+        "windowMs": 500,
+        "statsRead": False,
+        "duckActive": False,
+        "pageUptimeS": 9,
+        "roomUptimeS": 4,
+    }
     assert await _post(app, token, minimal) == 202
 
     assert _markers(capsys.readouterr().out) == [
@@ -109,6 +116,7 @@ async def test_receive_sample_prints_one_marker_per_sample_and_omits_absent_fiel
             "version": 1,
             "generation": 3,
             "window_ms": 2_480,
+            "stats_read": True,
             "removed_samples_for_acceleration": 480,
             "inserted_samples_for_deceleration": 0,
             "concealed_samples": 240,
@@ -124,6 +132,7 @@ async def test_receive_sample_prints_one_marker_per_sample_and_omits_absent_fiel
             "version": 1,
             "generation": 3,
             "window_ms": 500,
+            "stats_read": False,
             "duck_active": False,
             "page_uptime_s": 9,
             "room_uptime_s": 4,
@@ -139,6 +148,8 @@ async def test_receive_sample_prints_one_marker_per_sample_and_omits_absent_fiel
         ({"concealedSamples": 2.5}, TypeError),
         ({"concealedSamples": True}, TypeError),
         ({"duckActive": 1}, TypeError),
+        ({"statsRead": 1}, TypeError),
+        ({"statsRead": False}, ValueError),
         ({"concealedSamples": -1}, ValueError),
         ({"concealedSamples": 1_000_000_001}, ValueError),
         ({"windowMs": 600_001}, ValueError),
@@ -165,7 +176,7 @@ async def test_receive_sample_rejects_strings_out_of_range_and_unknown_fields(
 @pytest.mark.asyncio
 async def test_receive_sample_rejects_a_missing_required_field_and_a_bad_envelope() -> None:
     app, token = await _application()
-    for required in ("windowMs", "duckActive", "pageUptimeS", "roomUptimeS"):
+    for required in ("windowMs", "statsRead", "duckActive", "pageUptimeS", "roomUptimeS"):
         partial = {key: value for key, value in _FULL.items() if key != required}
         with pytest.raises(ValueError):
             await _post(app, token, partial)
@@ -187,11 +198,58 @@ async def test_receive_sample_rejects_a_missing_required_field_and_a_bad_envelop
 
 
 @pytest.mark.asyncio
+async def test_an_unread_sample_carries_no_delta_field(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    app, token = await _application()
+    unread = {
+        "windowMs": 0,
+        "statsRead": False,
+        "duckActive": True,
+        "audioContext": "running",
+        "pageUptimeS": 9,
+        "roomUptimeS": 4,
+    }
+    deltas = (
+        "removedSamplesForAcceleration",
+        "insertedSamplesForDeceleration",
+        "concealedSamples",
+        "silentConcealedSamples",
+        "concealmentEvents",
+        "meanTargetDelayMs",
+    )
+    capsys.readouterr()
+    for delta in deltas:
+        with pytest.raises(ValueError, match="unread"):
+            await _post(app, token, {**unread, delta: 0})
+    assert _markers(capsys.readouterr().out) == []
+    assert await _post(app, token, unread) == 202
+    assert _markers(capsys.readouterr().out) == [
+        {
+            "version": 1,
+            "generation": 3,
+            "window_ms": 0,
+            "stats_read": False,
+            "duck_active": True,
+            "audio_context": "running",
+            "page_uptime_s": 9,
+            "room_uptime_s": 4,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_receive_samples_are_capped_per_binding(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     app, token = await _application()
-    minimal = {"windowMs": 500, "duckActive": False, "pageUptimeS": 9, "roomUptimeS": 4}
+    minimal = {
+        "windowMs": 500,
+        "statsRead": False,
+        "duckActive": False,
+        "pageUptimeS": 9,
+        "roomUptimeS": 4,
+    }
     for _ in range(BrowserReceiveSample.MAX_PER_BINDING):
         assert await _post(app, token, minimal) == 202
     capsys.readouterr()
@@ -204,6 +262,7 @@ def test_receive_sample_validates_exact_types_directly() -> None:
     with pytest.raises(TypeError):
         BrowserReceiveSample(
             window_ms=500,
+            stats_read=False,
             duck_active=False,
             page_uptime_s=9,
             room_uptime_s=4,
