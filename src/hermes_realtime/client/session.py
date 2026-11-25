@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from threading import Lock
 from types import MethodType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from hermes_realtime.conversation.output_style import require_output_style
 from hermes_realtime.conversation.work_tools import WorkCommandAdmission
@@ -132,6 +132,86 @@ class BrowserAudioDiagnostic:
         ):
             if type(delta_ms) is not int or not 0 <= delta_ms <= 120_000:
                 raise ValueError("audio diagnostic renderer delta is invalid")
+
+
+_RECEIVE_COUNT_MAX = 1_000_000_000
+_RECEIVE_AUDIO_CONTEXT_STATES = frozenset({"running", "suspended", "closed", "interrupted"})
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserReceiveSample:
+    """Content-free deltas of the speech track's inbound audio stats for one delivered publication.
+
+    The window runs from the start of the publication's last chunk to 500 ms after its end.
+    ``None`` means the browser did not report the field; it is never read as zero.
+    ``stats_read`` is false when a stats read failed; such a sample carries no delta field.
+    """
+
+    MAX_PER_BINDING: ClassVar[int] = 2_048
+
+    window_ms: int
+    stats_read: bool
+    duck_active: bool
+    page_uptime_s: int
+    room_uptime_s: int
+    audio_context: str | None
+    removed_samples_for_acceleration: int | None
+    inserted_samples_for_deceleration: int | None
+    concealed_samples: int | None
+    silent_concealed_samples: int | None
+    concealment_events: int | None
+    mean_target_delay_ms: int | None
+
+    def __post_init__(self) -> None:
+        if type(self.duck_active) is not bool or type(self.stats_read) is not bool:
+            raise TypeError("receive sample flags must be exact booleans")
+        bounded: tuple[tuple[int | None, int, bool], ...] = (
+            (self.window_ms, 600_000, True),
+            (self.page_uptime_s, 31_536_000, True),
+            (self.room_uptime_s, 31_536_000, True),
+            (self.removed_samples_for_acceleration, _RECEIVE_COUNT_MAX, False),
+            (self.inserted_samples_for_deceleration, _RECEIVE_COUNT_MAX, False),
+            (self.concealed_samples, _RECEIVE_COUNT_MAX, False),
+            (self.silent_concealed_samples, _RECEIVE_COUNT_MAX, False),
+            (self.concealment_events, _RECEIVE_COUNT_MAX, False),
+            (self.mean_target_delay_ms, 60_000, False),
+        )
+        for value, maximum, required in bounded:
+            if value is None and not required:
+                continue
+            if type(value) is not int:
+                raise TypeError("receive sample fields must be exact integers")
+            if not 0 <= value <= maximum:
+                raise ValueError("receive sample field is out of range")
+        if self.audio_context is not None and (
+            type(self.audio_context) is not str
+            or self.audio_context not in _RECEIVE_AUDIO_CONTEXT_STATES
+        ):
+            raise ValueError("receive sample audio context state is invalid")
+        if not self.stats_read and any(
+            value is not None for value, _, required in bounded if not required
+        ):
+            raise ValueError("an unread receive sample must not carry a delta field")
+
+    def evidence(self, generation: int) -> dict[str, int | bool | str]:
+        evidence: dict[str, int | bool | str] = {"version": 1, "generation": generation}
+        for name, value in (
+            ("window_ms", self.window_ms),
+            ("stats_read", self.stats_read),
+            ("removed_samples_for_acceleration", self.removed_samples_for_acceleration),
+            ("inserted_samples_for_deceleration", self.inserted_samples_for_deceleration),
+            ("concealed_samples", self.concealed_samples),
+            ("silent_concealed_samples", self.silent_concealed_samples),
+            ("concealment_events", self.concealment_events),
+            ("mean_target_delay_ms", self.mean_target_delay_ms),
+            ("duck_active", self.duck_active),
+            ("audio_context", self.audio_context),
+            ("page_uptime_s", self.page_uptime_s),
+            ("room_uptime_s", self.room_uptime_s),
+        ):
+            if value is not None:
+                evidence[name] = value
+        return evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,6 +666,7 @@ class BrowserSessionDirector:
         # decision in its own sequence, so it is given this one, which never restarts.
         self._approval_authority_sequence = 0
         self._audio_diagnostics: dict[str, BrowserAudioDiagnostic] = {}
+        self._receive_samples = 0
         self._last_activity: float | None = None
 
     @property
@@ -1044,6 +1125,7 @@ class BrowserSessionDirector:
             self._projection_resync_consumed = False
             self._active_media_incarnation = None
             self._audio_diagnostics.clear()
+            self._receive_samples = 0
             return credential
 
     async def revoke_evidence(
@@ -1207,6 +1289,7 @@ class BrowserSessionDirector:
                     replacement_generation,
                 )
                 self._audio_diagnostics.clear()
+                self._receive_samples = 0
                 self._touch_activity()
                 return credential
 
@@ -1436,6 +1519,31 @@ class BrowserSessionDirector:
                 await observer(identity, generation, diagnostic)
         except Exception:
             _LOGGER.warning("browser audio diagnostic observer failed", exc_info=True)
+
+    async def submit_receive_sample(
+        self,
+        *,
+        participant_identity: str,
+        sample: BrowserReceiveSample,
+    ) -> None:
+        """Print one bounded advisory receive-stats sample without conversation authority."""
+
+        if type(participant_identity) is not str:
+            raise TypeError("participant_identity must be an exact built-in string")
+        if type(sample) is not BrowserReceiveSample:
+            raise TypeError("sample must be an exact BrowserReceiveSample")
+        async with self._start_lock:
+            _, generation = self._require_active_binding(
+                participant_identity, "receive sample participant"
+            )
+            if self._receive_samples >= BrowserReceiveSample.MAX_PER_BINDING:
+                raise RuntimeError("receive sample binding capacity is exhausted")
+            self._receive_samples += 1
+        print(
+            "[browser-receive-sample] "
+            + json.dumps(sample.evidence(generation), separators=(",", ":")),
+            flush=True,
+        )
 
     async def submit_text(
         self,
@@ -2062,6 +2170,7 @@ class BrowserSessionDirector:
         self._last_proposal_decision = None
         self._last_proposal_failure = None
         self._audio_diagnostics.clear()
+        self._receive_samples = 0
         self._last_activity = None
 
     async def _invalidate_evidence(self, reason: BindingCloseReason) -> None:

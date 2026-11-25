@@ -414,6 +414,22 @@ From the host:
   `late_ms` how far past the planned stop the cut landed, and `clamped` that the playout clock
   had run past the end of the chunk. A `late_ms` well above 20, or `clamped` on a stop you
   heard mid-word, means the playout clock drifted from the audio: record it.
+- `[browser-receive-sample]`: one per delivered speech publication, reported by the page over
+  the audio-diagnostic endpoint (#556). A publication of several chunks gets one sample, covering
+  only its last chunk: the window runs from that chunk's start (or the publication's end, when
+  no start was seen; `window_ms` says how long) to 500 ms after the publication's end. It holds
+  how the browser's receiver handled the speech track in that window: the samples the jitter
+  buffer `removed_samples_for_acceleration`, `inserted_samples_for_deceleration`,
+  `concealed_samples` and `silent_concealed_samples`, the `concealment_events`, and the
+  `mean_target_delay_ms` of the jitter buffer; then whether the duck was active at the end
+  (`duck_active`), the mixing `audio_context` state and the page and room uptimes in seconds
+  (`page_uptime_s`, `room_uptime_s`). `stats_read: false` means a stats read failed or timed out:
+  the line still appears, with no delta fields. A field the browser did not report is left out,
+  never shown as 0. Only counts, flags and the state are sent; no text, identifier or audio. The
+  page and the host each stop after 2048 samples per session. When a reply's last word sounds
+  slurred, note the time and copy the last few of these lines: nonzero acceleration,
+  deceleration or non-silent concealment points at the receiver's jitter buffer; all zeros
+  points away from it, towards the mixing context or the audio output.
 - `[binding-speech]`: `cause: resisted`, speech the page's binding started, such as the
   readiness cue, did not stop within 10 s of the binding closing. The reload or reconnect that
   closed it fails, and a retry tries again. It is a finding.

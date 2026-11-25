@@ -102,6 +102,12 @@ import { mountTypedComposerEnterSubmission } from "./typed-composer";
 import { mountTaskCancelControl } from "./task-controls";
 import { VoiceDeleteControls } from "./voice-delete-controls";
 import { PlaybackOutputGate, PlaybackVolumeControls } from "./playback-volume";
+import {
+  audioContextStateName,
+  ReceiveStatsSampler,
+  type ReceiveStatsContext,
+  type ReceiveStatsSample,
+} from "./receive-stats";
 import { TaskProposalControls } from "./task-proposals";
 import {
   parseBootstrapCredential,
@@ -421,6 +427,16 @@ let microphoneMutePending = false;
 const microphoneReadinessAuthority = new MicrophoneReadinessAuthority<Room, LocalTrack>();
 const reconnectMicrophoneQueue = new SerializedAsyncQueue();
 const audioDiagnosticQueue = new SerializedAsyncQueue();
+let roomStartedAt: number | null = null;
+const receiveStatsSampler = new ReceiveStatsSampler({
+  readStats: async () => {
+    const track = activeRemoteTrack;
+    return track === null ? undefined : await track.getRTCStatsReport();
+  },
+  submit: submitReceiveStatsSample,
+  now: () => performance.now(),
+  delay: (ms) => new Promise<void>((resolve) => window.setTimeout(resolve, ms)),
+});
 const typedSubmissionQueue = new SerializedAsyncQueue();
 const maxTypedSubmissions = 8;
 let typedSubmissionCount = 0;
@@ -1631,6 +1647,7 @@ function applySpeechTiming(timing: SpeechTiming): void {
   ) {
     streamMediaStarts.beginPassage(timing.chunkId, remoteAudio.currentTime);
     window.requestAnimationFrame(() => observeSpeechPassageStart(timing, 0));
+    receiveStatsSampler.chunkStarted();
   }
   const view = assistantTurns.get(timing.presentationTurnId);
   if (view === undefined || view.assembler.turnGeneration !== timing.turnGeneration) return;
@@ -1903,6 +1920,10 @@ function projectPublicEvent(event: PublicEvent): void {
     if (typeof text === "string" && (role === "user" || role === "assistant")) {
       if (role === "assistant") {
         const identity = assistantEventIdentity(event);
+        if (identity !== null && activeRemoteTrack !== null) {
+          // One receive-stats sample per delivered publication, from its last chunk's start.
+          recordReceiveStatsDisposition();
+        }
         if (identity === null) {
           addTranscript("Assistant", text);
         } else if (typeof event.data.segmentId === "string") {
@@ -2984,6 +3005,48 @@ async function submitAudioDiagnostic(
   });
 }
 
+function recordReceiveStatsDisposition(): void {
+  let disposition: string;
+  try {
+    disposition = receiveStatsSampler.publicationDelivered(receiveStatsContext());
+  } catch {
+    disposition = "invalid-context";
+  }
+  if (disposition !== "sampled" && disposition !== "ignored") {
+    addMarker(`receive_stats_${disposition.replace("-", "_")}`);
+  }
+}
+
+function receiveStatsContext(): ReceiveStatsContext {
+  const now = performance.now();
+  // livekit-client 2.22 keeps the webAudioMix context private; read its state defensively.
+  const mixing = (activeRemoteTrack as unknown as { audioContext?: { state?: unknown } } | null)
+    ?.audioContext;
+  return {
+    duckActive: provisionalSpeechYieldController.attenuated,
+    audioContext: audioContextStateName(mixing?.state),
+    pageUptimeS: now / 1_000,
+    roomUptimeS: roomStartedAt === null ? -1 : (now - roomStartedAt) / 1_000,
+  };
+}
+
+async function submitReceiveStatsSample(sample: ReceiveStatsSample): Promise<void> {
+  const activeCredential = credential;
+  if (activeCredential === null) return;
+  await fetch("/api/v1/audio-diagnostic", {
+    method: "POST",
+    headers: {
+      ...authorization(activeCredential.token),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ version: 1, receive: sample }),
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+    signal: AbortSignal.timeout(5_000),
+  });
+}
+
 function recordSupersededRecovery(stage: ConnectionFailureStage): void {
   console.info(`[connection-recovery] ${JSON.stringify({ stage, category: "superseded" })}`);
 }
@@ -3532,6 +3595,7 @@ async function connect(projectionResync = false): Promise<void> {
     attempt = new ConnectionAttempt<Room>((obsoleteRoom) => obsoleteRoom.disconnect());
     connectionAttempt = attempt;
     room = activeRoom;
+    roomStartedAt = performance.now();
     microphoneEnumerationAuthority.invalidate();
     bindRoomEvents(activeRoom);
     failureStage = "media";

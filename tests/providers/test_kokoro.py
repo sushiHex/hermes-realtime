@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import struct
 import sys
 import threading
 import urllib.request
@@ -718,6 +719,27 @@ async def test_kokoro_linearly_upsamples_native_pcm_for_livekit_transport() -> N
         b"\x18\xfc"  # -1000
         b"\x18\xfc"  # terminal sample
     )
+    await tts.close()
+
+
+@pytest.mark.asyncio
+async def test_kokoro_keeps_every_final_sample_and_pads_only_after_them() -> None:
+    # A native tail that ends mid-block and loud: the last word's final samples.
+    native = [((-1) ** index) * (1_000 + 37 * index) for index in range(301)]
+    native_pcm = struct.pack(f"<{len(native)}h", *native)
+    tts = KokoroSynthesizer(synthesize_pcm=lambda *_: native_pcm)
+
+    chunk = await anext(tts.synthesize("Tail.", "turn_tail"))
+
+    transport = list(struct.unpack(f"<{len(chunk.audio.pcm) // 2}h", chunk.audio.pcm))
+    upsampled = [0] * (2 * len(native))
+    upsampled[0::2] = native
+    upsampled[1:-1:2] = [(a + b) // 2 for a, b in zip(native, native[1:], strict=False)]
+    upsampled[-1] = native[-1]
+    assert len(transport) % 480 == 0
+    assert transport[: len(upsampled)] == upsampled
+    assert len(transport) - len(upsampled) < 480
+    assert set(transport[len(upsampled) :]) == {0}
     await tts.close()
 
 

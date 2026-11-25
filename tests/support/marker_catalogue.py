@@ -41,6 +41,9 @@ EMIT_SITES: dict[str, dict[str, int]] = {
     "browser-model-admission": {
         "src/hermes_realtime/client/session.py": 1,
     },
+    "browser-receive-sample": {
+        "src/hermes_realtime/client/session.py": 1,
+    },
     "browser-request": {
         "src/hermes_realtime/client/server.py": 1,
     },
@@ -905,6 +908,11 @@ UNPROVEN_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
     "src/hermes_realtime/client/server.py": {
         "browser-request": (
             "status: call: error_status(error)",
+        ),
+    },
+    "src/hermes_realtime/client/session.py": {
+        "browser-receive-sample": (
+            "*: call: sample.evidence(generation)",
         ),
     },
     "src/hermes_realtime/companion/archive.py": {
