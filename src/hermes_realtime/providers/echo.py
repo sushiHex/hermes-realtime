@@ -235,13 +235,14 @@ class PlaybackEchoGuard:
         reference_windows: list[tuple[memoryview, int]] = []
         reference_analysis_bytes = 0
         for reference in references:
-            reference_time = now if reference.ended_at is None else min(now, reference.ended_at)
-            elapsed_samples = round(
-                (reference_time - reference.started_at) * self._analysis_rate_hz
-            )
+            # The capture ends now, so delays count back from now; only audio that was
+            # actually played (up to ended_at) may serve as reference.
+            played_time = now if reference.ended_at is None else min(now, reference.ended_at)
+            played_samples = round((played_time - reference.started_at) * self._analysis_rate_hz)
+            elapsed_samples = round((now - reference.started_at) * self._analysis_rate_hz)
             available_samples = len(reference.frame.pcm) // (2 * factor)
             window_start = max(0, elapsed_samples - max_delay_samples - len(mic))
-            window_end = min(available_samples, elapsed_samples)
+            window_end = min(available_samples, played_samples)
             if window_start >= window_end:
                 continue
             raw_start = window_start * factor * 2
@@ -254,12 +255,11 @@ class PlaybackEchoGuard:
 
         step_samples = max(1, round(self._delay_step_ms * self._analysis_rate_hz / 1_000))
         correlation_work = 0
-        for window, elapsed_samples in reference_windows:
-            outbound_length = window.nbytes // (2 * factor)
+        for _window, elapsed_samples in reference_windows:
             for delay_samples in range(0, max_delay_samples + 1, step_samples):
                 end = elapsed_samples - delay_samples
                 start = end - len(mic)
-                if start < 0 or end > outbound_length:
+                if start < 0:
                     continue
                 correlation_work += len(mic)
                 if correlation_work > self._max_correlation_work:
@@ -292,10 +292,12 @@ class PlaybackEchoGuard:
         for window, elapsed_samples in reference_windows:
             pcm = np.frombuffer(window, dtype="<i2").astype(np.float64)
             outbound = self._downsample(pcm, factor)
+            # Nothing is played after playback ended, so the reference is silent up to now.
+            outbound = np.pad(outbound, (0, max(0, elapsed_samples - len(outbound))))
             for delay_samples in range(0, max_delay_samples + 1, step_samples):
                 end = elapsed_samples - delay_samples
                 start = end - len(mic)
-                if start < 0 or end > len(outbound):
+                if start < 0:
                     continue
                 candidate = outbound[start:end]
                 candidate_mean = float(candidate.mean())
