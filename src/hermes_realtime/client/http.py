@@ -27,7 +27,12 @@ from hermes_realtime.search_egress import (
 
 from .bootstrap import BrowserJoinCredential, BrowserTokenVerifier, OneTimeBootstrapCapability
 from .loopback import LoopbackPeerAddress, LoopbackPeerAuthorizer
-from .session import BrowserAudioDiagnostic, BrowserSessionDirector, NoBrowserSession
+from .session import (
+    BrowserAudioDiagnostic,
+    BrowserReceiveSample,
+    BrowserSessionDirector,
+    NoBrowserSession,
+)
 from .tailnet import TailnetPeerAddress, TailnetPeerAuthorizer
 
 StablePeerAddress = LoopbackPeerAddress | TailnetPeerAddress
@@ -53,6 +58,43 @@ def _strict_json_body(body: bytes, label: str) -> Any:
         return json.loads(body.decode("utf-8"), object_pairs_hook=_strict_json_object)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError(f"{label} body must be strict UTF-8 JSON") from None
+
+
+_RECEIVE_REQUIRED = {
+    "windowMs": "window_ms",
+    "duckActive": "duck_active",
+    "pageUptimeS": "page_uptime_s",
+    "roomUptimeS": "room_uptime_s",
+}
+_RECEIVE_OPTIONAL = {
+    "audioContext": "audio_context",
+    "removedSamplesForAcceleration": "removed_samples_for_acceleration",
+    "insertedSamplesForDeceleration": "inserted_samples_for_deceleration",
+    "concealedSamples": "concealed_samples",
+    "silentConcealedSamples": "silent_concealed_samples",
+    "concealmentEvents": "concealment_events",
+    "meanTargetDelayMs": "mean_target_delay_ms",
+}
+
+
+def _receive_sample(decoded: dict[str, object]) -> BrowserReceiveSample:
+    receive = decoded["receive"]
+    version = decoded["version"]
+    if type(version) is not int or version != 1:
+        raise ValueError("receive sample version is invalid")
+    if (
+        type(receive) is not dict
+        or not set(_RECEIVE_REQUIRED) <= set(receive)
+        or not set(receive) <= set(_RECEIVE_REQUIRED) | set(_RECEIVE_OPTIONAL)
+    ):
+        raise ValueError("receive sample fields are invalid")
+    fields: dict[str, Any] = dict.fromkeys(_RECEIVE_OPTIONAL.values())
+    for key, name in (_RECEIVE_REQUIRED | _RECEIVE_OPTIONAL).items():
+        if key in receive:
+            if receive[key] is None:
+                raise ValueError("receive sample absent fields must be omitted")
+            fields[name] = receive[key]
+    return BrowserReceiveSample(**fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +504,14 @@ class BrowserBootstrapApplication:
                 raise ValueError("audio diagnostic content-type must be application/json")
             identity = self._verifier.verify(bearer)
             decoded = _strict_json_body(body, "audio diagnostic")
+            if type(decoded) is dict and set(decoded) == {"version", "receive"}:
+                sample = _receive_sample(decoded)
+                await self._sessions.submit_receive_sample(
+                    participant_identity=identity, sample=sample
+                )
+                return BrowserBootstrapResponse(
+                    status=202, headers=self._RESPONSE_HEADERS, body=b'{"version":1}'
+                )
             if type(decoded) is not dict or set(decoded) != {
                 "version",
                 "streamId",
