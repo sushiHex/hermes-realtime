@@ -7,8 +7,10 @@ confirmed speech, when no transcript in the capture matched outbound text, and w
 recently played assistant text contains the word. Every other short final without evidence
 stays refused (R2-14).
 
-However it was admitted, an exact stop word captured during playback is speech-only (owner
-decision): it stops the current speech exactly as any barge-in does, is shown as the user's
+However it was admitted, an exact stop word is speech-only (owner decision) when there is a
+reply to silence: a foreground was speaking at the capture's onset or is speaking when the
+word is consumed. In the playback tail with nothing speaking it behaves exactly as on main.
+Speech-only, it stops the current speech exactly as any barge-in does, is shown as the user's
 final, and is then consumed. It silences whatever foreground is playing when it is consumed,
 retires a pending proposal as any non-confirmation input does, and is never evaluated as a
 confirmation. It starts no model turn, so it can never become a cancel selection; background
@@ -89,8 +91,11 @@ async def _capture(
     recent_playback: bool = True,
     guard: bool = True,
     late_foreground: bool = False,
+    reply_ends_naturally: bool = False,
 ) -> tuple[list[str], bool, list[str]]:
     actions, cancelled, responses = action_executor_probe()
+    if reply_ends_naturally:
+        actions._speech._interruption_settled_naturally = lambda _: True  # type: ignore[attr-defined]
     actions._speech.foreground_active = foreground  # type: ignore[attr-defined]
     actions._speech.active_turn_id = "foreground_1" if foreground else None  # type: ignore[attr-defined]
     observed: list[str] = []
@@ -121,6 +126,10 @@ async def _capture(
             # Speech (a proactive update, say) starts after this capture's onset.
             actions._speech.foreground_active = True  # type: ignore[attr-defined]
             actions._speech.active_turn_id = "foreground_late"  # type: ignore[attr-defined]
+        if reply_ends_naturally:
+            # The reply that was speaking at onset finishes on its own before the endpoint.
+            actions._speech.foreground_active = False  # type: ignore[attr-defined]
+            actions._speech.active_turn_id = None  # type: ignore[attr-defined]
         await worker.receive_audio("participant", 1, _FRAMES[1])
         await worker.wait_for_responses()
         interrupted = cancelled.is_set()  # before close, which ends the foreground
@@ -175,12 +184,35 @@ async def test_stop_word_with_streaming_evidence_is_speech_only_too() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_word_in_the_playback_tail_starts_no_turn() -> None:
-    texts, interrupted, observed = await _capture("Stop.", foreground=False)
+async def test_stop_word_with_a_partial_in_the_playback_tail_is_an_ordinary_turn() -> None:
+    # Nothing is speaking at onset or at the endpoint: there is no reply to silence, so a
+    # consumed "stop" would silently drop the user's input. It is a turn, as on main.
+    texts, interrupted, observed = await _capture("Stop.", "Stop", foreground=False)
 
-    assert texts == []
+    assert texts == ["Stop."]
     assert interrupted is False
     assert "interrupt_requested" not in observed
+    assert observed.count("transcript_final") == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_word_without_a_partial_in_the_playback_tail_is_refused_as_on_main(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The partial-less admission exists only to silence a reply; with none it never
+    # creates a turn that main would not have created.
+    await _assert_refused(capsys, foreground=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partials", [(), ("Stop",)], ids=["no-partial", "streaming-partial"])
+async def test_stop_word_is_consumed_when_the_interrupted_reply_ended_before_the_endpoint(
+    partials: tuple[str, ...],
+) -> None:
+    texts, interrupted, observed = await _capture("Stop.", *partials, reply_ends_naturally=True)
+
+    assert texts == []
+    assert interrupted is False  # nothing left to cancel
     assert observed.count("transcript_final") == 1
 
 
