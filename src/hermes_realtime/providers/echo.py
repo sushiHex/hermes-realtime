@@ -185,6 +185,22 @@ class PlaybackEchoGuard:
                 return True
         return False
 
+    def has_recent_outbound_word_prefix(self, prefix: str) -> bool:
+        """Whether active or retained outbound text has a word starting with ``prefix``."""
+
+        if type(prefix) is not str:
+            raise TypeError("prefix must be an exact built-in string")
+        if not prefix or self._normalized_text(prefix) != prefix or " " in prefix:
+            raise ValueError("prefix must be one normalized word")
+        now = float(self._clock())
+        self._purge_retired(now)
+        references = (
+            *((self._active,) if self._active is not None else ()),
+            *self._retired,
+        )
+        # Normalized text is single-space separated words, so this is a word-start match.
+        return any(f" {prefix}" in f" {reference.normalized_text}" for reference in references)
+
     def has_recent_playback(self) -> bool:
         """Whether active or retained playback can still contaminate microphone PCM."""
 

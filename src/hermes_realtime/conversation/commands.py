@@ -324,6 +324,17 @@ class ConversationTaskCommandRouter:
         confirmed = await self._route_confirmation(text, authority)
         return self._not_command_result(authority) if confirmed is None else confirmed
 
+    def intervening_spoken_input(self) -> None:
+        """A microphone final consumed without a turn retires a pending proposal (#576).
+
+        It is the non-confirmation outcome of ``_route_confirmation`` without its text:
+        the consumed input is never evaluated as a confirmation.
+        """
+
+        proposals = self._task_proposals
+        if proposals is not None and proposals.has_pending:
+            proposals.intervening_input()
+
     async def _route_confirmation(
         self,
         text: str,

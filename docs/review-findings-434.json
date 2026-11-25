@@ -252,8 +252,8 @@
       "id": "R2-14",
       "status": "accepted_limit",
       "canonical_id": "R2-14",
-      "reason": "Short final-only responses within retained echo playback are deliberately refused when streaming evidence has fewer than three alphanumerics. This is the implemented echo false-positive/false-negative policy, not an accidental missing branch; changing it alters the excluded acceptance gate.",
-      "evidence": "worker.py _with_playback_authority; tests/conversation/test_worker.py retained echo tail and post-foreground streaming evidence tests.",
+      "reason": "Short final-only responses within retained echo playback are deliberately refused when streaming evidence has fewer than three alphanumerics. This is the implemented echo false-positive/false-negative policy, not an accidental missing branch; changing it alters the excluded acceptance gate. Two narrow exceptions apply, each only after echo promotion with an explicit speech verifier: a two-character final matching its own same-capture partial (#587), and a final that is exactly the single word \"stop\" when a reply was speaking at the capture's onset or is speaking at its endpoint, no transcript in the capture matched outbound text, and no recently played assistant text has a word starting with \"stop\" (#576). Every other short final without streaming evidence is still refused, including a partial-less \"stop\" in the playback tail with nothing speaking. By owner decision (#576), an exact stop word with a reply to silence (one speaking at the capture's onset, or at the point the word is consumed), however admitted, only stops speech as a barge-in does: it is shown as the user's final, retires a pending task proposal as any non-confirmation input does, and starts no model turn, so it cannot select a task cancellation. With nothing speaking at either point it behaves exactly as before #576.",
+      "evidence": "worker.py _with_playback_authority; tests/conversation/test_worker.py retained echo tail and post-foreground streaming evidence tests; tests/conversation/test_short_playback_final.py; tests/conversation/test_playback_stop_word.py.",
       "commit": null
     },
     {

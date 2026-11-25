@@ -261,6 +261,39 @@ def test_playback_echo_guard_matches_active_and_recent_outbound_text() -> None:
     )
 
 
+def test_playback_echo_guard_reports_a_word_prefix_in_recent_outbound_text() -> None:
+    # #576: the transcript-echo match cannot see a four-character word; this query can.
+    clock = Clock()
+    guard = PlaybackEchoGuard(clock=clock, tail_seconds=1.0)
+    assert guard.has_recent_outbound_word_prefix("stop") is False
+    token = guard.begin_playback(_frame(_speech(48_000, 65)), "Say STOP, and I'll stop.")
+
+    assert guard.has_recent_outbound_word_prefix("stop") is True
+    clock.now = 1.0
+    guard.end_playback(token)
+    clock.now = 1.9
+    assert guard.has_recent_outbound_word_prefix("stop") is True
+    clock.now = 2.01
+    assert guard.has_recent_outbound_word_prefix("stop") is False
+
+    for outbound in ("Unstoppable.", "Nonstop.", "st op", "Halt."):
+        word_guard = PlaybackEchoGuard(clock=clock)
+        word_guard.begin_playback(_frame(_speech(48_000, 66)), outbound)
+        assert word_guard.has_recent_outbound_word_prefix("stop") is False, outbound
+    for outbound in (
+        "Don't stop.", "stop", "Stop-start.", "It stopped.", "Stops here.", "Keep stopping.",
+    ):
+        word_guard = PlaybackEchoGuard(clock=clock)
+        word_guard.begin_playback(_frame(_speech(48_000, 67)), outbound)
+        assert word_guard.has_recent_outbound_word_prefix("stop") is True, outbound
+
+    for prefix in ("", "two words", "Stop"):
+        with pytest.raises(ValueError, match="one normalized word"):
+            guard.has_recent_outbound_word_prefix(prefix)
+    with pytest.raises(TypeError):
+        guard.has_recent_outbound_word_prefix(b"stop")  # type: ignore[arg-type]
+
+
 def test_playback_echo_guard_matches_short_multiword_outbound_text() -> None:
     guard = PlaybackEchoGuard()
     guard.begin_playback(

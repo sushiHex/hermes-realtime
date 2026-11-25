@@ -34,10 +34,11 @@ async def _barge_in(
     *,
     streams_partials: bool = True,
     partial: str | None = "Stop",
+    final: str = "Stop.",
     transcript_echoes: tuple[str, ...] = (),
 ) -> tuple[ScriptedMoonshineBackend, bool, list[tuple[str, Transcript]], list[str]]:
     executor, foreground_cancelled, responses = action_executor_probe()
-    backend = ScriptedMoonshineBackend(partial, final="Stop.")
+    backend = ScriptedMoonshineBackend(partial, final=final)
     observed: list[str] = []
     worker = ConversationSessionWorker(
         participant_identity="browser_user",
@@ -68,9 +69,9 @@ async def test_control_without_the_evidence_rule_the_same_barge_in_is_admitted()
     assert backend.add_sizes and backend.finish_calls == 1
     assert cancelled is True
     assert "interrupt_requested" in observed
-    assert [transcript for _turn, transcript in responses] == [
-        Transcript(text="Stop.", final=True)
-    ]
+    # Admitted, then consumed as speech-only: a playback stop word starts no turn.
+    assert "transcript_final" in observed
+    assert responses == []
 
 
 @pytest.mark.asyncio
@@ -82,25 +83,41 @@ async def test_endpoint_promoted_short_word_keeps_its_drained_streaming_partial(
     assert "transcript_partial" in observed
     assert cancelled is True
     assert "interrupt_requested" in observed
-    assert [transcript for _turn, transcript in responses] == [
-        Transcript(text="Stop.", final=True)
-    ]
+    assert "transcript_final" in observed
+    assert responses == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial", (None, "No"), ids=("no-partial", "subthreshold-partial"))
+async def test_an_exact_stop_word_final_needs_no_drained_evidence(partial: str | None) -> None:
+    # The single stop word is relieved of partial evidence under its acoustic gates (#576).
+    backend, cancelled, responses, observed = await _barge_in(partial=partial)
+
+    assert backend.add_sizes and backend.finish_calls == 1
+    assert cancelled is True
+    assert "interrupt_requested" in observed
+    assert "transcript_final" in observed
+    assert responses == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("partial", "transcript_echoes", "echo_suppressed"),
+    ("partial", "final", "transcript_echoes", "echo_suppressed"),
     (
-        pytest.param(None, (), False, id="no-partial"),
-        pytest.param("No", (), False, id="subthreshold-partial"),
-        pytest.param("Stop", ("Stop",), True, id="echoed-partial"),
+        pytest.param(None, "Chapter 3.", (), False, id="no-partial"),
+        pytest.param("No", "Chapter 3.", (), False, id="subthreshold-partial"),
+        # Long enough for the real guard's text match, which never matches a short word.
+        pytest.param(
+            "yes i can switch models", "Chapter 3.", ("yes i can switch models",), True,
+            id="echoed-partial",
+        ),
     ),
 )
 async def test_drained_partial_without_evidence_leaves_the_final_unauthoritative(
-    partial: str | None, transcript_echoes: tuple[str, ...], echo_suppressed: bool
+    partial: str | None, final: str, transcript_echoes: tuple[str, ...], echo_suppressed: bool
 ) -> None:
     backend, cancelled, responses, observed = await _barge_in(
-        partial=partial, transcript_echoes=transcript_echoes
+        partial=partial, final=final, transcript_echoes=transcript_echoes
     )
 
     assert backend.add_sizes and backend.finish_calls == 1

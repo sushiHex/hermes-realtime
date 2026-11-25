@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import math
+import string
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -69,6 +70,17 @@ def _short_transcript_key(text: str) -> str | None:
     return key if len(key) == 2 and key.isalnum() else None
 
 
+# The one word a playback final may carry without a streaming partial (#576): a short barge-in
+# can end before the STT raises any partial. Exactly one token; ASCII space and punctuation
+# around it are ignored, nothing else is.
+_PLAYBACK_STOP_WORD = "stop"
+_PLAYBACK_STOP_WORD_SURROUNDINGS = string.whitespace + string.punctuation
+
+
+def _is_playback_stop_word(text: str) -> bool:
+    return text.strip(_PLAYBACK_STOP_WORD_SURROUNDINGS).lower() == _PLAYBACK_STOP_WORD
+
+
 class _VoiceActivityDetector(Protocol):
     def process(self, frame: AudioFrame) -> VoiceActivity: ...
 
@@ -94,6 +106,8 @@ class _TaskCommandRouter(Protocol):
         authority: FinalInputAuthorityV1,
     ) -> CommandRoutingResultV1: ...
 
+    def intervening_spoken_input(self) -> None: ...
+
 
 class _ParticipantAudioSource(Protocol):
     async def receive_participant_audio(
@@ -107,6 +121,8 @@ class _PlaybackEchoGuard(Protocol):
     def is_echo_dominated(self, frames: tuple[AudioFrame, ...]) -> bool: ...
 
     def is_transcript_echo(self, text: str) -> bool: ...
+
+    def has_recent_outbound_word_prefix(self, prefix: str) -> bool: ...
 
     def has_recent_playback(self) -> bool: ...
 
@@ -173,6 +189,10 @@ class ConversationSessionWorker:
             getattr(command_router, "route_spoken", None)
         ):
             raise TypeError("command_router must provide route_spoken()")
+        if command_router is not None and not callable(
+            getattr(command_router, "intervening_spoken_input", None)
+        ):
+            raise TypeError("command_router must provide intervening_spoken_input()")
         if (
             evidence_lifecycle is not None
             and type(evidence_lifecycle) is not EvidenceConversationAuthorityV1
@@ -235,6 +255,7 @@ class ConversationSessionWorker:
             for method in (
                 "is_echo_dominated",
                 "is_transcript_echo",
+                "has_recent_outbound_word_prefix",
                 "has_recent_playback",
             ):
                 if not callable(getattr(echo_guard, method, None)):
@@ -310,6 +331,7 @@ class ConversationSessionWorker:
         self._interruption_committed = False
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
+        self._playback_candidate_text_echo_seen = False
         self._playback_candidate_short_partial: str | None = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id: str | None = None
@@ -437,6 +459,7 @@ class ConversationSessionWorker:
                         confirmation_required and self._stt_streams_partials
                     )
                     self._playback_candidate_streaming_evidence = False
+                    self._playback_candidate_text_echo_seen = False
                     self._playback_candidate_short_partial = None
                     if echo_dominated or confirmation_required:
                         self._echo_suppressed = True
@@ -526,6 +549,7 @@ class ConversationSessionWorker:
                         utterance_ended = True
 
                 transcripts: tuple[Transcript, ...] = ()
+                speech_only_final: Transcript | None = None
                 for utterance_frame in frames_to_push:
                     raw_transcripts = self._without_transcript_echoes(
                         self._trusted_transcripts(await self._stt.push(utterance_frame))
@@ -593,6 +617,12 @@ class ConversationSessionWorker:
                         if admitted_final:
                             transcripts = (*transcripts, *admitted_final)
                             self._utterance_has_final_transcript = True
+                            # Owner decision (#576): a bare stop word with a reply to
+                            # silence only silences it; it starts no turn.
+                            if self._stop_word_has_reply_to_silence() and (
+                                _is_playback_stop_word(admitted_final[0].text)
+                            ):
+                                speech_only_final = admitted_final[0]
                     if (
                         self._interruption_committed
                         and not self._utterance_has_final_transcript
@@ -608,6 +638,9 @@ class ConversationSessionWorker:
                 for transcript in transcripts:
                     if transcript.final:
                         self._observe_final_transcript(transcript)
+                        if transcript is speech_only_final:
+                            await self._silence_for_playback_stop_word()
+                            continue
                         router = self._command_router
                         lifecycle = self._resolve_evidence_lifecycle()
                         authority: FinalInputAuthorityV1 | None = None
@@ -718,9 +751,26 @@ class ConversationSessionWorker:
                     # that check and cannot authorize this additional short-final path.
                     # Agreement is consistency, not independent recognition (the STT
                     # wrapper can fall back to its last partial at the endpoint).
-                    accepted = (self._speech_presence_verifier is not None
+                    verified = self._speech_presence_verifier is not None
+                    accepted = (verified
                                 and key is not None
                                 and key == self._playback_candidate_short_partial)
+                    # The exact stop word needs no partial (#576), under the same promotion
+                    # and explicit verifier, unless this capture already matched outbound
+                    # text or recently played text has a word starting with it ("stop",
+                    # "stopped"): the text-echo match cannot see a four-character word, so
+                    # the assistant's own clipped "stop" would otherwise interrupt it.
+                    # It exists only to silence a reply, so it needs one: it never creates
+                    # a turn that main would not have created.
+                    guard = self._echo_guard
+                    accepted = accepted or (
+                        verified
+                        and guard is not None
+                        and self._stop_word_has_reply_to_silence()
+                        and not self._playback_candidate_text_echo_seen
+                        and _is_playback_stop_word(transcript.text)
+                        and not guard.has_recent_outbound_word_prefix(_PLAYBACK_STOP_WORD)
+                    )
                     if accepted:
                         admitted.append(transcript)
                 finally:
@@ -743,6 +793,7 @@ class ConversationSessionWorker:
     def _clear_playback_candidate_authority(self) -> None:
         self._playback_candidate_requires_streaming_evidence = False
         self._playback_candidate_streaming_evidence = False
+        self._playback_candidate_text_echo_seen = False
         self._playback_candidate_short_partial = None
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id = None
@@ -782,6 +833,37 @@ class ConversationSessionWorker:
             observer("playback_silenced", {})
             self._notify_advisory(observer, "echo_barge_in_confirmed", {})
 
+    def _stop_word_has_reply_to_silence(self) -> bool:
+        """#576: a stop word is speech-only only when there is a reply to silence.
+
+        A foreground was speaking at this capture's onset (it may since have ended on its
+        own), or one is speaking now. In the playback tail with nothing speaking there is
+        nothing to silence, and the word behaves exactly as on main.
+        """
+
+        return self._interruption_foreground_turn_id is not None or (
+            self._actions.foreground_active
+        )
+
+    async def _silence_for_playback_stop_word(self) -> None:
+        """Consume a playback stop word (#576): silence speech, start no turn."""
+
+        # Whatever is speaking now stops, including a foreground that began after this
+        # capture's onset; the capture's own barge-in has usually already cancelled it.
+        turn_id = self._actions.foreground_turn_id
+        if self._actions.foreground_active and turn_id is not None:
+            cancelled = await self._actions.cancel_foreground_if(turn_id)
+            self._raise_if_closed()
+            observer = self._observer
+            if cancelled and observer is not None:
+                observer("interrupt_requested", {"turnId": turn_id})
+                observer("playback_silenced", {})
+        # Intervening input for a pending proposal; never evaluated as a confirmation.
+        router = self._command_router
+        if router is not None:
+            router.intervening_spoken_input()
+        await self._revoke_active_ticket("playback_stop_word")
+
     def _without_transcript_echoes(
         self,
         transcripts: tuple[Transcript, ...],
@@ -796,6 +878,7 @@ class ConversationSessionWorker:
         guard = self._echo_guard
         if guard is None or not guard.is_transcript_echo(transcript.text):
             return False
+        self._playback_candidate_text_echo_seen = True
         observer = self._observer
         if observer is not None:
             self._notify_advisory(observer, "transcript_echo_suppressed", {})
