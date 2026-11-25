@@ -112,12 +112,15 @@ class ScriptedEchoGuard:
         *decisions: bool,
         transcript_echoes: tuple[str, ...] = (),
         recent_playback: bool = False,
+        outbound_words: tuple[str, ...] = (),
     ) -> None:
         self._decisions = iter(decisions)
         self._transcript_echoes = frozenset(transcript_echoes)
         self._recent_playback = recent_playback
+        self._outbound_words = frozenset(outbound_words)
         self.windows: list[tuple[AudioFrame, ...]] = []
         self.transcripts: list[str] = []
+        self.outbound_word_queries: list[str] = []
 
     def is_echo_dominated(self, frames: tuple[AudioFrame, ...]) -> bool:
         self.windows.append(frames)
@@ -129,6 +132,10 @@ class ScriptedEchoGuard:
 
     def has_recent_playback(self) -> bool:
         return self._recent_playback
+
+    def has_recent_outbound_word(self, word: str) -> bool:
+        self.outbound_word_queries.append(word)
+        return word in self._outbound_words
 
 
 class ScriptedSpeechPresenceVerifier:

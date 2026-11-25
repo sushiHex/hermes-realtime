@@ -69,9 +69,9 @@ async def test_control_without_the_evidence_rule_the_same_barge_in_is_admitted()
     assert backend.add_sizes and backend.finish_calls == 1
     assert cancelled is True
     assert "interrupt_requested" in observed
-    assert [transcript for _turn, transcript in responses] == [
-        Transcript(text="Stop.", final=True)
-    ]
+    # Admitted, then consumed as speech-only: a playback stop word starts no turn.
+    assert "transcript_final" in observed
+    assert responses == []
 
 
 @pytest.mark.asyncio
@@ -83,9 +83,8 @@ async def test_endpoint_promoted_short_word_keeps_its_drained_streaming_partial(
     assert "transcript_partial" in observed
     assert cancelled is True
     assert "interrupt_requested" in observed
-    assert [transcript for _turn, transcript in responses] == [
-        Transcript(text="Stop.", final=True)
-    ]
+    assert "transcript_final" in observed
+    assert responses == []
 
 
 @pytest.mark.asyncio
@@ -97,9 +96,8 @@ async def test_an_exact_stop_word_final_needs_no_drained_evidence(partial: str |
     assert backend.add_sizes and backend.finish_calls == 1
     assert cancelled is True
     assert "interrupt_requested" in observed
-    assert [transcript for _turn, transcript in responses] == [
-        Transcript(text="Stop.", final=True)
-    ]
+    assert "transcript_final" in observed
+    assert responses == []
 
 
 @pytest.mark.asyncio
@@ -108,7 +106,11 @@ async def test_an_exact_stop_word_final_needs_no_drained_evidence(partial: str |
     (
         pytest.param(None, "Chapter 3.", (), False, id="no-partial"),
         pytest.param("No", "Chapter 3.", (), False, id="subthreshold-partial"),
-        pytest.param("Stop", "Stop.", ("Stop",), True, id="echoed-partial"),
+        # Long enough for the real guard's text match, which never matches a short word.
+        pytest.param(
+            "yes i can switch models", "Chapter 3.", ("yes i can switch models",), True,
+            id="echoed-partial",
+        ),
     ),
 )
 async def test_drained_partial_without_evidence_leaves_the_final_unauthoritative(
