@@ -440,6 +440,17 @@ speaks a fixed readback built from the stored objective, "Stop background task.
 <objective>?", containing no assent phrase. The slot holds one host question at a time,
 so a single affirmative always answers exactly one question.
 
+Prose a streaming provider (Codex) emits before it nominates is spoken as it arrives
+and cannot be undone, and no phrase guard checks it; Ollama buffers its structured
+decision and speaks no such prose. No stream hold is applied to ordinary replies:
+holding prose whenever cancellation is offered would delay every reply while work runs,
+and was rejected in [#588](https://github.com/sushiHex/hermes-realtime/pull/588). A
+first segment shorter than 32 characters, still held for coalescing, is dropped when
+the selection arrives, and Codex drops prose it reads after the selection has started.
+The host's own question follows and states the true situation: nothing is cancelled
+until it is confirmed. The known gap is a provider failure after such prose and before
+the selection, which leaves the prose spoken and no question asked.
+
 **Confirmation.** The cancel question reuses the start proposal's spoken-confirmation
 rules unchanged:
 - the same participant and generation binding and the 60-second deadline;
