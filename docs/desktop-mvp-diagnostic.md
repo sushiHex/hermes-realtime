@@ -414,6 +414,20 @@ From the host:
   `late_ms` how far past the planned stop the cut landed, and `clamped` that the playout clock
   had run past the end of the chunk. A `late_ms` well above 20, or `clamped` on a stop you
   heard mid-word, means the playout clock drifted from the audio: record it.
+- `[browser-receive-sample]`: one per delivered speech chunk, reported by the page over the
+  audio-diagnostic endpoint (#556). It holds how the browser's receiver handled the speech
+  track between the chunk's start (or its end, when the start was missed; `window_ms` says how
+  long) and 500 ms after its end: the samples the jitter buffer `removed_samples_for_acceleration`,
+  `inserted_samples_for_deceleration`, `concealed_samples` and `silent_concealed_samples`, the
+  `concealment_events`, and the `mean_target_delay_ms` of the jitter buffer; then whether the
+  duck was active at the chunk end (`duck_active`), the mixing `audio_context` state and the
+  page and room uptimes in seconds (`page_uptime_s`, `room_uptime_s`). A field the browser did
+  not report is left out, never shown as 0. Only counts, flags and the state are sent; no text,
+  identifier or audio. The page and the host each stop after 2048 samples per session. When a
+  reply's last word sounds slurred, note the time and copy the last few of these lines:
+  nonzero acceleration, deceleration or non-silent concealment on that chunk points at the
+  receiver's jitter buffer; all zeros points away from it, towards the mixing context or the
+  audio output.
 - `[binding-speech]`: `cause: resisted`, speech the page's binding started, such as the
   readiness cue, did not stop within 10 s of the binding closing. The reload or reconnect that
   closed it fails, and a retry tries again. It is a finding.
